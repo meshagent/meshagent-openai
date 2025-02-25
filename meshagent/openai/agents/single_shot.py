@@ -90,6 +90,7 @@ class OpenAIToolBundle:
                 }
 
 
+                logger.info(f">>>>>>>>>>>>DEFS {v.name} {v.defs}\n\n\n\n")
                 if v.defs != None:
                     fn["parameters"]["$defs"] = v.defs
           
@@ -275,9 +276,9 @@ class OpenAILLMAdapter(LLMAdapter):
             open_ai_tools = tool_bundle.to_json()
 
             if open_ai_tools != None:
-                logger.info("tools %s", json.dumps(open_ai_tools))
+                logger.info("OpenAI Tools: %s", json.dumps(open_ai_tools))
             else:
-                logger.info("empty tools")
+                logger.info("penAI Tools: Empty")
             
             response_schema = output_schema
             response_name = "response"
