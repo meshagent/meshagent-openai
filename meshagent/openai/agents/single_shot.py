@@ -90,7 +90,6 @@ class OpenAIToolBundle:
                 }
 
 
-                logger.info(f">>>>>>>>>>>>DEFS {v.name} {v.defs}\n\n\n\n")
                 if v.defs != None:
                     fn["parameters"]["$defs"] = v.defs
           
