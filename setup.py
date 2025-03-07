@@ -19,7 +19,7 @@ setuptools.setup(
     classifiers=[       
     ],
     keywords=[],
-    license="MIT",
+    license="Apache License 2.0",
     packages=setuptools.find_namespace_packages(include=[
         "meshagent.*",
     ]),
