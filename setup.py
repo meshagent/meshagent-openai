@@ -28,7 +28,7 @@ setuptools.setup(
         "pyjwt>=2.0.0",
         "pytest>=8.3.4",
         "pytest-asyncio>=0.24.0",
-        "openai>=1.57.0",
+        "openai>=1.66.2",
         "meshagent-api>=0.0.1",
         "meshagent-agents>=0.0.1",
         "meshagent-tools>=0.0.1"

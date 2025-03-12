@@ -59,7 +59,7 @@ def safe_tool_name(name: str):
     return _replace_non_matching(name, "a-zA-Z0-9_-", "_")
 
 # Collects a group of tool proxies and manages execution of openai tool calls
-class OpenAIToolBundle:
+class CompletionsToolBundle:
     def __init__(self, toolkits: List[Toolkit]):
         self._toolkits = toolkits
         self._executors = dict[str, Toolkit]()
@@ -143,7 +143,7 @@ class OpenAIToolBundle:
     
 
 # Converts a tool response into a series of messages that can be inserted into the openai context
-class OpenAIToolResponseAdapter(ToolResponseAdapter):
+class OpenAICompletionsToolResponseAdapter(ToolResponseAdapter):
     def __init__(self, blob_storage: Optional[BlobStorage] = None):
         self._blob_storage = blob_storage
         pass
@@ -214,7 +214,7 @@ class OpenAIToolResponseAdapter(ToolResponseAdapter):
 
 
 
-class OpenAILLMAdapter(LLMAdapter):
+class OpenAICompletionsAdapter(LLMAdapter):
     def __init__(self,      
         model: str = os.getenv("OPENAI_MODEL"),
         parallel_tool_calls : Optional[bool] = None,
@@ -247,9 +247,12 @@ class OpenAILLMAdapter(LLMAdapter):
         context: AgentChatContext,
         room: RoomClient,
         toolkits: Toolkit,
-        tool_adapter: ToolResponseAdapter,
+        tool_adapter: Optional[ToolResponseAdapter] = None,
         output_schema: Optional[dict] = None,
-    ):  
+    ):
+        if tool_adapter == None:
+            tool_adapter = OpenAICompletionsToolResponseAdapter()
+
         try:
             if self._client != None:
                 openai = self._client
@@ -269,7 +272,7 @@ class OpenAILLMAdapter(LLMAdapter):
                     }
                 )
 
-            tool_bundle = OpenAIToolBundle(toolkits=[
+            tool_bundle = CompletionsToolBundle(toolkits=[
                 *toolkits,
             ])
             open_ai_tools = tool_bundle.to_json()
