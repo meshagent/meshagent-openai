@@ -280,7 +280,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
             if open_ai_tools != None:
                 logger.info("OpenAI Tools: %s", json.dumps(open_ai_tools))
             else:
-                logger.info("penAI Tools: Empty")
+                logger.info("OpenAI Tools: Empty")
             
             response_schema = output_schema
             response_name = "response"

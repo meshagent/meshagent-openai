@@ -275,13 +275,13 @@ class OpenAIResponsesAdapter(LLMAdapter):
             if open_ai_tools != None:
                 logger.info("OpenAI Tools: %s", json.dumps(open_ai_tools))
             else:
-                logger.info("penAI Tools: Empty")
+                logger.info("OpenAI Tools: Empty")
             
             response_schema = output_schema
             response_name = "response"
             
         
-            while(True):
+            while context.messages[-1].get("role") != "assistant" if context.messages else True:
                 logger.info("model: %s, context: %s, output_schema: %s", self._model, context.messages, output_schema)
                 ptc = self._parallel_tool_calls
                 extra = {}
@@ -313,7 +313,6 @@ class OpenAIResponsesAdapter(LLMAdapter):
                     reasoning=reasoning,
                 )
                 
-             
                 room.developer.log_nowait(type="llm.message", data={ "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "response" : response.to_dict() })
                 
                 for message in response.output:
@@ -352,8 +351,6 @@ class OpenAIResponsesAdapter(LLMAdapter):
                                 room.developer.log_nowait(type="llm.message", data={ "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : result })
                                 context.messages.append(result)
                         
-                        
-            
                     elif response.output_text != None:
 
                         content = response.output_text
