@@ -3,7 +3,7 @@ from meshagent.agents.agent import Agent, AgentChatContext, AgentCallContext
 from meshagent.api import WebSocketClientProtocol, RoomClient, RoomException
 from meshagent.tools.blob import Blob, BlobStorage
 from meshagent.tools import Toolkit, ToolContext, Tool
-from meshagent.api.messaging import Response, LinkResponse, FileResponse, JsonResponse, TextResponse, EmptyResponse
+from meshagent.api.messaging import Response, LinkResponse, FileResponse, JsonResponse, TextResponse, EmptyResponse, RawOutputs
 from meshagent.agents.schema import prompt_schema
 from meshagent.agents.adapter import ToolResponseAdapter, LLMAdapter
 from uuid import uuid4
@@ -65,12 +65,13 @@ class ResponsesToolBundle:
         self._toolkits = toolkits
         self._executors = dict[str, Toolkit]()
         self._safe_names = {}
+        self._tools_by_name = {}
 
         open_ai_tools = []
         
         for toolkit in toolkits:                
             for v in toolkit.tools:
-
+          
                 k = v.name
 
                 name = safe_tool_name(k)
@@ -81,22 +82,29 @@ class ResponsesToolBundle:
                 self._executors[k] = toolkit
 
                 self._safe_names[name] = k
+                self._tools_by_name[name] = v
 
-                fn = {
-                    "type" : "function",
-                    "name" : name,
-                    "description" : v.description,
-                    "parameters" : {
-                        **v.input_schema,
-                    },
-                    "strict": True,
-                }
+                if v.name != "computer_call":
+
+                    fn = {
+                        "type" : "function",
+                        "name" : name,
+                        "description" : v.description,
+                        "parameters" : {
+                            **v.input_schema,
+                        },
+                        "strict": True,
+                    }
 
 
-                if v.defs != None:
-                    fn["parameters"]["$defs"] = v.defs
-          
-                open_ai_tools.append(fn)
+                    if v.defs != None:
+                        fn["parameters"]["$defs"] = v.defs
+            
+                    open_ai_tools.append(fn)
+
+                else:
+
+                    open_ai_tools.append(v.options)
 
         if len(open_ai_tools) == 0:
             open_ai_tools = None
@@ -127,7 +135,10 @@ class ResponsesToolBundle:
         except Exception as e:
             logger.error("failed calling %s %s", tool_call.id, name, exc_info=e)
             raise
-
+    
+    def get_tool(self, name: str) -> Tool | None:
+        return self._tools_by_name.get(name, None)
+    
     def contains(self, name: str) -> bool:
         return name in self._open_ai_tools
 
@@ -150,7 +161,8 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
                 "url" : response.url,
             })
            
-        elif isinstance(response, JsonResponse):                                            
+        elif isinstance(response, JsonResponse):   
+                                                     
             return json.dumps(response.json)
         
         elif isinstance(response, TextResponse):
@@ -195,17 +207,27 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
 
     async def append_messages(self, *, context: AgentChatContext, tool_call: ResponseFunctionToolCall, room: RoomClient, response: Response) -> list:
 
-        message = {
-            "output" : await self.to_plain_text(room=room, response=response),
-            "call_id" : tool_call.call_id,
-            "type" : "function_call_output"
-        }                                 
-      
+        if isinstance(response, RawOutputs):
+            
+            for output in response.outputs:
 
-        room.developer.log_nowait(type="llm.message", data={ "context" : context.id,  "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : message })
-                            
-        context.messages.append(message) 
+                room.developer.log_nowait(type="llm.message", data={ "context" : context.id,  "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : output })
+                                    
+                context.messages.append(output) 
+        else:
+            output = await self.to_plain_text(room=room, response=response)
+                
+            message = {
+                "output" : output,
+                "call_id" : tool_call.call_id,
+                "type" : "function_call_output"
+            }                                 
         
+
+            room.developer.log_nowait(type="llm.message", data={ "context" : context.id,  "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : message })
+                                
+            context.messages.append(message) 
+            
 
 
 
@@ -227,6 +249,8 @@ class OpenAIResponsesAdapter(LLMAdapter):
         if self._model.startswith("o1"):
             system_role = "developer"
         elif self._model.startswith("o3"):
+            system_role = "developer"
+        elif self._model.startswith("computer-use"):
             system_role = "developer"
 
         context = AgentChatContext(
@@ -276,6 +300,7 @@ class OpenAIResponsesAdapter(LLMAdapter):
                 logger.info("OpenAI Tools: %s", json.dumps(open_ai_tools))
             else:
                 logger.info("OpenAI Tools: Empty")
+                open_ai_tools = NOT_GIVEN
             
             response_schema = output_schema
             response_name = "response"
@@ -287,6 +312,10 @@ class OpenAIResponsesAdapter(LLMAdapter):
                 extra = {}
                 if ptc != None and self._model.startswith("o") == False:
                     extra["parallel_tool_calls"] = ptc 
+                
+                trunc = NOT_GIVEN
+                if self._model == "computer-use-preview":
+                    trunc = "auto"
 
                 text = NOT_GIVEN
                 if output_schema != None:
@@ -305,18 +334,26 @@ class OpenAIResponsesAdapter(LLMAdapter):
                         "effort" : self._reasoning_effort
                     }
 
+                previous_response_id = NOT_GIVEN
+                if context.previous_response_id != None:
+                    previous_response_id = context.previous_response_id
+                
                 response = await openai.responses.create(
                     model = self._model,
                     input = context.messages,
                     tools = open_ai_tools,
                     text = text,
+                    previous_response_id=previous_response_id,
                     reasoning=reasoning,
+                    truncation=trunc
                 )
+
+                context.create_response(response.id)
                 
                 room.developer.log_nowait(type="llm.message", data={ "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "response" : response.to_dict() })
                 
                 for message in response.output:
-                    context.messages.append(message)
+                    #context.messages.append(message.to_dict())
                 
                     if message.type == "function_call":
                     
@@ -350,7 +387,19 @@ class OpenAIResponsesAdapter(LLMAdapter):
                             if result != None:
                                 room.developer.log_nowait(type="llm.message", data={ "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : result })
                                 context.messages.append(result)
-                        
+                    elif message.type == "computer_call" and tool_bundle.get_tool("computer_call"):
+                        tool_context = ToolContext(
+                            room=room,
+                            caller=room.local_participant,
+                        )
+                        outputs = (await tool_bundle.get_tool("computer_call").execute(context=tool_context, arguments=message.to_dict(mode="json"))).outputs
+
+                        context.messages.extend(outputs)
+                    elif message.type == "reasoning":
+                        reasoning = tool_bundle.get_tool("reasoning_tool")
+                        if reasoning != None:
+                            await tool_bundle.get_tool("reasoning_tool").execute(context=tool_context, arguments=message.to_dict(mode="json"))
+                        continue
                     elif response.output_text != None:
 
                         content = response.output_text
