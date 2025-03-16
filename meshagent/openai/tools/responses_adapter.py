@@ -392,9 +392,6 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
 
                         all_results = []
                         for result in results:
-                            for r in result:
-                                r["src_id"] = message.id
-
                             room.developer.log_nowait(type="llm.message", data={ "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : result })
                             all_results.extend(result)
 
@@ -540,29 +537,14 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
 
                             if preemptive_function_calls == False:
                                 for output in event.response.output:
-                                    
-                                    # note: the call_id seems to change if you handle the response from the item output streaming
+                                   
                                     outputs, done = await handle_message(message=output)
                                     if done:
                                         return outputs
                                     else:
                                         for output in outputs:
-                                            if "src_id" in output:
-                                                output.pop("src_id")
                                             all_outputs.append(output)
-                            else:
-
-                                for output in all_outputs:
-                                    # remap function calls, works around a bug in OAI
-                                    if "src_id" in output:
-                                        for dest in event.response.output:
-                                            if dest.id == output["src_id"]:
-                                                output["call_id"] = dest.call_id
-                                                pass
-
-                                        output.pop("src_id")
-
-
+                         
                             context.messages.extend(all_outputs)
                             all_outputs = []
 
