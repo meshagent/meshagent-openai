@@ -12,14 +12,13 @@ from jsonschema import validate
 from typing import List, Dict
 
 from openai import AsyncOpenAI, APIStatusError, NOT_GIVEN
-from openai.types.chat import ChatCompletionMessageToolCall
-from openai.types.responses import ResponseFunctionToolCall
+from openai.types.responses import ResponseFunctionToolCall, ResponseStreamEvent
 
 from copy import deepcopy
 from abc import abstractmethod, ABC
 import os
 import jsonschema
-from typing import Optional, Any
+from typing import Optional, Any, Callable
 
 import logging
 import re
@@ -205,7 +204,7 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
         else:
             raise Exception("unexpected return type: {type}".format(type=type(response)))
 
-    async def append_messages(self, *, context: AgentChatContext, tool_call: ResponseFunctionToolCall, room: RoomClient, response: Response) -> list:
+    async def create_messages(self, *, context: AgentChatContext, tool_call: ResponseFunctionToolCall, room: RoomClient, response: Response) -> list:
 
         if isinstance(response, RawOutputs):
             
@@ -213,7 +212,7 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
 
                 room.developer.log_nowait(type="llm.message", data={ "context" : context.id,  "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : output })
                                     
-                context.messages.append(output) 
+            return response.outputs
         else:
             output = await self.to_plain_text(room=room, response=response)
                 
@@ -226,12 +225,12 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
 
             room.developer.log_nowait(type="llm.message", data={ "context" : context.id,  "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : message })
                                 
-            context.messages.append(message) 
+            return [ message ]
             
 
 
 
-class OpenAIResponsesAdapter(LLMAdapter):
+class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
     def __init__(self,      
         model: str = os.getenv("OPENAI_MODEL"),
         parallel_tool_calls : Optional[bool] = None,
@@ -242,7 +241,6 @@ class OpenAIResponsesAdapter(LLMAdapter):
         self._parallel_tool_calls = parallel_tool_calls
         self._client = client
         self._reasoning_effort = reasoning_effort
-
 
     def create_chat_context(self):
         system_role = "system"
@@ -268,6 +266,7 @@ class OpenAIResponsesAdapter(LLMAdapter):
         toolkits: Toolkit,
         tool_adapter: Optional[ToolResponseAdapter] = None,
         output_schema: Optional[dict] = None,
+        event_handler: Optional[Callable[[ResponseStreamEvent],None]] = None
     ):  
         if tool_adapter == None:
             tool_adapter = OpenAIResponsesToolResponseAdapter()
@@ -305,8 +304,9 @@ class OpenAIResponsesAdapter(LLMAdapter):
             response_schema = output_schema
             response_name = "response"
             
-        
-            while context.messages[-1].get("role") != "assistant" if context.messages else True:
+
+            while True:
+  
                 logger.info("model: %s, context: %s, output_schema: %s", self._model, context.messages, output_schema)
                 ptc = self._parallel_tool_calls
                 extra = {}
@@ -338,23 +338,30 @@ class OpenAIResponsesAdapter(LLMAdapter):
                 if context.previous_response_id != None:
                     previous_response_id = context.previous_response_id
                 
-                response = await openai.responses.create(
-                    model = self._model,
-                    input = context.messages,
-                    tools = open_ai_tools,
-                    text = text,
-                    previous_response_id=previous_response_id,
-                    reasoning=reasoning,
-                    truncation=trunc
-                )
+                stream = event_handler != None
+                
+                for i in range(4):
+                    if range == 3:
+                        raise RoomException("exceeded maximum attempts calling openai")
+                    try:
+                        response = await openai.responses.create(
+                            stream=stream,
+                            model = self._model,
+                            input = context.messages,
+                            tools = open_ai_tools,
+                            text = text,
+                            previous_response_id=previous_response_id,
+                            reasoning=reasoning,
+                            truncation=trunc
+                        )
+                        break
+                    except Exception as e:
+                        logger.error(f"error calling openai attempt: {i+1}", exc_info=e)
+                
 
-                context.create_response(response.id)
-                
-                room.developer.log_nowait(type="llm.message", data={ "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "response" : response.to_dict() })
-                
-                for message in response.output:
-                    #context.messages.append(message.to_dict())
-                
+                async def handle_message(message):
+                    
+
                     if message.type == "function_call":
                     
                         tasks = []
@@ -367,26 +374,32 @@ class OpenAIResponsesAdapter(LLMAdapter):
                                 )
                                 tool_response = await tool_bundle.execute(context=tool_context, tool_call=tool_call)
                                 logger.info(f"tool response {tool_response}")
-                                await tool_adapter.append_messages(context=context, tool_call=tool_call, room=room, response=tool_response)
+                                return await tool_adapter.create_messages(context=context, tool_call=tool_call, room=room, response=tool_response)
                             except Exception as e:
                                 logger.error(f"unable to complete tool call {tool_call}", exc_info=e)
                                 room.developer.log_nowait(type="llm.error", data={ "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "error" : f"{e}" })
                     
-                                return {
+                                return [{
                                     "output" : json.dumps({"error":f"unable to complete tool call: {e}"}),
                                     "call_id" : tool_call.call_id,
                                     "type" : "function_call_output"
-                                }
+                                }]
 
 
                         tasks.append(asyncio.create_task(do_tool_call(message)))
 
                         results = await asyncio.gather(*tasks)
 
+                        all_results = []
                         for result in results:
-                            if result != None:
-                                room.developer.log_nowait(type="llm.message", data={ "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : result })
-                                context.messages.append(result)
+                            for r in result:
+                                r["src_id"] = message.id
+
+                            room.developer.log_nowait(type="llm.message", data={ "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : result })
+                            all_results.extend(result)
+
+                        return all_results, False
+
                     elif message.type == "computer_call" and tool_bundle.get_tool("computer_call"):
                         tool_context = ToolContext(
                             room=room,
@@ -394,41 +407,177 @@ class OpenAIResponsesAdapter(LLMAdapter):
                         )
                         outputs = (await tool_bundle.get_tool("computer_call").execute(context=tool_context, arguments=message.to_dict(mode="json"))).outputs
 
-                        context.messages.extend(outputs)
+                        return outputs, False
+                    
                     elif message.type == "reasoning":
                         reasoning = tool_bundle.get_tool("reasoning_tool")
                         if reasoning != None:
                             await tool_bundle.get_tool("reasoning_tool").execute(context=tool_context, arguments=message.to_dict(mode="json"))
-                        continue
-                    elif response.output_text != None:
+                        
+                    elif message.type == "message":
 
-                        content = response.output_text
-                        
-                        logger.info("RESPONSE FROM OPENAI %s", content)
-                        if response_schema == None:
-                            return content
-                        
-                        # First try to parse the result
-                        try:
-                            full_response = json.loads(content)
-                        # sometimes open ai packs two JSON chunks seperated by newline, check if that's why we couldn't parse
-                        except json.decoder.JSONDecodeError as e:
-                            for part in content.splitlines():
-                                if len(part.strip()) > 0:
-                                    full_response = json.loads(part)
-                                    
-                                    try:
-                                        self.validate(response=full_response, output_schema=response_schema)
-                                    except Exception as e:
-                                        logger.error("recieved invalid response, retrying", exc_info=e)
-                                        error = { "role" : "user", "content" : "encountered a validation error with the output: {error}".format(error=e)}
-                                        room.developer.log_nowait(type="llm.message", data={ "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : error })
-                                        context.messages.append(error)
-                                        continue
+                        contents = message.content
+                        for content in contents:
                             
-                        return full_response
+                            logger.info("RESPONSE FROM OPENAI %s", content)
+                            if response_schema == None:
+                                
+                                if content == contents[-1]:
+                                    # Check if we are done        
+                                    logger.info("Checking done")
+                                    for i in range(4):
+                                        if range == 3:
+                                            raise RoomException("exceeded maximum attempts calling openai")
+                                        
+                                        try:
+                                            response = await openai.responses.create(
+                                                model = self._model,
+                                                input = [
+                                                    *context.messages,
+                                                    {
+                                                        "role" : "user",
+                                                        "content" : "have you finished working on what was requested, are you in the middle of it, or are you waiting for a response"
+                                                    }
+                                                ],
+                                                text = {
+                                                    "format" : {
+                                                        "type" : "json_schema",
+                                                        "name" : "check",
+                                                        "schema" : {
+                                                            
+                                                            "type" : "object",
+                                                            "required" : [ "check" ],
+                                                            "additionalProperties" : False,
+                                                            "properties" : {
+                                                                "check" : {
+                                                                    "type" : "object",
+                                                                    "required" : [ "status", "remaining_work" ],
+                                                                    "additionalProperties" : False,
+                                                                    "properties" : {
+                                                                        "status" : {
+                                                                            "type" : "string",
+                                                                            "enum" : [
+                                                                                "finished",
+                                                                                "in_progress",
+                                                                                "waiting_for_user_response",
+                                                                            ]
+                                                                        },
+                                                                        "remaining_work" : {
+                                                                            "type" : "string"
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        },
+                                                        "strict" : True,
+                                                    }
+                                                },
+                                                previous_response_id=previous_response_id,
+                                            )
+                                        except Exception as e:
+                                            logger.error(f"error calling openai attempt: {i+1}", exc_info=e)
+
+                                    for output in response.output:
+                                        for c in output.content:
+                                            res = json.loads(c.text)
+                                            if res["check"]["status"] == "finished" or res["check"]["status"] == "waiting_for_user_response":
+                                                logger.info("Evaulator says we are done")
+                                                return content.text, True
+                                    
+                                    continue
+
+                            
+                            # First try to parse the result
+                            try:
+                                full_response = json.loads(content.text)
+                            # sometimes open ai packs two JSON chunks seperated by newline, check if that's why we couldn't parse
+                            except json.decoder.JSONDecodeError as e:
+                                for part in content.text.splitlines():
+                                    if len(part.strip()) > 0:
+                                        full_response = json.loads(part)
+                                        
+                                        try:
+                                            self.validate(response=full_response, output_schema=response_schema)
+                                        except Exception as e:
+                                            logger.error("recieved invalid response, retrying", exc_info=e)
+                                            error = { "role" : "user", "content" : "encountered a validation error with the output: {error}".format(error=e)}
+                                            room.developer.log_nowait(type="llm.message", data={ "context" : message.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : error })
+                                            context.messages.append(error)
+                                            continue
+                                
+                            return full_response, True
                     else:
                         raise RoomException("Unexpected response from OpenAI {response}".format(response=message))
+                    
+                    return [], False
+                    
+                if stream == False:
+                    room.developer.log_nowait(type="llm.message", data={ "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "response" : response.to_dict() })
+                
+                    context.create_response(response.id)
+                
+                    for message in response.output:
+                        outputs, done = await handle_message(message=message)
+                        if done:
+                            return outputs
+                        else:
+                            for output in outputs:
+                                context.messages.append(output)
+
+
+                else:
+
+                    preemptive_function_calls = True
+
+                    all_outputs = []
+                    async for e in response:
+                        
+                        event : ResponseStreamEvent = e
+                        event_handler(event)
+
+                        if event.type == "response.completed":
+                            context.create_response(event.response.id)
+
+                            if preemptive_function_calls == False:
+                                for output in event.response.output:
+                                    
+                                    # note: the call_id seems to change if you handle the response from the item output streaming
+                                    outputs, done = await handle_message(message=output)
+                                    if done:
+                                        return outputs
+                                    else:
+                                        for output in outputs:
+                                            if "src_id" in output:
+                                                output.pop("src_id")
+                                            all_outputs.append(output)
+                            else:
+
+                                for output in all_outputs:
+                                    # remap function calls, works around a bug in OAI
+                                    if "src_id" in output:
+                                        for dest in event.response.output:
+                                            if dest.id == output["src_id"]:
+                                                output["call_id"] = dest.call_id
+                                                pass
+
+                                        output.pop("src_id")
+
+
+                            context.messages.extend(all_outputs)
+                            all_outputs = []
+
+                        elif event.type == "response.output_item.done":
+                            if preemptive_function_calls == True:
+                                outputs, done = await handle_message(message=event.item)
+                                if done:
+                                    return outputs
+                                else:
+                                    for output in outputs:
+                                        all_outputs.append(output)
+
+                                        
+                    
+                        
         except APIStatusError as e:
             raise RoomException(f"Error from OpenAI: {e}")
             

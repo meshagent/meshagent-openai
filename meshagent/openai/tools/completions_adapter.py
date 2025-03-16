@@ -198,7 +198,7 @@ class OpenAICompletionsToolResponseAdapter(ToolResponseAdapter):
         else:
             raise Exception("unexpected return type: {type}".format(type=type(response)))
 
-    async def append_messages(self, *, context: AgentChatContext, tool_call: Any, room: RoomClient, response: Response) -> list:
+    async def create_messages(self, *, context: AgentChatContext, tool_call: Any, room: RoomClient, response: Response) -> list:
 
         message = {
             "role" : "tool",
@@ -209,7 +209,7 @@ class OpenAICompletionsToolResponseAdapter(ToolResponseAdapter):
 
         room.developer.log_nowait(type="llm.message", data={ "context" : context.id,  "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : message })
                             
-        context.messages.append(message) 
+        return [ message ]
         
 
 
@@ -330,16 +330,17 @@ class OpenAICompletionsAdapter(LLMAdapter):
                             )
                             tool_response = await tool_bundle.execute(context=tool_context, tool_call=tool_call)
                             logger.info(f"tool response {tool_response}")
-                            await tool_adapter.append_messages(context=context, tool_call=tool_call, room=room, response=tool_response)
+                            return await tool_adapter.create_messages(context=context, tool_call=tool_call, room=room, response=tool_response)
+                        
                         except Exception as e:
                             logger.error(f"unable to complete tool call {tool_call}", exc_info=e)
                             room.developer.log_nowait(type="llm.error", data={ "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "error" : f"{e}" })
                 
-                            return {
+                            return [{
                                 "role" : "tool",
                                 "content" : json.dumps({"error":f"unable to complete tool call: {e}"}),
                                 "tool_call_id" : tool_call.id,
-                            }
+                            }]
 
 
                     for tool_call in message.tool_calls:
