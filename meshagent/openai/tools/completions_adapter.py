@@ -4,7 +4,7 @@ from meshagent.api import WebSocketClientProtocol, RoomClient, RoomException
 from meshagent.tools.blob import Blob, BlobStorage
 from meshagent.tools import Toolkit, ToolContext, Tool
 from meshagent.api.messaging import Response, LinkResponse, FileResponse, JsonResponse, TextResponse, EmptyResponse
-from meshagent.agents.schema import prompt_schema
+from meshagent.api.schema_util import prompt_schema
 from meshagent.agents.adapter import ToolResponseAdapter, LLMAdapter
 from uuid import uuid4
 import json
