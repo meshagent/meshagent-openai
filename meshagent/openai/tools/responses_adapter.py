@@ -459,7 +459,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                                 context.messages.append(error)
                                                 continue
                                     
-                                return full_response, True
+                                return [ full_response ], True
                     else:
                         raise RoomException("Unexpected response from OpenAI {response}".format(response=message))
                     
@@ -469,18 +469,24 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                     room.developer.log_nowait(type="llm.message", data={ "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "response" : response.to_dict() })
                 
                     context.create_response(response.id)
-                
+
+                    final_outputs = []
+                    
                     for message in response.output:
                         outputs, done = await handle_message(message=message)
                         if done:
-                            return outputs
+                            final_outputs.extend(outputs)
                         else:
                             for output in outputs:
                                 context.messages.append(output)
 
+                    if len(final_outputs) > 0:
+
+                        return final_outputs[0]
 
                 else:
-
+                    
+                    final_outputs = []
                     all_outputs = []
                     async for e in response:
                         
@@ -512,10 +518,14 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                         
                             outputs, done = await handle_message(message=event.item)
                             if done:
-                                return outputs
+                                final_outputs.extend(outputs)
                             else:
                                 for output in outputs:
                                     all_outputs.append(output)
+
+                        if len(final_outputs) > 0:
+
+                            return final_outputs[0]
 
                                         
                     
