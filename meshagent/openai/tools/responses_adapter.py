@@ -513,7 +513,9 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                             all_outputs = []
 
                         elif event.type == "response.output_item.done":
-                          
+
+                            room.developer.log_nowait(type="llm.output", data={ "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "response" : event.to_dict() })
+                
                             context.previous_messages.append(event.item.to_dict())
                         
                             outputs, done = await handle_message(message=event.item)
