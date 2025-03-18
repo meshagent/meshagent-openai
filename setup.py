@@ -29,9 +29,9 @@ setuptools.setup(
         "pytest>=8.3.4",
         "pytest-asyncio>=0.24.0",
         "openai>=1.66.2",
-        "meshagent-api>=0.0.4",
-        "meshagent-agents>=0.0.4",
-        "meshagent-tools>=0.0.4"
+        "meshagent-api>=0.0.5",
+        "meshagent-agents>=0.0.5",
+        "meshagent-tools>=0.0.5"
     ],
     package_data={        
         "meshagent.openai": ["py.typed", "*.pyi", "**/*.pyi",  "**/*.js"],
