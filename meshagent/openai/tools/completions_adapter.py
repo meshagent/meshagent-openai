@@ -219,13 +219,11 @@ class OpenAICompletionsAdapter(LLMAdapter):
         model: str = os.getenv("OPENAI_MODEL"),
         parallel_tool_calls : Optional[bool] = None,
         client: Optional[AsyncOpenAI] = None,
-        reasoning_effort: Optional[str] = None,
     ):
         self._model = model
         self._parallel_tool_calls = parallel_tool_calls
         self._client = client
-        self._reasoning_effort = reasoning_effort
-
+    
 
     def create_chat_context(self):
         system_role = "system"
@@ -302,9 +300,6 @@ class OpenAICompletionsAdapter(LLMAdapter):
                             "strict" : True,
                         }
                     }
-
-                if self._reasoning_effort != None:
-                    extra["reasoning_effort"] = self._reasoning_effort
 
                 response : ChatCompletion = await openai.chat.completions.create(
                     n=1,

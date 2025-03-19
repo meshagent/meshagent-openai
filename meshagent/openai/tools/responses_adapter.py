@@ -235,14 +235,14 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
         model: str = os.getenv("OPENAI_MODEL"),
         parallel_tool_calls : Optional[bool] = None,
         client: Optional[AsyncOpenAI] = None,
-        reasoning_effort: Optional[str] = None,
         retries : int = 10,
+        response_options : Optional[dict] = None
     ):
         self._model = model
         self._parallel_tool_calls = parallel_tool_calls
         self._client = client
-        self._reasoning_effort = reasoning_effort
         self._retries = retries
+        self._response_options = response_options
 
     def create_chat_context(self):
         system_role = "system"
@@ -252,6 +252,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
             system_role = "developer"
         elif self._model.startswith("computer-use"):
             system_role = "developer"
+            
 
         context = AgentChatContext(
             system_role=system_role
@@ -339,10 +340,6 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                 if ptc != None and self._model.startswith("o") == False:
                     extra["parallel_tool_calls"] = ptc 
                 
-                trunc = NOT_GIVEN
-                if self._model == "computer-use-preview":
-                    trunc = "auto"
-
                 text = NOT_GIVEN
                 if output_schema != None:
                     text = {
@@ -354,12 +351,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                         }
                     }
 
-                reasoning = NOT_GIVEN
-                if self._reasoning_effort != None:
-                    reasoning = {
-                        "effort" : self._reasoning_effort
-                    }
-
+           
                 previous_response_id = NOT_GIVEN
                 if context.previous_response_id != None:
                     previous_response_id = context.previous_response_id
@@ -370,15 +362,19 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                     if range == self._retries:
                         raise RoomException("exceeded maximum attempts calling openai")
                     try:
-                        response = await openai.responses.create(
+                        response_options = self._response_options
+                        if response_options == None:
+                            response_options = {}
+
+                        response : Response = await openai.responses.create(
                             stream=stream,
                             model = self._model,
                             input = context.messages,
                             tools = open_ai_tools,
                             text = text,
                             previous_response_id=previous_response_id,
-                            reasoning=reasoning,
-                            truncation=trunc
+                            
+                            **response_options
                         )
                         break
                     except Exception as e:
