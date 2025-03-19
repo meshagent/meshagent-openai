@@ -70,7 +70,7 @@ class ResponsesToolBundle:
         
         for toolkit in toolkits:                
             for v in toolkit.tools:
-          
+
                 k = v.name
 
                 name = safe_tool_name(k)
@@ -311,22 +311,27 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
             
             openai = self._get_client(room=room)
 
-            tool_bundle = ResponsesToolBundle(toolkits=[
-                *toolkits,
-            ])
-            open_ai_tools = tool_bundle.to_json()
-
-            if open_ai_tools != None:
-                logger.info("OpenAI Tools: %s", json.dumps(open_ai_tools))
-            else:
-                logger.info("OpenAI Tools: Empty")
-                open_ai_tools = NOT_GIVEN
-            
+          
             response_schema = output_schema
             response_name = "response"
             
 
             while True:
+
+                # We need to do this inside the loop because tools can change mid loop
+                # for example computer use adds goto tools after the first interaction
+                tool_bundle = ResponsesToolBundle(toolkits=[
+                    *toolkits,
+                ])
+                open_ai_tools = tool_bundle.to_json()
+
+                if open_ai_tools != None:
+                    logger.info("OpenAI Tools: %s", json.dumps(open_ai_tools))
+                else:
+                    logger.info("OpenAI Tools: Empty")
+                    open_ai_tools = NOT_GIVEN
+                
+
   
                 logger.info("model: %s, context: %s, output_schema: %s", self._model, context.messages, output_schema)
                 ptc = self._parallel_tool_calls
