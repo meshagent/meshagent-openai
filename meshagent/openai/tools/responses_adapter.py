@@ -235,7 +235,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
         model: str = os.getenv("OPENAI_MODEL"),
         parallel_tool_calls : Optional[bool] = None,
         client: Optional[AsyncOpenAI] = None,
-        retries : int = 10,
+        retries : int = 0,
         response_options : Optional[dict] = None
     ):
         self._model = model
@@ -473,7 +473,9 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
 
                     final_outputs = []
                     
+                    
                     for message in response.output:
+                        context.previous_messages.append(message.to_dict())
                         outputs, done = await handle_message(message=message)
                         if done:
                             final_outputs.extend(outputs)
@@ -484,6 +486,17 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                     if len(final_outputs) > 0:
 
                         return final_outputs[0]
+                    
+                    term = await self.check_for_termination(context=context, room=room)
+                    if term:
+                        text = ""
+                        for output in response.output:
+                            if output.type == "message":
+                                for content in output.content:
+                                    text += content.text
+
+                        return text
+
 
                 else:
                     
