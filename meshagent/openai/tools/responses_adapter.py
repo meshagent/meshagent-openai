@@ -395,8 +395,15 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                 tool_context = ToolContext(
                                     room=room,
                                     caller=room.local_participant,
+                                    caller_context={ "chat" : context.to_json }
                                 )
                                 tool_response = await tool_bundle.execute(context=tool_context, tool_call=tool_call)
+                                if tool_response.caller_context != None:
+                                    if tool_response.caller_context.get("chat", None) != None:
+                                        tool_chat_context = AgentChatContext.from_json(tool_response.caller_context["chat"])
+                                        if tool_chat_context.previous_response_id != None:
+                                            context.track_response(tool_chat_context.previous_response_id)
+
                                 logger.info(f"tool response {tool_response}")
                                 return await tool_adapter.create_messages(context=context, tool_call=tool_call, room=room, response=tool_response)
                             except Exception as e:
@@ -425,6 +432,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                         tool_context = ToolContext(
                             room=room,
                             caller=room.local_participant,
+                            caller_context={ "chat" : context.to_json }
                         )
                         outputs = (await tool_bundle.get_tool("computer_call").execute(context=tool_context, arguments=message.to_dict(mode="json"))).outputs
 
@@ -469,7 +477,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                 if stream == False:
                     room.developer.log_nowait(type="llm.message", data={ "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "response" : response.to_dict() })
                 
-                    context.create_response(response.id)
+                    context.track_response(response.id)
 
                     final_outputs = []
                     
@@ -509,7 +517,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                         event_handler(event)
 
                         if event.type == "response.completed":
-                            context.create_response(event.response.id)
+                            context.track_response(event.response.id)
                          
                             context.messages.extend(all_outputs)
 

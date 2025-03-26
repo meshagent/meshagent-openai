@@ -322,6 +322,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
                             tool_context = ToolContext(
                                 room=room,
                                 caller=room.local_participant,
+                                caller_context={ "chat" : context.to_json }
                             )
                             tool_response = await tool_bundle.execute(context=tool_context, tool_call=tool_call)
                             logger.info(f"tool response {tool_response}")
