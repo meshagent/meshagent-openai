@@ -1,3 +1,9 @@
+## [0.0.9]
+- Stability
+
+## [0.0.8]
+- Stability 
+
 ## [0.0.7]
 - Added code editor agent
 - Fixes
