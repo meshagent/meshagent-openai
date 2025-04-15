@@ -24,9 +24,8 @@ import logging
 import re
 import asyncio
 
-logging.basicConfig()
 logger = logging.getLogger("openai_agent")
-logger.setLevel(logging.INFO)
+
 
 
 
