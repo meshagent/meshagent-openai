@@ -3,7 +3,7 @@ from meshagent.agents.agent import Agent, AgentChatContext, AgentCallContext
 from meshagent.api import WebSocketClientProtocol, RoomClient, RoomException
 from meshagent.tools.blob import Blob, BlobStorage
 from meshagent.tools import Toolkit, ToolContext, Tool
-from meshagent.api.messaging import Response, LinkResponse, FileResponse, JsonResponse, TextResponse, EmptyResponse, RawOutputs
+from meshagent.api.messaging import Response, LinkResponse, FileResponse, JsonResponse, TextResponse, EmptyResponse, RawOutputs, ensure_response
 from meshagent.api.schema_util import prompt_schema
 from meshagent.agents.adapter import ToolResponseAdapter, LLMAdapter
 from uuid import uuid4
@@ -128,7 +128,7 @@ class ResponsesToolBundle:
             proxy = self._executors[name]
             result = await proxy.execute(context=context, name=name, arguments=arguments)
             logger.info("success calling %s %s %s", tool_call.id, name, result)        
-            return result
+            return ensure_response(result)
 
         except Exception as e:
             logger.error("failed calling %s %s", tool_call.id, name, exc_info=e)
@@ -345,7 +345,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                         "format" : {
                             "type" : "json_schema",
                             "name" : response_name,
-                            "schema" :  response_schema,
+                            "schema" : response_schema,
                             "strict" : True,
                         }
                     }
