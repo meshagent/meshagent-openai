@@ -231,7 +231,7 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
 
 class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
     def __init__(self,      
-        model: str = os.getenv("OPENAI_MODEL","gpt-4o"),
+        model: str = os.getenv("OPENAI_MODEL","gpt-4.1"),
         parallel_tool_calls : Optional[bool] = None,
         client: Optional[AsyncOpenAI] = None,
         retries : int = 0,
