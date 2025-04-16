@@ -249,6 +249,8 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
             system_role = "developer"
         elif self._model.startswith("o3"):
             system_role = "developer"
+        elif self._model.startswith("o4"):
+            system_role = "developer"
         elif self._model.startswith("computer-use"):
             system_role = "developer"
             
@@ -276,13 +278,14 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
 
     def _get_client(self, *, room: RoomClient) -> AsyncOpenAI:
         if self._client != None:
+            
             openai = self._client
         else:
             token : str = room.protocol.token
             url : str = room.room_url
             
             room_proxy_url = f"{url}/v1"
-        
+            
             openai=AsyncOpenAI(
                 api_key=token,
                 base_url=room_proxy_url,

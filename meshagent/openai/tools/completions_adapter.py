@@ -230,6 +230,8 @@ class OpenAICompletionsAdapter(LLMAdapter):
             system_role = "developer"
         elif self._model.startswith("o3"):
             system_role = "developer"
+        elif self._model.startswith("o4"):
+            system_role = "developer"
 
         context = AgentChatContext(
             system_role=system_role
