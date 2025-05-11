@@ -27,9 +27,6 @@ import asyncio
 logger = logging.getLogger("openai_agent")
 
 
-
-
-
 def _replace_non_matching(text: str, allowed_chars: str, replacement: str) -> str:
     """
     Replaces every character in `text` that does not match the given
