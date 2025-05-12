@@ -20,9 +20,9 @@ dependencies = [
 ]
 
 [project.urls]
-Documentation = "https://meshagent.com"
-Website = "https://meshagent.com"
-Source = "https://github.com/meshagent"
+Documentation = "https://docs.meshagent.com"
+Website = "https://www.meshagent.com"
+Source = "https://www.meshagent.com"
 
 [tool.setuptools.packages.find]
 include = ["meshagent.*"]
