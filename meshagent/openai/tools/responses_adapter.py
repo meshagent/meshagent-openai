@@ -314,11 +314,9 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
             
             openai = self._get_client(room=room)
 
-          
             response_schema = output_schema
             response_name = "response"
             
-
             while True:
 
                 # We need to do this inside the loop because tools can change mid loop
@@ -386,7 +384,10 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                 
 
                 async def handle_message(message):
-                    
+
+                    room.developer.log_nowait(type=f"llm.message", data={
+                         "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : message.to_dict()
+                    })
 
                     if message.type == "function_call":
                     
@@ -455,6 +456,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                 # First try to parse the result
                                 try:
                                     full_response = json.loads(content.text)
+                                                
                                 # sometimes open ai packs two JSON chunks seperated by newline, check if that's why we couldn't parse
                                 except json.decoder.JSONDecodeError as e:
                                     for part in content.text.splitlines():

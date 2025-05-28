@@ -201,10 +201,9 @@ class OpenAICompletionsToolResponseAdapter(ToolResponseAdapter):
             "content" : await self.to_plain_text(room=room, response=response),
             "tool_call_id" : tool_call.id,
         }                                 
-      
 
         room.developer.log_nowait(type="llm.message", data={ "context" : context.id,  "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : message })
-                            
+
         return [ message ]
         
 
