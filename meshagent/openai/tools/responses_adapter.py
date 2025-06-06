@@ -573,11 +573,12 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                             async for e in response:
                                 with tracer.start_as_current_span("llm.stream.event") as span:
                                     
+                                   
+                                    event : ResponseStreamEvent = e
                                     span.set_attributes({
                                         "type" : event.type
                                     })
 
-                                    event : ResponseStreamEvent = e
 
                                     event_handler(event)
 
