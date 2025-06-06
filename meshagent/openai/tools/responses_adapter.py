@@ -315,8 +315,8 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
         with tracer.start_as_current_span("llm.turn") as span:
 
             span.set_attributes({
-                "chat_context", context.id,
-                "api", "responses"
+                "chat_context" : context.id,
+                "api" : "responses"
             })
 
             if tool_adapter == None:
@@ -329,8 +329,8 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                     with tracer.start_as_current_span("llm.turn.iteration") as span:
 
                         span.set_attributes({
-                            "model", self._model,
-                            "provider", self._provider
+                            "model": self._model,
+                            "provider": self._provider
                         })
                     
                         openai = self._get_client(room=room)
@@ -427,10 +427,10 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                                 with tracer.start_as_current_span("llm.handle_tool_call") as span:
                                                     
                                                     span.set_attributes({
-                                                        "id", tool_call.id,
-                                                        "name", tool_call.name,
-                                                        "call_id", tool_call.call_id,
-                                                        "arguments", json.dumps(tool_call.arguments)
+                                                        "id": tool_call.id,
+                                                        "name": tool_call.name,
+                                                        "call_id": tool_call.call_id,
+                                                        "arguments": json.dumps(tool_call.arguments)
                                                     })
 
                                                     tool_context = ToolContext(
@@ -477,10 +477,10 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                         
                                         computer_call :ResponseComputerToolCall = message
                                         span.set_attributes({
-                                            "id", computer_call.id,
-                                            "action", computer_call.action,
-                                            "call_id", computer_call.call_id,
-                                            "type", json.dumps(computer_call.type)
+                                            "id": computer_call.id,
+                                            "action": computer_call.action,
+                                            "call_id": computer_call.call_id,
+                                            "type": json.dumps(computer_call.type)
                                         })
 
                                         tool_context = ToolContext(
