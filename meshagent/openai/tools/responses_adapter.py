@@ -24,6 +24,8 @@ import logging
 import re
 import asyncio
 
+from pydantic import BaseModel
+
 logger = logging.getLogger("openai_agent")
 
 
@@ -409,9 +411,14 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                     raise
                         
 
-                        async def handle_message(message):
+                        async def handle_message(message: BaseModel):
 
                             with tracer.start_as_current_span("llm.handle_response") as span:
+
+                                span.set_attributes({
+                                    "type" : message.type,
+                                    "message" : message.model_dump_json()
+                                })
 
                                 room.developer.log_nowait(type=f"llm.message", data={
                                     "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : message.to_dict()
@@ -500,6 +507,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                         
                                 elif message.type == "message":
                                     with tracer.start_as_current_span("llm.handle_message") as span:
+                                       
                                         contents = message.content
                                         if response_schema == None:
                                             return [], False
@@ -572,8 +580,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                             all_outputs = []
                             async for e in response:
                                 with tracer.start_as_current_span("llm.stream.event") as span:
-                                    
-                                   
+
                                     event : ResponseStreamEvent = e
                                     span.set_attributes({
                                         "type" : event.type
@@ -622,10 +629,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                     if len(final_outputs) > 0:
 
                                         return final_outputs[0]
-
-                                                
-                    
-                        
+    
             except APIStatusError as e:
                 raise RoomException(f"Error from OpenAI: {e}")
                 
