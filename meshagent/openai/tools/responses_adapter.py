@@ -583,7 +583,8 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
 
                                     event : ResponseStreamEvent = e
                                     span.set_attributes({
-                                        "type" : event.type
+                                        "type" : event.type,
+                                        "event" : event.model_dump_json()
                                     })
 
 
