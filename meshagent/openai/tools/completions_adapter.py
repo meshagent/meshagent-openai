@@ -234,6 +234,38 @@ class OpenAICompletionsAdapter(LLMAdapter):
         )
 
         return context
+
+    def _get_client(self, *, room: RoomClient) -> AsyncOpenAI:
+        if self._client != None:
+            
+            openai = self._client
+
+        else:
+
+            if os.getenv("OPENAI_BASE_URL") == None:
+
+                token : str = room.protocol.token
+                url : str = room.room_url
+                
+                room_proxy_url = f"{url}/v1"
+
+                openai=AsyncOpenAI(
+                    api_key=token,
+                    base_url=room_proxy_url,
+                    default_headers={
+                        "Meshagent-Session" : room.session_id
+                    }
+                )
+
+            else:
+            
+                openai=AsyncOpenAI(
+                    default_headers={
+                        "Meshagent-Session" : room.session_id
+                    }
+                )
+       
+        return openai
     
     # Takes the current chat context, executes a completion request and processes the response.
     # If a tool calls are requested, invokes the tools, processes the tool calls results, and appends the tool call results to the context
@@ -249,23 +281,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
             tool_adapter = OpenAICompletionsToolResponseAdapter()
 
         try:
-            if self._client != None:
-                openai = self._client
-            else:
-                
-               
-                token : str = room.protocol.token
-                url : str = room.room_url
-                
-                room_proxy_url = f"{url}/v1"
-            
-                openai=AsyncOpenAI(
-                    api_key=token,
-                    base_url=room_proxy_url,
-                    default_headers={
-                        "Meshagent-Session" : room.session_id
-                    }
-                )
+            openai = self._get_client(room=room)
 
             tool_bundle = CompletionsToolBundle(toolkits=[
                 *toolkits,

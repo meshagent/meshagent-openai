@@ -285,19 +285,31 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
         if self._client != None:
             
             openai = self._client
+
         else:
-            token : str = room.protocol.token
-            url : str = room.room_url
+
+            if os.getenv("OPENAI_BASE_URL") == None:
+
+                token : str = room.protocol.token
+                url : str = room.room_url
+                
+                room_proxy_url = f"{url}/v1"
+
+                openai=AsyncOpenAI(
+                    api_key=token,
+                    base_url=room_proxy_url,
+                    default_headers={
+                        "Meshagent-Session" : room.session_id
+                    }
+                )
+
+            else:
             
-            room_proxy_url = f"{url}/v1"
-            
-            openai=AsyncOpenAI(
-                api_key=token,
-                base_url=room_proxy_url,
-                default_headers={
-                    "Meshagent-Session" : room.session_id
-                }
-            )
+                openai=AsyncOpenAI(
+                    default_headers={
+                        "Meshagent-Session" : room.session_id
+                    }
+                )
        
         return openai
     
