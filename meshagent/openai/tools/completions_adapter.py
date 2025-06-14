@@ -248,6 +248,8 @@ class OpenAICompletionsAdapter(LLMAdapter):
                 url : str = room.room_url
                 
                 room_proxy_url = f"{url}/v1"
+                if room_proxy_url.startswith("ws:") or room_proxy_url.startswith("wss:"):
+                    room_proxy_url = room_proxy_url.replace("ws","http",1)
 
                 openai=AsyncOpenAI(
                     api_key=token,

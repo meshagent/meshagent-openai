@@ -11,7 +11,7 @@ import json
 from jsonschema import validate
 from typing import List, Dict
 
-from openai import AsyncOpenAI, APIStatusError, NOT_GIVEN
+from openai import AsyncOpenAI, APIStatusError, NOT_GIVEN, APIStatusError
 from openai.types.responses import ResponseFunctionToolCall, ResponseComputerToolCall, ResponseStreamEvent
 
 from copy import deepcopy
@@ -294,6 +294,8 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                 url : str = room.room_url
                 
                 room_proxy_url = f"{url}/v1"
+                if room_proxy_url.startswith("ws:") or room_proxy_url.startswith("wss:"):
+                    room_proxy_url = room_proxy_url.replace("ws","http",1)
 
                 openai=AsyncOpenAI(
                     api_key=token,
@@ -417,6 +419,9 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                         **response_options
                                     )
                                     break
+                            except APIStatusError as e:
+                                logger.error(f"error calling openai attempt: {i+1} ({e.response.request.url})", exc_info=e)
+                                raise
                             except Exception as e:
                                 logger.error(f"error calling openai attempt: {i+1}", exc_info=e)
                                 if i == self._retries:
@@ -464,7 +469,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                                             if tool_chat_context.previous_response_id != None:
                                                                 context.track_response(tool_chat_context.previous_response_id)
 
-                                                    span.set_attribute("response", tool_adapter.to_plain_text(tool_response))
+                                                    span.set_attribute("response", await tool_adapter.to_plain_text(room=room, response=tool_response))
 
                                                     logger.info(f"tool response {tool_response}")
                                                     return await tool_adapter.create_messages(context=context, tool_call=tool_call, room=room, response=tool_response)
