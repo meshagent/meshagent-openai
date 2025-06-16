@@ -2,23 +2,20 @@
 from meshagent.agents.agent import Agent, AgentChatContext, AgentCallContext
 from meshagent.api import WebSocketClientProtocol, RoomClient, RoomException
 from meshagent.tools.blob import Blob, BlobStorage
-from meshagent.tools import Toolkit, ToolContext, Tool
+from meshagent.tools import Toolkit, ToolContext, Tool, BaseTool
 from meshagent.api.messaging import Response, LinkResponse, FileResponse, JsonResponse, TextResponse, EmptyResponse, RawOutputs, ensure_response
 from meshagent.api.schema_util import prompt_schema
 from meshagent.agents.adapter import ToolResponseAdapter, LLMAdapter
 from uuid import uuid4
 import json
 from jsonschema import validate
-from typing import List, Dict
+from typing import List, Literal
 
 from openai import AsyncOpenAI, APIStatusError, NOT_GIVEN, APIStatusError
-from openai.types.responses import ResponseFunctionToolCall, ResponseComputerToolCall, ResponseStreamEvent
-
-from copy import deepcopy
-from abc import abstractmethod, ABC
+from openai.types.responses import ResponseFunctionToolCall, ResponseComputerToolCall, ResponseStreamEvent, ResponseImageGenCallCompletedEvent
 import os
-import jsonschema
 from typing import Optional, Any, Callable
+import base64
 
 import logging
 import re
@@ -85,8 +82,14 @@ class ResponsesToolBundle:
 
                 self._safe_names[name] = k
                 self._tools_by_name[name] = v
+                
+                if isinstance(v, OpenAIResponsesTool):
 
-                if v.name != "computer_call":
+                    fns = v.get_open_ai_tool_definitions()
+                    for fn in fns:
+                        open_ai_tools.append(fn)
+
+                elif isinstance(v, Tool):
 
                     fn = {
                         "type" : "function",
@@ -98,7 +101,6 @@ class ResponsesToolBundle:
                         "strict": True,
                     }
 
-
                     if v.defs != None:
                         fn["parameters"]["$defs"] = v.defs
             
@@ -106,7 +108,7 @@ class ResponsesToolBundle:
 
                 else:
 
-                    open_ai_tools.append(v.options)
+                    raise RoomException(f"unsupported tool type {type(v)}")
 
         if len(open_ai_tools) == 0:
             open_ai_tools = None
@@ -138,7 +140,7 @@ class ResponsesToolBundle:
             logger.error("failed calling %s %s", tool_call.id, name, exc_info=e)
             raise
     
-    def get_tool(self, name: str) -> Tool | None:
+    def get_tool(self, name: str) -> BaseTool | None:
         return self._tools_by_name.get(name, None)
     
     def contains(self, name: str) -> bool:
@@ -223,15 +225,11 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
                 "output" : output,
                 "call_id" : tool_call.call_id,
                 "type" : "function_call_output"
-            }                                 
-        
+            }
 
             room.developer.log_nowait(type="llm.message", data={ "context" : context.id,  "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : message })
-                                
+
             return [ message ]
-            
-
-
 
 class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
     def __init__(self,      
@@ -288,7 +286,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
 
         else:
 
-            if os.getenv("OPENAI_BASE_URL") == None:
+            if os.getenv("MESHAGENT_API_URL") == None:
 
                 token : str = room.protocol.token
                 url : str = room.room_url
@@ -323,7 +321,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
         *,
         context: AgentChatContext,
         room: RoomClient,
-        toolkits: Toolkit,
+        toolkits: list[Toolkit],
         tool_adapter: Optional[ToolResponseAdapter] = None,
         output_schema: Optional[dict] = None,
         event_handler: Optional[Callable[[ResponseStreamEvent],None]] = None
@@ -430,6 +428,8 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
 
                         async def handle_message(message: BaseModel):
 
+
+
                             with tracer.start_as_current_span("llm.handle_response") as span:
 
                                 span.set_attributes({
@@ -460,7 +460,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                                     tool_context = ToolContext(
                                                         room=room,
                                                         caller=room.local_participant,
-                                                        caller_context={ "chat" : context.to_json }
+                                                        caller_context={ "chat" : context.to_json() }
                                                     )
                                                     tool_response = await tool_bundle.execute(context=tool_context, tool_call=tool_call)
                                                     if tool_response.caller_context != None:
@@ -496,32 +496,6 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
 
                                     return all_results, False
 
-                                elif message.type == "computer_call" and tool_bundle.get_tool("computer_call"):
-                                    with tracer.start_as_current_span("llm.handle_computer_call") as span:
-                                        
-                                        computer_call :ResponseComputerToolCall = message
-                                        span.set_attributes({
-                                            "id": computer_call.id,
-                                            "action": computer_call.action,
-                                            "call_id": computer_call.call_id,
-                                            "type": json.dumps(computer_call.type)
-                                        })
-
-                                        tool_context = ToolContext(
-                                            room=room,
-                                            caller=room.local_participant,
-                                            caller_context={ "chat" : context.to_json }
-                                        )
-                                        outputs = (await tool_bundle.get_tool("computer_call").execute(context=tool_context, arguments=message.to_dict(mode="json"))).outputs
-
-                                    return outputs, False
-                                
-                                elif message.type == "reasoning":
-                                    with tracer.start_as_current_span("llm.handle_reasoning") as span:
-                                        reasoning = tool_bundle.get_tool("reasoning_tool")
-                                        if reasoning != None:
-                                            await tool_bundle.get_tool("reasoning_tool").execute(context=tool_context, arguments=message.to_dict(mode="json"))
-                                        
                                 elif message.type == "message":
                                     with tracer.start_as_current_span("llm.handle_message") as span:
                                        
@@ -550,9 +524,42 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                                                 continue
                                                     
                                                 return [ full_response ], True
+                                #elif message.type == "computer_call" and tool_bundle.get_tool("computer_call"):
+                                #    with tracer.start_as_current_span("llm.handle_computer_call") as span:
+                                #        
+                                #        computer_call :ResponseComputerToolCall = message
+                                #        span.set_attributes({
+                                #            "id": computer_call.id,
+                                #            "action": computer_call.action,
+                                #            "call_id": computer_call.call_id,
+                                #            "type": json.dumps(computer_call.type)
+                                #        })
+
+                                #        tool_context = ToolContext(
+                                #            room=room,
+                                #            caller=room.local_participant,
+                                #            caller_context={ "chat" : context.to_json }
+                                #        )
+                                #        outputs = (await tool_bundle.get_tool("computer_call").execute(context=tool_context, arguments=message.to_dict(mode="json"))).outputs
+
+                                #    return outputs, False
+                                      
+
                                 else:
-                                    raise RoomException("Unexpected response from OpenAI {response}".format(response=message))
-                                
+                                    for toolkit in toolkits:
+                                        for tool in toolkit.tools:
+                                            if isinstance(tool, OpenAIResponsesTool):
+                                                handlers = tool.get_open_ai_output_handlers()
+                                                if message.type in handlers:
+                                                    tool_context = ToolContext(
+                                                        room=room,
+                                                        caller=room.local_participant,
+                                                        caller_context={ "chat" : context.to_json() }
+                                                    )
+                                                    result = await handlers[message.type](tool_context, **message.to_dict(mode="json"))
+                                                    if result != None:
+                                                        return [ result ], False
+                                    
                                 return [], False
                             
                         if stream == False:
@@ -644,13 +651,545 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                                 for output in outputs:
                                                     all_outputs.append(output)
 
+                                    else:
+                                        for toolkit in toolkits:
+                                            for tool in toolkit.tools:
+
+                                                if isinstance(tool, OpenAIResponsesTool):
+
+                                                    callbacks = tool.get_open_ai_stream_callbacks()
+
+                                                    if event.type in callbacks:
+
+                                                        tool_context = ToolContext(
+                                                            room=room,
+                                                            caller=room.local_participant,
+                                                            caller_context={ "chat" : context.to_json() }
+                                                        )
+
+                                                        await callbacks[event.type](tool_context, **event.to_dict())
+
+
                                     if len(final_outputs) > 0:
 
                                         return final_outputs[0]
     
             except APIStatusError as e:
                 raise RoomException(f"Error from OpenAI: {e}")
-                
+                                        
+
+class OpenAIResponsesTool(BaseTool):
+
+    def get_open_ai_tool_definitions(self) -> list[dict]:
+        return []
+    
+    def get_open_ai_stream_callbacks(self) -> dict[str, Callable]:
+        return {}
+    
+    def get_open_ai_output_handlers(self)  -> dict[str, Callable]:
+        return {}
+        
+
+class ImageGenerationTool(OpenAIResponsesTool):
+    def __init__(self, *,
+        background: Literal["transparent","opaque","auto"] = None,
+        input_image_mask_url: Optional[str] = None,
+        model: Optional[str] = None,
+        moderation: Optional[str] = None,
+        output_compression: Optional[int] = None,
+        output_format: Optional[Literal["png","webp","jpeg"]] = None,
+        partial_images: Optional[int] = None,
+        quality: Optional[Literal["auto", "low", "medium", "high"]] = None,
+        size: Optional[Literal["1024x1024","1024x1536","1536x1024","auto"]] = None
+    ):
+        super().__init__(name="image_generation")
+        self.background = background
+        self.input_image_mask_url = input_image_mask_url
+        self.model = model
+        self.moderation = moderation
+        self.output_compression = output_compression
+        self.output_format = output_format
+        if partial_images == None:
+            partial_images = 1 # streaming wants non zero, and we stream by default
+        self.partial_images = partial_images
+        self.quality = quality
+        self.size = size
+
+    def get_open_ai_tool_definitions(self):
+        opts = {
+            "type" : "image_generation"
+        }
+
+        if self.background != None:
+            opts["background"] = self.background
+
+        if self.input_image_mask_url != None:
+            opts["input_image_mask"] = { "image_url" : self.input_image_mask_url }
+
+        if self.model != None:
+            opts["model"] = self.model
+
+        if self.moderation != None:
+            opts["moderation"] = self.moderation
+
+        if self.output_compression != None:
+            opts["output_compression"] = self.output_compression
+
+        if self.output_format != None:
+            opts["output_format"] = self.output_format
+
+        if self.partial_images != None:
+            opts["partial_images"] = self.partial_images
+
+        if self.quality != None:
+            opts["quality"] = self.quality
+
+        if self.size != None:
+            opts["size"] = self.size
+
+        return [ opts ]
+    
+    def get_open_ai_stream_callbacks(self):
+        return {
+            "response.image_generation_call.completed" : self.on_image_generation_completed,
+            "response.image_generation_call.in_progress" : self.on_image_generation_in_progress,
+            "response.image_generation_call.generating" : self.on_image_generation_generating,
+            "response.image_generation_call.partial_image" : self.on_image_generation_partial,
+        }
+    
+    def get_open_ai_output_handlers(self):
+        return {
+            "image_generation_call" : self.handle_image_generated
+        }
+
+    # response.image_generation_call.completed
+    async def on_image_generation_completed(self, context: ToolContext, *, item_id: str, output_index: int, sequence_number: int, type: str, **extra):
+        pass
+
+    # response.image_generation_call.in_progress
+    async def on_image_generation_in_progress(self, context: ToolContext, *, item_id: str, output_index: int, sequence_number: int, type: str, **extra):
+        pass
+
+    # response.image_generation_call.generating
+    async def on_image_generation_generating(self, context: ToolContext, *, item_id: str, output_index: int, sequence_number: int, type: str, **extra):
+        pass
+
+    # response.image_generation_call.partial_image
+    async def on_image_generation_partial(self, context: ToolContext, *, item_id: str, output_index: int, sequence_number: int, type: str, partial_image_b64: str, partial_image_index: int, size: str, quality: str, background: str, output_format: str, **extra):
+        pass
+
+    async def on_image_generated(self, context: ToolContext, *, item_id: str, data: bytes, status: str,  size: str, quality: str, background: str, output_format: str, **extra):
+        pass
+
+    async def handle_image_generated(self, context: ToolContext, *, id: str, result: str | None, status: str, type: str, size: str, quality: str, background: str, output_format: str, **extra):
+        if result != None:
+            data = base64.b64decode(result)
+            await self.on_image_generated(context, item_id=id, data=data, status=status, size=size, quality=quality, background=background, output_format=output_format)
 
 
-  
+class LocalShellTool(OpenAIResponsesTool):
+    def __init__(self):
+        super().__init__(name="local_shell")
+
+    def get_open_ai_tool_definitions(self):
+        return [
+            {
+                "type" : "local_shell"
+            }
+        ]
+    
+    def get_open_ai_output_handlers(self):
+        return {
+            "local_shell_call" : self.handle_local_shell_call
+        }
+
+    async def execute_shell_command(self, context: ToolContext, *, command: list[str], env: dict, type: str, timeout_ms: int | None, user: str | None, working_directory: str | None):
+
+        merged_env = {**os.environ, **(env or {})}
+
+        # Spawn the process
+        proc = await asyncio.create_subprocess_exec(
+            *(command if isinstance(command, (list, tuple)) else [command]),
+            cwd=working_directory or os.getcwd(),
+            env=merged_env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=timeout_ms / 1000 if timeout_ms else None,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()                 # send SIGKILL / TerminateProcess
+            stdout, stderr = await proc.communicate()
+            raise                       # re-raise so caller sees the timeout
+
+
+        encoding = os.device_encoding(1) or "utf-8"
+        stdout = stdout.decode(encoding, errors="replace")
+        stderr = stderr.decode(encoding, errors="replace")
+
+        return stdout + stderr
+    
+    async def handle_local_shell_call(self, context, *, id: str, action: dict, call_id: str, status: str, type: str, **extra):
+       
+        result = await self.execute_shell_command(context, **action)  
+
+        output_item = {
+            "type": "local_shell_call_output",
+            "call_id": call_id,
+            "output": result,
+        }
+
+        return output_item
+
+
+class ContainerFile:
+    def __init__(self, *, file_id: str, mime_type: str, container_id: str):
+        self.file_id = file_id
+        self.mime_type = mime_type
+        self.container_id = container_id
+
+class CodeInterpreterTool(OpenAIResponsesTool):
+    def __init__(self, *, container_id: Optional[str] = None, file_ids: Optional[List[str]] = None):
+        super().__init__(name="code_interpreter_call")
+        self.container_id = container_id
+        self.file_ids = file_ids
+
+    def get_open_ai_tool_definitions(self):
+        opts = {
+            "type" : "code_interpreter"
+        }
+
+        if self.container_id != None:
+            opts["container_id"] = self.container_id
+
+        if self.file_ids != None:
+            if self.container_id != None:
+                raise Exception("Cannot specify both an existing container and files to upload in a code interpreter tool")
+            
+            opts["container"] = {
+                "type" : "auto",
+                "file_ids" : self.file_ids
+            }
+
+        return [
+            opts
+        ]
+    
+    def get_open_ai_output_handlers(self):
+        return {
+            "code_interpreter_call" : self.handle_code_interpreter_call
+        }
+    
+    async def on_code_interpreter_result(self, context: ToolContext, *, code: str, logs: list[str], files: list[ContainerFile]):
+        pass
+    
+    async def handle_code_interpreter_call(self, context, *, code: str, id: str, results: list[dict], call_id: str, status: str, type: str, container_id: str, **extra):
+       
+        logs = []
+        files = []
+
+        for result in results:
+           
+            if result.type == "logs":
+               
+               logs.append(results["logs"])
+            
+            elif result.type == "files":
+
+                files.append(ContainerFile(container_id=container_id, file_id=result["file_id"], mime_type=result["mime_type"]))
+
+        await self.on_code_interpreter_result(context, code=code, logs=logs, files=files)
+
+
+class MCPToolDefinition:
+    def __init__(self, *, input_schema: dict, name: str, annotations: dict | None, description: str | None):
+        self.input_schema = input_schema
+        self.name = name
+        self.annotations = annotations
+        self.description = description
+
+class MCPServer:
+    def __init__(self, *, 
+        server_label: str,
+        server_url: str,
+        allowed_tools: Optional[list[str]] = None,
+        headers: Optional[dict] = None,
+        # require approval for all tools
+        require_approval: Optional[Literal["always","never"]] = None,
+        # list of tools that always require approval
+        always_require_approval: Optional[list[str]] = None,
+        # list of tools that never require approval
+        never_require_approval: Optional[list[str]] = None
+    ):
+        self.server_label = server_label
+        self.server_url = server_url
+        self.allowed_tools = allowed_tools
+        self.headers = headers
+        self.require_approval = require_approval
+        self.always_require_approval = always_require_approval
+        self.never_require_approval = never_require_approval
+
+
+class MCPTool(OpenAIResponsesTool):
+    def __init__(self, *,
+            servers: list[MCPServer]
+        ):
+        super().__init__(name="mcp")
+        self.servers = servers
+
+    
+    def get_open_ai_tool_definitions(self):
+
+        defs = []
+        for server in self.servers:
+            opts = {
+                "type" : "mcp",
+                "server_label" : server.server_label,
+                "server_url" : server.server_url,
+            }
+
+            if server.allowed_tools != None:
+                opts["allowed_tools"] = server.allowed_tools
+
+            if server.headers != None:
+                opts["headers"] = server.headers
+            
+
+            if server.always_require_approval != None or server.never_require_approval != None:
+                opts["require_approval"] = {}
+
+                if server.always_require_approval != None:
+                    opts["require_approval"]["always"] = { "tool_names" : server.always_require_approval }
+            
+                if server.never_require_approval != None:
+                    opts["require_approval"]["never"] = { "tool_names" : server.never_require_approval }
+
+            if server.require_approval:
+                opts["require_approval"] = server.require_approval
+
+            defs.append(opts)
+
+        return defs
+    
+    def get_open_ai_stream_callbacks(self):
+        return {
+            "response.mcp_list_tools.in_progress" : self.on_mcp_list_tools_in_progress,
+            "response.mcp_list_tools.failed" : self.on_mcp_list_tools_failed,
+            "response.mcp_list_tools.completed" : self.on_mcp_list_tools_completed,
+            "response.mcp_call.in_progress" : self.on_mcp_call_in_progress,
+            "response.mcp_call.failed" : self.on_mcp_call_failed,
+            "response.mcp_call.completed" : self.on_mcp_call_completed,
+            "response.mcp_call.arguments.done" : self.on_mcp_call_arguments_done,
+            "response.mcp_call.arguments.delta" : self.on_mcp_call_arguments_delta,
+        }
+    
+    async def on_mcp_list_tools_in_progress(self, context: ToolContext, *, sequence_number: int, type: str, **extra):
+        pass
+
+    async def on_mcp_list_tools_failed(self, context: ToolContext, *, sequence_number: int, type: str, **extra):
+        pass
+
+    async def on_mcp_list_tools_completed(self, context: ToolContext, *, sequence_number: int, type: str, **extra):
+        pass
+
+    async def on_mcp_call_in_progress(self, context: ToolContext, *, item_id: str, output_index: int, sequence_number: int, type: str, **extra):
+        pass
+
+    async def on_mcp_call_failed(self, context: ToolContext, *, sequence_number: int, type: str, **extra):
+        pass
+
+    async def on_mcp_call_completed(self, context: ToolContext, *, sequence_number: int, type: str, **extra):
+        pass
+
+    async def on_mcp_call_arguments_done(self, context: ToolContext, *, arguments: dict, item_id: str, output_index: int, sequence_number: int, type: str, **extra):
+        pass
+
+    async def on_mcp_call_arguments_delta(self, context: ToolContext, *, delta: dict, item_id: str, output_index: int, sequence_number: int, type: str, **extra):
+        pass
+
+
+    def get_open_ai_output_handlers(self):
+        return {
+            "mcp_call" : self.handle_mcp_call,
+            "mcp_list_tools" : self.handle_mcp_list_tools,
+            "mcp_approval" : self.handle_mcp_approval,
+        }
+
+    async def on_mcp_list_tools(self, context: ToolContext, *, server_label: str, tools: list[MCPToolDefinition], error: str | None, **extra):
+        pass
+    
+    async def handle_mcp_list_tools(self, context, *, id: str, server_label: str, tools: list, type: str, error: str | None, **extra):
+       
+        mcp_tools = []
+        for tool in tools:
+            mcp_tools.append(MCPToolDefinition(input_schema=tool["input_schema"], name=tool["name"], annotations=tool["annotations"], description=tool["description"]))
+        
+        await self.on_mcp_list_tools(context, server_label=server_label, tools=mcp_tools, error=error)
+
+
+    async def on_mcp_call(self, context: ToolContext, *, name: str, arguments: str, server_label: str, status: str, error: str | None, output: str | None, **extra):
+        pass
+    
+    async def handle_mcp_call(self, context, *, arguments: str, id: str, name: str, server_label: str, status: str, type: str, error: str | None, output: str | None, **extra):
+       
+        await self.on_mcp_call(context, name=name, arguments=arguments, server_label=server_label, status=status, error=error, output=output)
+
+
+    async def on_mcp_approval(self, context: ToolContext, *, name: str, arguments: str, server_label: str, **extra):
+        pass
+    
+    async def handle_mcp_approval(self, context: ToolContext, *, arguments: str, id: str, name: str, server_label: str, type: str, **extra):
+        await self.on_mcp_approval(context, arguments=arguments, name=name, server_label=server_label)
+
+
+class ReasoningTool(OpenAIResponsesTool):
+    def __init__(self):
+        super().__init__(name="reasoning")
+
+
+    def get_open_ai_output_handlers(self):
+        return {
+            "reasoning" : self.handle_reasoning,
+        }
+    
+    def get_open_ai_stream_callbacks(self):
+        return {
+            "response.reasoning_summary_text.done" : self.on_reasoning_summary_text_done,
+            "response.reasoning_summary_text.delta" : self.on_reasoning_summary_text_delta,
+            "response.reasoning_summary_part.done" :  self.on_reasoning_summary_part_done,
+            "response.reasoning_summary_part.added" : self.on_reasoning_summary_part_added,
+        }
+
+    async def on_reasoning_summary_part_added(self, context: ToolContext, *, item_id: str, output_index: int, part: dict, sequence_number: int, summary_index: int, text: str, type: str, **extra):
+        pass
+
+
+    async def on_reasoning_summary_part_done(self, context: ToolContext, *, item_id: str, output_index: int, part: dict, sequence_number: int, summary_index: int, text: str, type: str, **extra):
+        pass
+
+    async def on_reasoning_summary_text_delta(self, context: ToolContext, *, delta: str, output_index: int, sequence_number: int, summary_index: int, text: str, type: str, **extra):
+        pass
+
+    async def on_reasoning_summary_text_done(self, context: ToolContext, *, item_id: str, output_index: int, sequence_number: int, summary_index: int, text: str, type: str, **extra):
+        pass
+
+    async def on_reasoning(self, context: ToolContext, *, summary: str, encrypted_content: str | None, status: Literal["in_progress", "completed", "incomplete"]):
+        pass
+    
+    async def handle_reasoning(self, context: ToolContext, *, id: str, summary: str, type: str, encrypted_content: str | None, status: str, **extra):
+        
+        await self.on_reasoning(context, summary=summary, encrypted_content=encrypted_content, status=status)
+
+
+# TODO: computer tool call
+
+class WebSearchTool(OpenAIResponsesTool):
+    def __init__(self):
+        super().__init__(name="web_search")
+
+
+    def get_open_ai_tool_definitions(self) -> list[dict]:
+        return [
+            {
+                "type" : "web_search_preview"
+            }
+        ]
+
+
+    def get_open_ai_stream_callbacks(self):
+        return {
+            "response.web_search_call.in_progress" : self.on_web_search_call_in_progress,
+            "response.web_search_call.searching" : self.on_web_search_call_searching,
+            "response.web_search_call.completed" : self.on_web_search_call_completed,
+        }
+    
+    def get_open_ai_output_handlers(self):
+        return {
+            "web_search_call" : self.handle_web_search_call
+        }
+    
+    async def on_web_search_call_in_progress(self, context: ToolContext, *, item_id: str, output_index: int, sequence_number: int, type: str, **extra):
+        pass
+
+    async def on_web_search_call_searching(self, context: ToolContext, *, item_id: str, output_index: int, sequence_number: int, type: str, **extra):
+        pass
+
+    async def on_web_search_call_completed(self, context: ToolContext, *, item_id: str, output_index: int, sequence_number: int, type: str, **extra):
+        pass
+
+    async def on_web_search(self, context: ToolContext, *, status: str, **extra):
+        pass
+    
+    async def handle_web_search_call(self, context: ToolContext, *, id: str, status: str, type: str, **extra):
+        
+        await self.on_web_search(context, status=status)
+
+class FileSearchResult:
+    def __init__(self, *, attributes: dict, file_id: str, filename: str, score: float, text: str):
+        self.attributes = attributes
+        self.file_id = file_id
+        self.filename = filename
+        self.score = score
+        self.text = text
+
+class FileSearchTool(OpenAIResponsesTool):
+    def __init__(self, *, vector_store_ids: list[str], filters: Optional[dict] = None, max_num_results: Optional[int] = None, ranking_options: Optional[dict] = None):
+        super().__init__(name="file_search")
+        
+        self.vector_store_ids = vector_store_ids
+        self.filters = filters
+        self.max_num_results = max_num_results
+        self.ranking_options = ranking_options
+
+    def get_open_ai_tool_definitions(self) -> list[dict]:
+        return [
+            {
+                "type" : "file_search",
+                "vector_store_ids" : self.vector_store_ids,
+                "filters" : self.filters,
+                "max_num_results" : self.max_num_results,
+                "ranking_options" : self.ranking_options
+            }
+        ]
+
+
+    def get_open_ai_stream_callbacks(self):
+        return {
+            "response.file_search_call.in_progress" : self.on_file_search_call_in_progress,
+            "response.file_search_call.searching" : self.on_file_search_call_searching,
+            "response.file_search_call.completed" : self.on_file_search_call_completed,
+        }
+    
+
+    def get_open_ai_output_handlers(self):
+        return {
+            "handle_file_search_call" : self.handle_file_search_call
+        }
+
+    
+    async def on_file_search_call_in_progress(self, context: ToolContext, *, item_id: str, output_index: int, sequence_number: int, type: str, **extra):
+        pass
+
+    async def on_file_search_call_searching(self, context: ToolContext, *, item_id: str, output_index: int, sequence_number: int, type: str, **extra):
+        pass
+
+    async def on_file_search_call_completed(self, context: ToolContext, *, item_id: str, output_index: int, sequence_number: int, type: str, **extra):
+        pass
+
+    async def on_file_search(self, context: ToolContext, *, queries: list, results: list[FileSearchResult], status: Literal["in_progress", "searching", "incomplete", "failed"]):
+        pass
+    
+    async def handle_file_search_call(self, context: ToolContext, *, id: str, queries: list, status: str, results: dict | None, type: str, **extra):
+        
+        search_results = None
+        if results != None:
+            search_results = []
+            for result in results:
+                search_results.append(FileSearchResult(**result))
+
+        await self.on_file_search(context, queries=queries, results=search_results, status=status)
+
