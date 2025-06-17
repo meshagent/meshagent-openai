@@ -803,7 +803,7 @@ class LocalShellTool(OpenAIResponsesTool):
             "local_shell_call" : self.handle_local_shell_call
         }
 
-    async def execute_shell_command(self, context: ToolContext, *, command: list[str], env: dict, type: str, timeout_ms: int | None, user: str | None, working_directory: str | None):
+    async def execute_shell_command(self, context: ToolContext, *, command: list[str], env: dict, type: str, timeout_ms: int | None = None, user: str | None = None, working_directory: str | None = None):
 
         merged_env = {**os.environ, **(env or {})}
 
