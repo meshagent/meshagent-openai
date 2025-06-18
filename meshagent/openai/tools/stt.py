@@ -1,4 +1,4 @@
-from meshagent.tools import ToolContext, Tool, JsonResponse, TextResponse
+from meshagent.tools import ToolContext, Tool, Toolkit, JsonResponse, TextResponse
 from openai import AsyncOpenAI
 from meshagent.openai.proxy import get_client
 from typing import Optional
@@ -77,3 +77,14 @@ class OpenAIAudioFileSTT(Tool):
             client = get_client(room=context.room)
 
         return await _transcribe(client=client, data=file_data.data, model=model, prompt=prompt, filename=pathlib.Path(path).name, response_format=response_format)
+
+
+class OpenAISTTToolkit(Toolkit):
+    def __init__(self):
+        super().__init__(
+            name="openai-stt",
+            description="tools for speech to text using openai",
+            tools=[
+                OpenAIAudioFileSTT()
+            ]
+        )
