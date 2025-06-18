@@ -29,7 +29,7 @@ async def _transcribe(*, client: AsyncOpenAI, data: bytes, model: str, filename:
 class OpenAIAudioFileSTT(Tool):
     def __init__(self, *, client: Optional[AsyncOpenAI] = None):
         super().__init__(
-            name="openai-stt",
+            name="openai-file-stt",
             input_schema={
                 "type" : "object",
                 "additionalProperties" : False,
