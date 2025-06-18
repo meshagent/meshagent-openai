@@ -452,7 +452,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                                             if tool_chat_context.previous_response_id != None:
                                                                 context.track_response(tool_chat_context.previous_response_id)
 
-                                                    span.set_attribute("response", tool_adapter.to_plain_text(tool_response))
+                                                    span.set_attribute("response", tool_adapter.to_plain_text(room=room, response=tool_response))
 
                                                     logger.info(f"tool response {tool_response}")
                                                     return await tool_adapter.create_messages(context=context, tool_call=tool_call, room=room, response=tool_response)
