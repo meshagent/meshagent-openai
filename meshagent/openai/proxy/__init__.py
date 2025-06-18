@@ -1,1 +1,1 @@
-from proxy import get_client
+from .proxy import get_client
