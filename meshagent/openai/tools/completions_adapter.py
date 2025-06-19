@@ -18,7 +18,7 @@ import logging
 import re
 import asyncio
 
-from proxy import get_client
+from meshagent.openai.proxy import get_client
 
 logger = logging.getLogger("openai_agent")
 

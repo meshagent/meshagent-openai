@@ -523,6 +523,10 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                                     result = await handlers[message.type](tool_context, **message.to_dict(mode="json"))
                                                     if result != None:
                                                         return [ result ], False
+                                                else:
+
+                                                    logger.warning(f"OpenAI response handler was not registered for {message.type}")
+        
                                     
                                 return [], False
                             
@@ -574,7 +578,6 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                         "type" : event.type,
                                         "event" : event.model_dump_json()
                                     })
-
 
                                     event_handler(event)
 
@@ -980,13 +983,13 @@ class MCPTool(OpenAIResponsesTool):
         return {
             "mcp_call" : self.handle_mcp_call,
             "mcp_list_tools" : self.handle_mcp_list_tools,
-            "mcp_approval" : self.handle_mcp_approval,
+            "mcp_approval_request" : self.handle_mcp_approval_request,
         }
 
     async def on_mcp_list_tools(self, context: ToolContext, *, server_label: str, tools: list[MCPToolDefinition], error: str | None, **extra):
         pass
     
-    async def handle_mcp_list_tools(self, context, *, id: str, server_label: str, tools: list, type: str, error: str | None, **extra):
+    async def handle_mcp_list_tools(self, context, *, id: str, server_label: str, tools: list, type: str, error: str | None = None, **extra):
        
         mcp_tools = []
         for tool in tools:
@@ -995,19 +998,34 @@ class MCPTool(OpenAIResponsesTool):
         await self.on_mcp_list_tools(context, server_label=server_label, tools=mcp_tools, error=error)
 
 
-    async def on_mcp_call(self, context: ToolContext, *, name: str, arguments: str, server_label: str, status: str, error: str | None, output: str | None, **extra):
+    async def on_mcp_call(self, context: ToolContext, *, name: str, arguments: str, server_label: str, error: str | None, output: str | None, **extra):
         pass
     
-    async def handle_mcp_call(self, context, *, arguments: str, id: str, name: str, server_label: str, status: str, type: str, error: str | None, output: str | None, **extra):
+    async def handle_mcp_call(self, context, *, arguments: str, id: str, name: str, server_label: str, type: str, error: str | None, output: str | None, **extra):
        
-        await self.on_mcp_call(context, name=name, arguments=arguments, server_label=server_label, status=status, error=error, output=output)
+        await self.on_mcp_call(context, name=name, arguments=arguments, server_label=server_label, error=error, output=output)
 
 
-    async def on_mcp_approval(self, context: ToolContext, *, name: str, arguments: str, server_label: str, **extra):
-        pass
+    async def on_mcp_approval_request(self, context: ToolContext, *, name: str, arguments: str, server_label: str, **extra) -> bool:
+        return True
     
-    async def handle_mcp_approval(self, context: ToolContext, *, arguments: str, id: str, name: str, server_label: str, type: str, **extra):
-        await self.on_mcp_approval(context, arguments=arguments, name=name, server_label=server_label)
+    async def handle_mcp_approval_request(self, context: ToolContext, *, arguments: str, id: str, name: str, server_label: str, type: str, **extra):
+        logger.info("approval requested for MCP tool {server_label}.{name}")
+        should_approve = await self.on_mcp_approval_request(context, arguments=arguments, name=name, server_label=server_label)
+        if should_approve:
+            logger.info("approval granted for MCP tool {server_label}.{name}")
+            return {
+                "type": "mcp_approval_response",
+                "approve": True,
+                "approval_request_id": id
+            }
+        else:
+            logger.info("approval denied for MCP tool {server_label}.{name}")
+            return {
+                "type": "mcp_approval_response",
+                "approve": False,
+                "approval_request_id": id
+            }
 
 
 class ReasoningTool(OpenAIResponsesTool):
