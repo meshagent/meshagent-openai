@@ -1,28 +1,24 @@
 
-from meshagent.agents.agent import Agent, AgentChatContext, AgentCallContext
-from meshagent.api import WebSocketClientProtocol, RoomClient, RoomException
+from meshagent.agents.agent import AgentChatContext
+from meshagent.api import RoomClient, RoomException
 from meshagent.tools.blob import Blob, BlobStorage
-from meshagent.tools import Toolkit, ToolContext, Tool
+from meshagent.tools import Toolkit, ToolContext
 from meshagent.api.messaging import Response, LinkResponse, FileResponse, JsonResponse, TextResponse, EmptyResponse
-from meshagent.api.schema_util import prompt_schema
 from meshagent.agents.adapter import ToolResponseAdapter, LLMAdapter
-from uuid import uuid4
 import json
-from jsonschema import validate
-from typing import List, Dict
+from typing import List
 
 from openai import AsyncOpenAI, APIStatusError
 from openai.types.chat import ChatCompletion, ChatCompletionMessage, ChatCompletionMessageToolCall
 
-from copy import deepcopy
-from abc import abstractmethod, ABC
 import os
-import jsonschema
 from typing import Optional, Any
 
 import logging
 import re
 import asyncio
+
+from proxy import get_client
 
 logger = logging.getLogger("openai_agent")
 
@@ -235,40 +231,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
 
         return context
 
-    def _get_client(self, *, room: RoomClient) -> AsyncOpenAI:
-        if self._client != None:
-            
-            openai = self._client
-
-        else:
-
-            if os.getenv("OPENAI_BASE_URL") == None:
-
-                token : str = room.protocol.token
-                url : str = room.room_url
-                
-                room_proxy_url = f"{url}/v1"
-                if room_proxy_url.startswith("ws:") or room_proxy_url.startswith("wss:"):
-                    room_proxy_url = room_proxy_url.replace("ws","http",1)
-
-                openai=AsyncOpenAI(
-                    api_key=token,
-                    base_url=room_proxy_url,
-                    default_headers={
-                        "Meshagent-Session" : room.session_id
-                    }
-                )
-
-            else:
-            
-                openai=AsyncOpenAI(
-                    default_headers={
-                        "Meshagent-Session" : room.session_id
-                    }
-                )
-       
-        return openai
-    
+   
     # Takes the current chat context, executes a completion request and processes the response.
     # If a tool calls are requested, invokes the tools, processes the tool calls results, and appends the tool call results to the context
     async def next(self,
@@ -283,7 +246,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
             tool_adapter = OpenAICompletionsToolResponseAdapter()
 
         try:
-            openai = self._get_client(room=room)
+            openai = get_client(room=room)
 
             tool_bundle = CompletionsToolBundle(toolkits=[
                 *toolkits,

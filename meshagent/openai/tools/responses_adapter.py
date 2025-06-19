@@ -4,13 +4,10 @@ from meshagent.api import WebSocketClientProtocol, RoomClient, RoomException
 from meshagent.tools.blob import Blob, BlobStorage
 from meshagent.tools import Toolkit, ToolContext, Tool, BaseTool
 from meshagent.api.messaging import Response, LinkResponse, FileResponse, JsonResponse, TextResponse, EmptyResponse, RawOutputs, ensure_response
-from meshagent.api.schema_util import prompt_schema
 from meshagent.agents.adapter import ToolResponseAdapter, LLMAdapter
-from uuid import uuid4
 import json
-from jsonschema import validate
 from typing import List, Literal
-
+from meshagent.openai.proxy import get_client
 from openai import AsyncOpenAI, APIStatusError, NOT_GIVEN, APIStatusError
 from openai.types.responses import ResponseFunctionToolCall, ResponseComputerToolCall, ResponseStreamEvent, ResponseImageGenCallCompletedEvent
 import os
@@ -24,7 +21,6 @@ import asyncio
 from pydantic import BaseModel
 
 logger = logging.getLogger("openai_agent")
-
 
 from opentelemetry import trace
 
@@ -90,6 +86,10 @@ class ResponsesToolBundle:
                         open_ai_tools.append(fn)
 
                 elif isinstance(v, Tool):
+                    
+                    strict = True
+                    if hasattr(v, "strict"):
+                        strict = getattr(v, "strict") == True
 
                     fn = {
                         "type" : "function",
@@ -98,7 +98,7 @@ class ResponsesToolBundle:
                         "parameters" : {
                             **v.input_schema,
                         },
-                        "strict": True,
+                        "strict": strict,
                     }
 
                     if v.defs != None:
@@ -279,42 +279,6 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
 
         return True
 
-    def _get_client(self, *, room: RoomClient) -> AsyncOpenAI:
-        if self._client != None:
-            
-            openai = self._client
-
-        else:
-
-            if os.getenv("MESHAGENT_API_URL") == None:
-
-                token : str = room.protocol.token
-                url : str = room.room_url
-                
-                room_proxy_url = f"{url}/v1"
-                if room_proxy_url.startswith("ws:") or room_proxy_url.startswith("wss:"):
-                    room_proxy_url = room_proxy_url.replace("ws","http",1)
-
-                openai=AsyncOpenAI(
-                    api_key=token,
-                    base_url=room_proxy_url,
-                    default_headers={
-                        "Meshagent-Session" : room.session_id
-                    }
-                )
-
-            else:
-            
-                openai=AsyncOpenAI(
-                    default_headers={
-                        "Meshagent-Session" : room.session_id
-                    }
-                )
-       
-        return openai
-    
-    
-    
     # Takes the current chat context, executes a completion request and processes the response.
     # If a tool calls are requested, invokes the tools, processes the tool calls results, and appends the tool call results to the context
     async def next(self,
@@ -347,7 +311,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                             "provider": self._provider
                         })
                     
-                        openai = self._get_client(room=room)
+                        openai = get_client(room=room)
 
                         response_schema = output_schema
                         response_name = "response"
