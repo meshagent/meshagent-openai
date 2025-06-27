@@ -26,6 +26,11 @@ from opentelemetry import trace
 
 tracer = trace.get_tracer("openai.llm.responses")
 
+def safe_model_dump(model: BaseModel):
+    try:
+       return model.model_dump_json()
+    except:
+        return {"error":"unable to dump json for model"}
 
 def _replace_non_matching(text: str, allowed_chars: str, replacement: str) -> str:
     """
@@ -369,7 +374,6 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                     response_options = self._response_options
                                     if response_options == None:
                                         response_options = {}
-
                                     response : Response = await openai.responses.create(
                                         stream=stream,
                                         model = self._model,
@@ -398,9 +402,9 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
 
                                 span.set_attributes({
                                     "type" : message.type,
-                                    "message" : message.model_dump_json()
+                                    "message" : safe_model_dump(message)
                                 })
-
+                             
                                 room.developer.log_nowait(type=f"llm.message", data={
                                     "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : message.to_dict()
                                 })
@@ -576,7 +580,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                     event : ResponseStreamEvent = e
                                     span.set_attributes({
                                         "type" : event.type,
-                                        "event" : event.model_dump_json()
+                                        "event" : safe_model_dump(event)
                                     })
 
                                     event_handler(event)
