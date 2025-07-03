@@ -5,7 +5,11 @@ from openai import AsyncOpenAI
 def get_client(*, room: RoomClient) -> AsyncOpenAI:
 
     token : str = room.protocol.token
-    url : str = room.room_url
+    
+    # when running inside the room pod, the room.room_url currently points to the external url
+    # so we need to use url off the protocol (if available).
+    # TODO: room_url should be set properly, but may need a claim in the token to be set during call to say it is local
+    url : str = getattr(room.protocol, "url", room.room_url)
     
     room_proxy_url = f"{url}/v1"
 
