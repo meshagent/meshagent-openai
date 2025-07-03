@@ -1,5 +1,6 @@
 from meshagent.tools import ToolContext, Tool, Toolkit, JsonResponse, TextResponse
 from openai import AsyncOpenAI
+from pydantic import BaseModel
 from meshagent.openai.proxy import get_client
 from typing import Optional
 import io
@@ -9,7 +10,7 @@ async def _transcribe(*, client: AsyncOpenAI, data: bytes, model: str, filename:
 
     buf = io.BytesIO(data)
     buf.name = filename
-    transcript = await client.audio.transcriptions.create(
+    transcript : BaseModel = await client.audio.transcriptions.create(
         model=model,
         response_format=response_format,
         file=buf,
@@ -22,7 +23,7 @@ async def _transcribe(*, client: AsyncOpenAI, data: bytes, model: str, filename:
     if isinstance(transcript, str):
         return TextResponse(text=transcript)
     
-    return JsonResponse(json=transcript.to_dict(mode="json"))
+    return JsonResponse(json=transcript.model_dump(mode="json"))
 
 class OpenAIAudioFileSTT(Tool):
     def __init__(self, *, client: Optional[AsyncOpenAI] = None):

@@ -19,6 +19,7 @@ import re
 import asyncio
 
 from pydantic import BaseModel
+import copy
 
 logger = logging.getLogger("openai_agent")
 
@@ -26,11 +27,17 @@ from opentelemetry import trace
 
 tracer = trace.get_tracer("openai.llm.responses")
 
+
+def safe_json_dump(data: dict):
+    
+    return json.dumps(copy.deepcopy(data))
+
 def safe_model_dump(model: BaseModel):
     try:
-       return model.model_dump_json()
+       return safe_json_dump(model.model_dump(mode='json'))
     except:
         return {"error":"unable to dump json for model"}
+
 
 def _replace_non_matching(text: str, allowed_chars: str, replacement: str) -> str:
     """
@@ -216,39 +223,43 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
 
     async def create_messages(self, *, context: AgentChatContext, tool_call: ResponseFunctionToolCall, room: RoomClient, response: Response) -> list:
 
-        if isinstance(response, RawOutputs):
+        with tracer.start_as_current_span("llm.tool_adapter.create_messages") as span:
+
             
-            for output in response.outputs:
-                
-                room.developer.log_nowait(type="llm.message", data={ "context" : context.id,  "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : output })
-                                    
-            return response.outputs
-        else:
-            output = await self.to_plain_text(room=room, response=response)
-                
-            message = {
-                "output" : output,
-                "call_id" : tool_call.call_id,
-                "type" : "function_call_output"
-            }
+            if isinstance(response, RawOutputs):
+                span.set_attribute("kind", "raw")
+                for output in response.outputs:
+                    
+                    room.developer.log_nowait(type="llm.message", data={ "context" : context.id,  "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : output })
+                                       
+                return response.outputs
+            else:
 
-            room.developer.log_nowait(type="llm.message", data={ "context" : context.id,  "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : message })
+                span.set_attribute("kind", "text")
+                output = await self.to_plain_text(room=room, response=response)
+                span.set_attribute("output", output)
+                    
+                message = {
+                    "output" : output,
+                    "call_id" : tool_call.call_id,
+                    "type" : "function_call_output"
+                }
 
-            return [ message ]
+                room.developer.log_nowait(type="llm.message", data={ "context" : context.id,  "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : message })
+
+                return [ message ]
 
 class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
     def __init__(self,      
         model: str = os.getenv("OPENAI_MODEL","gpt-4.1"),
         parallel_tool_calls : Optional[bool] = None,
         client: Optional[AsyncOpenAI] = None,
-        retries : int = 0,
         response_options : Optional[dict] = None,
         provider: str = "openai"
     ):
         self._model = model
         self._parallel_tool_calls = parallel_tool_calls
         self._client = client
-        self._retries = retries
         self._response_options = response_options
         self._provider = provider
 
@@ -273,13 +284,10 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
     async def check_for_termination(self, *, context: AgentChatContext, room: RoomClient) -> bool:
         if len(context.previous_messages) > 0:
             last_message = context.previous_messages[-1]
-            logger.info(f"last_message {last_message}")
-
+            
         for message in context.messages:
 
             if message.get("type", "message") != "message":
-                logger.info(f"found {message.get("type", "message")}")
-
                 return False
 
         return True
@@ -328,14 +336,9 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                         ])
                         open_ai_tools = tool_bundle.to_json()
 
-                        if open_ai_tools != None:
-                            logger.info("OpenAI Tools: %s", json.dumps(open_ai_tools))
-                        else:
-                            logger.info("OpenAI Tools: Empty")
+                        if open_ai_tools == None:
                             open_ai_tools = NOT_GIVEN
                         
-
-                        logger.info("model: %s, context: %s, output_schema: %s", self._model, context.messages, output_schema)
                         ptc = self._parallel_tool_calls
                         extra = {}
                         if ptc != None and self._model.startswith("o") == False:
@@ -365,108 +368,91 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                         
                         stream = event_handler != None
                         
-                        for i in range(self._retries + 1):
-        
-                            if range == self._retries:
-                                raise RoomException("exceeded maximum attempts calling openai")
-                            try:
-                                with tracer.start_as_current_span("llm.invoke") as span:
-                                    response_options = self._response_options
-                                    if response_options == None:
-                                        response_options = {}
-                                    response : Response = await openai.responses.create(
-                                        stream=stream,
-                                        model = self._model,
-                                        input = context.messages,
-                                        tools = open_ai_tools,
-                                        text = text,
-                                        previous_response_id=previous_response_id,
-                                        
-                                        **response_options
-                                    )
-                                    break
-                            except APIStatusError as e:
-                                logger.error(f"error calling openai attempt: {i+1} ({e.response.request.url})", exc_info=e)
-                                raise
-                            except Exception as e:
-                                logger.error(f"error calling openai attempt: {i+1}", exc_info=e)
-                                if i == self._retries:
-                                    raise
-                        
-
-                        async def handle_message(message: BaseModel):
-
-
-
-                            with tracer.start_as_current_span("llm.handle_response") as span:
-
-                                span.set_attributes({
-                                    "type" : message.type,
-                                    "message" : safe_model_dump(message)
-                                })
-                             
-                                room.developer.log_nowait(type=f"llm.message", data={
-                                    "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : message.to_dict()
-                                })
-
-                                if message.type == "function_call":
+                      
+                        with tracer.start_as_current_span("llm.invoke") as span:
+                            response_options = self._response_options
+                            if response_options == None:
+                                response_options = {}
+                            response : Response = await openai.responses.create(
+                                stream=stream,
+                                model = self._model,
+                                input = context.messages,
+                                tools = open_ai_tools,
+                                text = text,
+                                previous_response_id=previous_response_id,
                                 
-                                    tasks = []
+                                **response_options
+                            )
 
-                                    async def do_tool_call(tool_call: ResponseFunctionToolCall):
-                                        
-                                            try:
-                                                with tracer.start_as_current_span("llm.handle_tool_call") as span:
-                                                    
-                                                    span.set_attributes({
-                                                        "id": tool_call.id,
-                                                        "name": tool_call.name,
-                                                        "call_id": tool_call.call_id,
-                                                        "arguments": json.dumps(tool_call.arguments)
-                                                    })
+                            async def handle_message(message: BaseModel):
 
-                                                    tool_context = ToolContext(
-                                                        room=room,
-                                                        caller=room.local_participant,
-                                                        caller_context={ "chat" : context.to_json() }
-                                                    )
-                                                    tool_response = await tool_bundle.execute(context=tool_context, tool_call=tool_call)
-                                                    if tool_response.caller_context != None:
-                                                        if tool_response.caller_context.get("chat", None) != None:
-                                                            tool_chat_context = AgentChatContext.from_json(tool_response.caller_context["chat"])
-                                                            if tool_chat_context.previous_response_id != None:
-                                                                context.track_response(tool_chat_context.previous_response_id)
+                                with tracer.start_as_current_span("llm.handle_response") as span:
 
-                                                    span.set_attribute("response", await tool_adapter.to_plain_text(room=room, response=tool_response))
+                                    span.set_attributes({
+                                        "type" : message.type,
+                                        "message" : safe_model_dump(message)
+                                    })
+                                
+                                    room.developer.log_nowait(type=f"llm.message", data={
+                                        "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : message.to_dict()
+                                    })
 
-                                                    logger.info(f"tool response {tool_response}")
-                                                    return await tool_adapter.create_messages(context=context, tool_call=tool_call, room=room, response=tool_response)
-                                                
-                                            except Exception as e:
-                                                logger.error(f"unable to complete tool call {tool_call}", exc_info=e)
-                                                room.developer.log_nowait(type="llm.error", data={ "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "error" : f"{e}" })
+                                    if message.type == "function_call":
                                     
-                                                return [{
-                                                    "output" : json.dumps({"error":f"unable to complete tool call: {e}"}),
-                                                    "call_id" : tool_call.call_id,
-                                                    "type" : "function_call_output"
-                                                }]
+                                        tasks = []
+
+                                        async def do_tool_call(tool_call: ResponseFunctionToolCall):
+                                            
+                                                try:
+                                                    with tracer.start_as_current_span("llm.handle_tool_call") as span:
+                                                        
+                                                        span.set_attributes({
+                                                            "id": tool_call.id,
+                                                            "name": tool_call.name,
+                                                            "call_id": tool_call.call_id,
+                                                            "arguments": json.dumps(tool_call.arguments)
+                                                        })
+
+                                                        tool_context = ToolContext(
+                                                            room=room,
+                                                            caller=room.local_participant,
+                                                            caller_context={ "chat" : context.to_json() }
+                                                        )
+                                                        tool_response = await tool_bundle.execute(context=tool_context, tool_call=tool_call)
+                                                        if tool_response.caller_context != None:
+                                                            if tool_response.caller_context.get("chat", None) != None:
+                                                                tool_chat_context = AgentChatContext.from_json(tool_response.caller_context["chat"])
+                                                                if tool_chat_context.previous_response_id != None:
+                                                                    context.track_response(tool_chat_context.previous_response_id)
+
+                                                        logger.info(f"tool response {tool_response}")
+                                                        return await tool_adapter.create_messages(context=context, tool_call=tool_call, room=room, response=tool_response)
+                                                    
+                                                except Exception as e:
+                                                    logger.error(f"unable to complete tool call {tool_call}", exc_info=e)
+                                                    room.developer.log_nowait(type="llm.error", data={ "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "error" : f"{e}" })
+                                        
+                                                    return [{
+                                                        "output" : json.dumps({"error":f"unable to complete tool call: {e}"}),
+                                                        "call_id" : tool_call.call_id,
+                                                        "type" : "function_call_output"
+                                                    }]
 
 
-                                    tasks.append(asyncio.create_task(do_tool_call(message)))
+                                        tasks.append(asyncio.create_task(do_tool_call(message)))
 
-                                    results = await asyncio.gather(*tasks)
+                                        results = await asyncio.gather(*tasks)
 
-                                    all_results = []
-                                    for result in results:
-                                        room.developer.log_nowait(type="llm.message", data={ "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : result })
-                                        all_results.extend(result)
+                                        all_results = []
+                                        for result in results:
+                                            room.developer.log_nowait(type="llm.message", data={ "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : result })
+                                            all_results.extend(result)
 
-                                    return all_results, False
+                                        return all_results, False
 
-                                elif message.type == "message":
-                                    with tracer.start_as_current_span("llm.handle_message") as span:
-                                       
+                                    elif message.type == "message":
+                                    
+                                    
                                         contents = message.content
                                         if response_schema == None:
                                             return [], False
@@ -492,159 +478,169 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                                                 continue
                                                     
                                                 return [ full_response ], True
-                                #elif message.type == "computer_call" and tool_bundle.get_tool("computer_call"):
-                                #    with tracer.start_as_current_span("llm.handle_computer_call") as span:
-                                #        
-                                #        computer_call :ResponseComputerToolCall = message
-                                #        span.set_attributes({
-                                #            "id": computer_call.id,
-                                #            "action": computer_call.action,
-                                #            "call_id": computer_call.call_id,
-                                #            "type": json.dumps(computer_call.type)
-                                #        })
+                                    #elif message.type == "computer_call" and tool_bundle.get_tool("computer_call"):
+                                    #    with tracer.start_as_current_span("llm.handle_computer_call") as span:
+                                    #        
+                                    #        computer_call :ResponseComputerToolCall = message
+                                    #        span.set_attributes({
+                                    #            "id": computer_call.id,
+                                    #            "action": computer_call.action,
+                                    #            "call_id": computer_call.call_id,
+                                    #            "type": json.dumps(computer_call.type)
+                                    #        })
 
-                                #        tool_context = ToolContext(
-                                #            room=room,
-                                #            caller=room.local_participant,
-                                #            caller_context={ "chat" : context.to_json }
-                                #        )
-                                #        outputs = (await tool_bundle.get_tool("computer_call").execute(context=tool_context, arguments=message.to_dict(mode="json"))).outputs
+                                    #        tool_context = ToolContext(
+                                    #            room=room,
+                                    #            caller=room.local_participant,
+                                    #            caller_context={ "chat" : context.to_json }
+                                    #        )
+                                    #        outputs = (await tool_bundle.get_tool("computer_call").execute(context=tool_context, arguments=message.model_dump(mode="json"))).outputs
 
-                                #    return outputs, False
-                                      
-
-                                else:
-                                    for toolkit in toolkits:
-                                        for tool in toolkit.tools:
-                                            if isinstance(tool, OpenAIResponsesTool):
-                                                handlers = tool.get_open_ai_output_handlers()
-                                                if message.type in handlers:
-                                                    tool_context = ToolContext(
-                                                        room=room,
-                                                        caller=room.local_participant,
-                                                        caller_context={ "chat" : context.to_json() }
-                                                    )
-                                                    result = await handlers[message.type](tool_context, **message.to_dict(mode="json"))
-                                                    if result != None:
-                                                        return [ result ], False
-                                                else:
-
-                                                    logger.warning(f"OpenAI response handler was not registered for {message.type}")
-        
-                                    
-                                return [], False
-                            
-                        if stream == False:
-                            room.developer.log_nowait(type="llm.message", data={ "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "response" : response.to_dict() })
-                        
-                            context.track_response(response.id)
-
-                            final_outputs = []
-                            
-                            for message in response.output:
-                                context.previous_messages.append(message.to_dict())
-                                outputs, done = await handle_message(message=message)
-                                if done:
-                                    final_outputs.extend(outputs)
-                                else:
-                                    for output in outputs:
-                                        context.messages.append(output)
-
-                            if len(final_outputs) > 0:
-
-                                return final_outputs[0]
-                            
-                            with tracer.start_as_current_span("llm.turn.check_for_termination") as span:
-
-                                term = await self.check_for_termination(context=context, room=room)
-                                if term:
-                                    span.set_attribute("terminate", True)
-                                    text = ""
-                                    for output in response.output:
-                                        if output.type == "message":
-                                            for content in output.content:
-                                                text += content.text
-
-                                    return text
-                                else:
-                                    span.set_attribute("terminate", False)
-
-
-                        else:
-                            
-                            final_outputs = []
-                            all_outputs = []
-                            async for e in response:
-                                with tracer.start_as_current_span("llm.stream.event") as span:
-
-                                    event : ResponseStreamEvent = e
-                                    span.set_attributes({
-                                        "type" : event.type,
-                                        "event" : safe_model_dump(event)
-                                    })
-
-                                    event_handler(event)
-
-                                    if event.type == "response.completed":
-
-                                    
-                                        context.track_response(event.response.id)
-                                    
-                                        context.messages.extend(all_outputs)
-
-                                        with tracer.start_as_current_span("llm.turn.check_for_termination") as span:
-                                            term = await self.check_for_termination(context=context, room=room)
-                                            
-                                            if term:
-                                                span.set_attribute("terminate", True)
-                                            
-                                                text = ""
-                                                for output in event.response.output:
-                                                    if output.type == "message":
-                                                        for content in output.content:
-                                                            text += content.text
-
-                                                return text
-
-                                            span.set_attribute("terminate", False)
-
-
-                                        all_outputs = []
-
-                                    elif event.type == "response.output_item.done":
-                                    
-                                            context.previous_messages.append(event.item.to_dict())
+                                    #    return outputs, False
                                         
-                                            outputs, done = await handle_message(message=event.item)
-                                            if done:
-                                                final_outputs.extend(outputs)
-                                            else:
-                                                for output in outputs:
-                                                    all_outputs.append(output)
 
                                     else:
                                         for toolkit in toolkits:
                                             for tool in toolkit.tools:
-
                                                 if isinstance(tool, OpenAIResponsesTool):
+                                                    with tracer.start_as_current_span("llm.handle_tool_call") as span:
+                                                        
+                                                        arguments = message.model_dump(mode="json")
+                                                        span.set_attributes({
+                                                            "type" : message.type,
+                                                            "arguments" : safe_json_dump(arguments)
+                                                        })
 
-                                                    callbacks = tool.get_open_ai_stream_callbacks()
+                                                        handlers = tool.get_open_ai_output_handlers()
+                                                        if message.type in handlers:
+                                                            tool_context = ToolContext(
+                                                                room=room,
+                                                                caller=room.local_participant,
+                                                                caller_context={ "chat" : context.to_json() }
+                                                            )
+                                                            result = await handlers[message.type](tool_context, **arguments)
 
-                                                    if event.type in callbacks:
+                                                            if result != None:
+                                                                span.set_attribute("result", safe_json_dump(result))
+                                                                return [ result ], False
+                                                        else:
 
-                                                        tool_context = ToolContext(
-                                                            room=room,
-                                                            caller=room.local_participant,
-                                                            caller_context={ "chat" : context.to_json() }
-                                                        )
+                                                            logger.warning(f"OpenAI response handler was not registered for {message.type}")
+                
+                                            
+                                    return [], False
+                                
+                            if stream == False:
+                                room.developer.log_nowait(type="llm.message", data={ "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "response" : response.to_dict() })
+                            
+                                context.track_response(response.id)
 
-                                                        await callbacks[event.type](tool_context, **event.to_dict())
+                                final_outputs = []
+                                
+                                for message in response.output:
+                                    context.previous_messages.append(message.to_dict())
+                                    outputs, done = await handle_message(message=message)
+                                    if done:
+                                        final_outputs.extend(outputs)
+                                    else:
+                                        for output in outputs:
+                                            context.messages.append(output)
+
+                                if len(final_outputs) > 0:
+
+                                    return final_outputs[0]
+                                
+                                with tracer.start_as_current_span("llm.turn.check_for_termination") as span:
+
+                                    term = await self.check_for_termination(context=context, room=room)
+                                    if term:
+                                        span.set_attribute("terminate", True)
+                                        text = ""
+                                        for output in response.output:
+                                            if output.type == "message":
+                                                for content in output.content:
+                                                    text += content.text
+
+                                        return text
+                                    else:
+                                        span.set_attribute("terminate", False)
 
 
-                                    if len(final_outputs) > 0:
+                            else:
+                                
+                                final_outputs = []
+                                all_outputs = []
+                                async for e in response:
+                                    with tracer.start_as_current_span("llm.stream.event") as span:
 
-                                        return final_outputs[0]
-    
+                                        event : ResponseStreamEvent = e
+                                        span.set_attributes({
+                                            "type" : event.type,
+                                            "event" : safe_model_dump(event)
+                                        })
+
+                                        event_handler(event)
+
+                                        if event.type == "response.completed":
+
+                                        
+                                            context.track_response(event.response.id)
+                                        
+                                            context.messages.extend(all_outputs)
+
+                                            with tracer.start_as_current_span("llm.turn.check_for_termination") as span:
+                                                term = await self.check_for_termination(context=context, room=room)
+                                                
+                                                if term:
+                                                    span.set_attribute("terminate", True)
+                                                
+                                                    text = ""
+                                                    for output in event.response.output:
+                                                        if output.type == "message":
+                                                            for content in output.content:
+                                                                text += content.text
+
+                                                    return text
+
+                                                span.set_attribute("terminate", False)
+
+
+                                            all_outputs = []
+
+                                        elif event.type == "response.output_item.done":
+                                        
+                                                context.previous_messages.append(event.item.to_dict())
+                                            
+                                                outputs, done = await handle_message(message=event.item)
+                                                if done:
+                                                    final_outputs.extend(outputs)
+                                                else:
+                                                    for output in outputs:
+                                                        all_outputs.append(output)
+
+                                        else:
+                                            for toolkit in toolkits:
+                                                for tool in toolkit.tools:
+
+                                                    if isinstance(tool, OpenAIResponsesTool):
+
+                                                        callbacks = tool.get_open_ai_stream_callbacks()
+
+                                                        if event.type in callbacks:
+
+                                                            tool_context = ToolContext(
+                                                                room=room,
+                                                                caller=room.local_participant,
+                                                                caller_context={ "chat" : context.to_json() }
+                                                            )
+
+                                                            await callbacks[event.type](tool_context, **event.to_dict())
+
+
+                                        if len(final_outputs) > 0:
+
+                                            return final_outputs[0]
+        
             except APIStatusError as e:
                 raise RoomException(f"Error from OpenAI: {e}")
                                         
