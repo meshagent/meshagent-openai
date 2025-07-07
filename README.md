@@ -20,3 +20,11 @@ adapter = OpenAIResponsesAdapter(client=AsyncOpenAI(api_key="sk-..."))
 ### Tool Response Adapter
 The ``OpenAICompletionsToolResponseAdapter`` and ``OpenAIResponsesToolResponseAdapter``convert a tool's structured response into plain text or JSOn that can beinserted into an OpenAI chat context. 
 
+---
+### Learn more about MeshAgent on our website or check out the docs for additional examples!
+
+**Website**: [www.meshagent.com](https://www.meshagent.com/)
+
+**Documentation**: [docs.meshagent.com](https://docs.meshagent.com/)
+
+---
