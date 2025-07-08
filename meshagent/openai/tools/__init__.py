@@ -7,3 +7,12 @@ from .completions_adapter import (
     OpenAICompletionsToolResponseAdapter,
 )
 from .stt import OpenAIAudioFileSTT, OpenAISTTToolkit
+
+__all__ = [
+    OpenAIResponsesAdapter,
+    OpenAIResponsesToolResponseAdapter,
+    OpenAICompletionsAdapter,
+    OpenAICompletionsToolResponseAdapter,
+    OpenAIAudioFileSTT,
+    OpenAISTTToolkit,
+]
