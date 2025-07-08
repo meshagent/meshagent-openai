@@ -1,6 +1,6 @@
 
-from meshagent.agents.agent import Agent, AgentChatContext, AgentCallContext
-from meshagent.api import WebSocketClientProtocol, RoomClient, RoomException
+from meshagent.agents.agent import AgentChatContext
+from meshagent.api import RoomClient, RoomException
 from meshagent.tools.blob import Blob, BlobStorage
 from meshagent.tools import Toolkit, ToolContext, Tool, BaseTool
 from meshagent.api.messaging import Response, LinkResponse, FileResponse, JsonResponse, TextResponse, EmptyResponse, RawOutputs, ensure_response
@@ -8,10 +8,10 @@ from meshagent.agents.adapter import ToolResponseAdapter, LLMAdapter
 import json
 from typing import List, Literal
 from meshagent.openai.proxy import get_client
-from openai import AsyncOpenAI, APIStatusError, NOT_GIVEN, APIStatusError
-from openai.types.responses import ResponseFunctionToolCall, ResponseComputerToolCall, ResponseStreamEvent, ResponseImageGenCallCompletedEvent
+from openai import AsyncOpenAI, NOT_GIVEN, APIStatusError
+from openai.types.responses import ResponseFunctionToolCall, ResponseStreamEvent
 import os
-from typing import Optional, Any, Callable
+from typing import Optional, Callable
 import base64
 
 import logging
@@ -393,7 +393,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                         "message" : safe_model_dump(message)
                                     })
                                 
-                                    room.developer.log_nowait(type=f"llm.message", data={
+                                    room.developer.log_nowait(type="llm.message", data={
                                         "context" : context.id, "participant_id" : room.local_participant.id, "participant_name" : room.local_participant.get_attribute("name"), "message" : message.to_dict()
                                     })
 
@@ -463,7 +463,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                                     full_response = json.loads(content.text)
                                                                 
                                                 # sometimes open ai packs two JSON chunks seperated by newline, check if that's why we couldn't parse
-                                                except json.decoder.JSONDecodeError as e:
+                                                except json.decoder.JSONDecodeError:
                                                     for part in content.text.splitlines():
                                                         if len(part.strip()) > 0:
                                                             full_response = json.loads(part)

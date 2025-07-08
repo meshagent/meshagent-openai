@@ -1,4 +1,3 @@
-import os
 from meshagent.api import RoomClient
 from openai import AsyncOpenAI
 

@@ -150,7 +150,7 @@ def validate_schema(schema, path="root", depth=0, stats=None):
     if schema.get("type") == "object":
         stats["total_properties"] += len(schema.get("properties", {}))
         if stats["total_properties"] > 100:
-            return f"Error: Exceeded maximum of 100 object properties."
+            return "Error: Exceeded maximum of 100 object properties."
 
     # Check for total string length
     for key in schema.get("properties", {}):
@@ -159,11 +159,11 @@ def validate_schema(schema, path="root", depth=0, stats=None):
         stats["total_enum_values"] += 1
         stats["total_enum_string_length"] += len(str(enum)) if enum is not None else 4
     if stats["total_string_length"] > 15000:
-        return f"Error: Exceeded maximum total string length of 15,000 characters."
+        return "Error: Exceeded maximum total string length of 15,000 characters."
     if stats["total_enum_values"] > 500:
-        return f"Error: Exceeded maximum of 500 enum values."
+        return "Error: Exceeded maximum of 500 enum values."
     if stats["total_enum_string_length"] > 7500 and stats["total_enum_values"] > 250:
-        return f"Error: Exceeded maximum total enum string length of 7,500 characters for more than 250 enum values."
+        return "Error: Exceeded maximum total enum string length of 7,500 characters for more than 250 enum values."
 
     # Recursively validate nested schemas
     if "properties" in schema:

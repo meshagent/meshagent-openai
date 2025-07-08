@@ -9,7 +9,7 @@ import json
 from typing import List
 
 from openai import AsyncOpenAI, APIStatusError
-from openai.types.chat import ChatCompletion, ChatCompletionMessage, ChatCompletionMessageToolCall
+from openai.types.chat import ChatCompletion, ChatCompletionMessageToolCall
 
 import os
 from typing import Optional, Any
@@ -340,7 +340,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
                     try:
                         full_response = json.loads(content)
                     # sometimes open ai packs two JSON chunks seperated by newline, check if that's why we couldn't parse
-                    except json.decoder.JSONDecodeError as e:
+                    except json.decoder.JSONDecodeError:
                         for part in content.splitlines():
                             if len(part.strip()) > 0:
                                 full_response = json.loads(part)
