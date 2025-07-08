@@ -1,2 +1,7 @@
-from .tools import OpenAICompletionsAdapter, OpenAIResponsesAdapter, OpenAICompletionsToolResponseAdapter, OpenAIResponsesToolResponseAdapter
+from .tools import (
+    OpenAICompletionsAdapter,
+    OpenAIResponsesAdapter,
+    OpenAICompletionsToolResponseAdapter,
+    OpenAIResponsesToolResponseAdapter,
+)
 from .version import __version__

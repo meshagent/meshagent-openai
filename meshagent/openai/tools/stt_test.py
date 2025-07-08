@@ -7,6 +7,7 @@ from meshagent.tools import JsonResponse, TextResponse
 
 from .tts import _transcribe
 
+
 ################################################################################
 # Fixtures
 ################################################################################
@@ -45,6 +46,7 @@ async def test_transcribe_text(client, audio_bytes):
     assert isinstance(result, TextResponse)
     assert result.text.strip() != ""
 
+
 @pytest.mark.asyncio
 async def test_transcribe_json(client, audio_bytes):
     """_transcribe should return a well-formed JsonResponse for JSON format."""
@@ -55,7 +57,7 @@ async def test_transcribe_json(client, audio_bytes):
             filename="harvard.wav",
             model="gpt-4o-mini-transcribe",
             prompt="",
-            response_format="json"
+            response_format="json",
         ),
         timeout=90,
     )
@@ -63,7 +65,8 @@ async def test_transcribe_json(client, audio_bytes):
     # Basic sanity checks
     assert isinstance(result, JsonResponse)
     assert isinstance(result.json["text"], str)
-    
+
+
 @pytest.mark.asyncio
 async def test_transcribe_verbose_json(client, audio_bytes):
     """_transcribe should return a well-formed JsonResponse for JSON format."""
@@ -74,7 +77,7 @@ async def test_transcribe_verbose_json(client, audio_bytes):
             filename="harvard.wav",
             model="whisper-1",
             prompt="",
-            response_format="verbose_json"
+            response_format="verbose_json",
         ),
         timeout=90,
     )
@@ -82,4 +85,3 @@ async def test_transcribe_verbose_json(client, audio_bytes):
     # Basic sanity checks
     assert isinstance(result, JsonResponse)
     assert isinstance(result.json["segments"], list)
-
