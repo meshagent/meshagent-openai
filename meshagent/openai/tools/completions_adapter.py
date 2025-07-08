@@ -90,7 +90,7 @@ class CompletionsToolBundle:
                     "strict": True,
                 }
 
-                if v.defs != None:
+                if v.defs is not None:
                     fn["parameters"]["$defs"] = v.defs
 
                 schema = {
@@ -140,7 +140,7 @@ class CompletionsToolBundle:
         return name in self._open_ai_tools
 
     def to_json(self) -> List[dict] | None:
-        if self._open_ai_tools == None:
+        if self._open_ai_tools is None:
             return None
         return self._open_ai_tools.copy()
 
@@ -195,7 +195,7 @@ class OpenAICompletionsToolResponseAdapter(ToolResponseAdapter):
         elif isinstance(response, str):
             return response
 
-        elif response == None:
+        elif response is None:
             return "ok"
 
         else:
@@ -265,7 +265,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
         tool_adapter: Optional[ToolResponseAdapter] = None,
         output_schema: Optional[dict] = None,
     ):
-        if tool_adapter == None:
+        if tool_adapter is None:
             tool_adapter = OpenAICompletionsToolResponseAdapter()
 
         try:
@@ -278,7 +278,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
             )
             open_ai_tools = tool_bundle.to_json()
 
-            if open_ai_tools != None:
+            if open_ai_tools is not None:
                 logger.info("OpenAI Tools: %s", json.dumps(open_ai_tools))
             else:
                 logger.info("OpenAI Tools: Empty")
@@ -295,10 +295,10 @@ class OpenAICompletionsAdapter(LLMAdapter):
                 )
                 ptc = self._parallel_tool_calls
                 extra = {}
-                if ptc != None and self._model.startswith("o") == False:
+                if ptc is not None and self._model.startswith("o") == False:
                     extra["parallel_tool_calls"] = ptc
 
-                if output_schema != None:
+                if output_schema is not None:
                     extra["response_format"] = {
                         "type": "json_schema",
                         "json_schema": {
@@ -329,7 +329,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
                 )
                 context.messages.append(message)
 
-                if message.tool_calls != None:
+                if message.tool_calls is not None:
                     tasks = []
 
                     async def do_tool_call(tool_call: ChatCompletionMessageToolCall):
@@ -381,7 +381,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
                     results = await asyncio.gather(*tasks)
 
                     for result in results:
-                        if result != None:
+                        if result is not None:
                             room.developer.log_nowait(
                                 type="llm.message",
                                 data={
@@ -395,11 +395,11 @@ class OpenAICompletionsAdapter(LLMAdapter):
                             )
                             context.messages.append(result)
 
-                elif message.content != None:
+                elif message.content is not None:
                     content = message.content
 
                     logger.info("RESPONSE FROM OPENAI %s", content)
-                    if response_schema == None:
+                    if response_schema is None:
                         return content
 
                     # First try to parse the result

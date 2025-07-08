@@ -122,7 +122,7 @@ class ResponsesToolBundle:
                         "strict": strict,
                     }
 
-                    if v.defs != None:
+                    if v.defs is not None:
                         fn["parameters"]["$defs"] = v.defs
 
                     open_ai_tools.append(fn)
@@ -172,7 +172,7 @@ class ResponsesToolBundle:
         return name in self._open_ai_tools
 
     def to_json(self) -> List[dict] | None:
-        if self._open_ai_tools == None:
+        if self._open_ai_tools is None:
             return None
         return self._open_ai_tools.copy()
 
@@ -227,7 +227,7 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
         elif isinstance(response, str):
             return response
 
-        elif response == None:
+        elif response is None:
             return "ok"
 
         else:
@@ -343,7 +343,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
         with tracer.start_as_current_span("llm.turn") as span:
             span.set_attributes({"chat_context": context.id, "api": "responses"})
 
-            if tool_adapter == None:
+            if tool_adapter is None:
                 tool_adapter = OpenAIResponsesToolResponseAdapter()
 
             try:
@@ -367,19 +367,19 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                         )
                         open_ai_tools = tool_bundle.to_json()
 
-                        if open_ai_tools == None:
+                        if open_ai_tools is None:
                             open_ai_tools = NOT_GIVEN
 
                         ptc = self._parallel_tool_calls
                         extra = {}
-                        if ptc != None and self._model.startswith("o") == False:
+                        if ptc is not None and self._model.startswith("o") == False:
                             extra["parallel_tool_calls"] = ptc
                             span.set_attribute("parallel_tool_calls", ptc)
                         else:
                             span.set_attribute("parallel_tool_calls", False)
 
                         text = NOT_GIVEN
-                        if output_schema != None:
+                        if output_schema is not None:
                             span.set_attribute("response_format", "json_schema")
                             text = {
                                 "format": {
@@ -393,14 +393,14 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                             span.set_attribute("response_format", "text")
 
                         previous_response_id = NOT_GIVEN
-                        if context.previous_response_id != None:
+                        if context.previous_response_id is not None:
                             previous_response_id = context.previous_response_id
 
-                        stream = event_handler != None
+                        stream = event_handler is not None
 
                         with tracer.start_as_current_span("llm.invoke") as span:
                             response_options = self._response_options
-                            if response_options == None:
+                            if response_options is None:
                                 response_options = {}
                             response: Response = await openai.responses.create(
                                 stream=stream,
@@ -471,13 +471,13 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                                     )
                                                     if (
                                                         tool_response.caller_context
-                                                        != None
+                                                        is not None
                                                     ):
                                                         if (
                                                             tool_response.caller_context.get(
                                                                 "chat", None
                                                             )
-                                                            != None
+                                                            is not None
                                                         ):
                                                             tool_chat_context = AgentChatContext.from_json(
                                                                 tool_response.caller_context[
@@ -486,7 +486,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                                             )
                                                             if (
                                                                 tool_chat_context.previous_response_id
-                                                                != None
+                                                                is not None
                                                             ):
                                                                 context.track_response(
                                                                     tool_chat_context.previous_response_id
@@ -555,7 +555,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
 
                                     elif message.type == "message":
                                         contents = message.content
-                                        if response_schema == None:
+                                        if response_schema is None:
                                             return [], False
                                         else:
                                             for content in contents:
@@ -662,7 +662,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                                                 message.type
                                                             ](tool_context, **arguments)
 
-                                                            if result != None:
+                                                            if result is not None:
                                                                 span.set_attribute(
                                                                     "result",
                                                                     safe_json_dump(
@@ -849,7 +849,7 @@ class ImageGenerationTool(OpenAIResponsesTool):
         self.moderation = moderation
         self.output_compression = output_compression
         self.output_format = output_format
-        if partial_images == None:
+        if partial_images is None:
             partial_images = 1  # streaming wants non zero, and we stream by default
         self.partial_images = partial_images
         self.quality = quality
@@ -858,31 +858,31 @@ class ImageGenerationTool(OpenAIResponsesTool):
     def get_open_ai_tool_definitions(self):
         opts = {"type": "image_generation"}
 
-        if self.background != None:
+        if self.background is not None:
             opts["background"] = self.background
 
-        if self.input_image_mask_url != None:
+        if self.input_image_mask_url is not None:
             opts["input_image_mask"] = {"image_url": self.input_image_mask_url}
 
-        if self.model != None:
+        if self.model is not None:
             opts["model"] = self.model
 
-        if self.moderation != None:
+        if self.moderation is not None:
             opts["moderation"] = self.moderation
 
-        if self.output_compression != None:
+        if self.output_compression is not None:
             opts["output_compression"] = self.output_compression
 
-        if self.output_format != None:
+        if self.output_format is not None:
             opts["output_format"] = self.output_format
 
-        if self.partial_images != None:
+        if self.partial_images is not None:
             opts["partial_images"] = self.partial_images
 
-        if self.quality != None:
+        if self.quality is not None:
             opts["quality"] = self.quality
 
-        if self.size != None:
+        if self.size is not None:
             opts["size"] = self.size
 
         return [opts]
@@ -985,7 +985,7 @@ class ImageGenerationTool(OpenAIResponsesTool):
         output_format: str,
         **extra,
     ):
-        if result != None:
+        if result is not None:
             data = base64.b64decode(result)
             await self.on_image_generated(
                 context,
@@ -1090,11 +1090,11 @@ class CodeInterpreterTool(OpenAIResponsesTool):
     def get_open_ai_tool_definitions(self):
         opts = {"type": "code_interpreter"}
 
-        if self.container_id != None:
+        if self.container_id is not None:
             opts["container_id"] = self.container_id
 
-        if self.file_ids != None:
-            if self.container_id != None:
+        if self.file_ids is not None:
+            if self.container_id is not None:
                 raise Exception(
                     "Cannot specify both an existing container and files to upload in a code interpreter tool"
                 )
@@ -1203,24 +1203,24 @@ class MCPTool(OpenAIResponsesTool):
                 "server_url": server.server_url,
             }
 
-            if server.allowed_tools != None:
+            if server.allowed_tools is not None:
                 opts["allowed_tools"] = server.allowed_tools
 
-            if server.headers != None:
+            if server.headers is not None:
                 opts["headers"] = server.headers
 
             if (
-                server.always_require_approval != None
-                or server.never_require_approval != None
+                server.always_require_approval is not None
+                or server.never_require_approval is not None
             ):
                 opts["require_approval"] = {}
 
-                if server.always_require_approval != None:
+                if server.always_require_approval is not None:
                     opts["require_approval"]["always"] = {
                         "tool_names": server.always_require_approval
                     }
 
-                if server.never_require_approval != None:
+                if server.never_require_approval is not None:
                     opts["require_approval"]["never"] = {
                         "tool_names": server.never_require_approval
                     }
@@ -1700,7 +1700,7 @@ class FileSearchTool(OpenAIResponsesTool):
         **extra,
     ):
         search_results = None
-        if results != None:
+        if results is not None:
             search_results = []
             for result in results:
                 search_results.append(FileSearchResult(**result))

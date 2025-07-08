@@ -96,7 +96,7 @@ class OpenAIAudioFileSTT(Tool):
     ):
         file_data = await context.room.storage.download(path=path)
         client = self.client
-        if client == None:
+        if client is None:
             client = get_client(room=context.room)
 
         return await _transcribe(
