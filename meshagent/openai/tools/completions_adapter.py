@@ -295,7 +295,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
                 )
                 ptc = self._parallel_tool_calls
                 extra = {}
-                if ptc is not None and self._model.startswith("o") == False:
+                if ptc is not None and not self._model.startswith("o"):
                     extra["parallel_tool_calls"] = ptc
 
                 if output_schema is not None:

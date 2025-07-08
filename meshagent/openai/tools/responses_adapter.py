@@ -28,11 +28,9 @@ import asyncio
 
 from pydantic import BaseModel
 import copy
-
-logger = logging.getLogger("openai_agent")
-
 from opentelemetry import trace
 
+logger = logging.getLogger("openai_agent")
 tracer = trace.get_tracer("openai.llm.responses")
 
 
@@ -43,7 +41,7 @@ def safe_json_dump(data: dict):
 def safe_model_dump(model: BaseModel):
     try:
         return safe_json_dump(model.model_dump(mode="json"))
-    except:
+    except Exception:
         return {"error": "unable to dump json for model"}
 
 
@@ -110,7 +108,7 @@ class ResponsesToolBundle:
                 elif isinstance(v, Tool):
                     strict = True
                     if hasattr(v, "strict"):
-                        strict = getattr(v, "strict") == True
+                        strict = getattr(v, "strict")
 
                     fn = {
                         "type": "function",
@@ -319,9 +317,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
     async def check_for_termination(
         self, *, context: AgentChatContext, room: RoomClient
     ) -> bool:
-        if len(context.previous_messages) > 0:
-            last_message = context.previous_messages[-1]
-
+        
         for message in context.messages:
             if message.get("type", "message") != "message":
                 return False
@@ -372,7 +368,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
 
                         ptc = self._parallel_tool_calls
                         extra = {}
-                        if ptc is not None and self._model.startswith("o") == False:
+                        if ptc is not None and not self._model.startswith("o"):
                             extra["parallel_tool_calls"] = ptc
                             span.set_attribute("parallel_tool_calls", ptc)
                         else:
@@ -677,7 +673,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
 
                                     return [], False
 
-                            if stream == False:
+                            if not stream:
                                 room.developer.log_nowait(
                                     type="llm.message",
                                     data={
