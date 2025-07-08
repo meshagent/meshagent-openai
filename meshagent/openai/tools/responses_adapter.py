@@ -317,7 +317,6 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
     async def check_for_termination(
         self, *, context: AgentChatContext, room: RoomClient
     ) -> bool:
-        
         for message in context.messages:
             if message.get("type", "message") != "message":
                 return False
