@@ -136,14 +136,11 @@ class ResponsesToolBundle:
     async def execute(
         self, *, context: ToolContext, tool_call: ResponseFunctionToolCall
     ) -> Response:
-
         name = tool_call.name
         arguments = json.loads(tool_call.arguments)
 
         if name not in self._safe_names:
-            raise RoomException(
-                f"Invalid tool name {name}, check the name of the tool"
-            )
+            raise RoomException(f"Invalid tool name {name}, check the name of the tool")
 
         name = self._safe_names[name]
 
@@ -151,11 +148,8 @@ class ResponsesToolBundle:
             raise Exception(f"Unregistered tool name {name}")
 
         proxy = self._executors[name]
-        result = await proxy.execute(
-            context=context, name=name, arguments=arguments
-        )
+        result = await proxy.execute(context=context, name=name, arguments=arguments)
         return ensure_response(result)
-
 
     def get_tool(self, name: str) -> BaseTool | None:
         return self._tools_by_name.get(name, None)
