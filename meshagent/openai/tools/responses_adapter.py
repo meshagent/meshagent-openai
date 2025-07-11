@@ -136,32 +136,26 @@ class ResponsesToolBundle:
     async def execute(
         self, *, context: ToolContext, tool_call: ResponseFunctionToolCall
     ) -> Response:
-        try:
-            name = tool_call.name
-            arguments = json.loads(tool_call.arguments)
 
-            if name not in self._safe_names:
-                raise RoomException(
-                    f"Invalid tool name {name}, check the name of the tool"
-                )
+        name = tool_call.name
+        arguments = json.loads(tool_call.arguments)
 
-            name = self._safe_names[name]
-
-            if name not in self._executors:
-                raise Exception(f"Unregistered tool name {name}")
-
-            logger.info("executing %s %s %s", tool_call.id, name, arguments)
-
-            proxy = self._executors[name]
-            result = await proxy.execute(
-                context=context, name=name, arguments=arguments
+        if name not in self._safe_names:
+            raise RoomException(
+                f"Invalid tool name {name}, check the name of the tool"
             )
-            logger.info("success calling %s %s %s", tool_call.id, name, result)
-            return ensure_response(result)
 
-        except Exception as e:
-            logger.error("failed calling %s %s", tool_call.id, name, exc_info=e)
-            raise
+        name = self._safe_names[name]
+
+        if name not in self._executors:
+            raise Exception(f"Unregistered tool name {name}")
+
+        proxy = self._executors[name]
+        result = await proxy.execute(
+            context=context, name=name, arguments=arguments
+        )
+        return ensure_response(result)
+
 
     def get_tool(self, name: str) -> BaseTool | None:
         return self._tools_by_name.get(name, None)

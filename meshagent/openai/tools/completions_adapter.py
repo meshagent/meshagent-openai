@@ -108,33 +108,28 @@ class CompletionsToolBundle:
     async def execute(
         self, *, context: ToolContext, tool_call: ChatCompletionMessageToolCall
     ) -> Response:
-        try:
-            function = tool_call.function
-            name = function.name
-            arguments = json.loads(function.arguments)
+    
+        function = tool_call.function
+        name = function.name
+        arguments = json.loads(function.arguments)
 
-            if name not in self._safe_names:
-                raise RoomException(
-                    f"Invalid tool name {name}, check the name of the tool"
-                )
-
-            name = self._safe_names[name]
-
-            if name not in self._executors:
-                raise Exception(f"Unregistered tool name {name}")
-
-            logger.info("executing %s %s %s", tool_call.id, name, arguments)
-
-            proxy = self._executors[name]
-            result = await proxy.execute(
-                context=context, name=name, arguments=arguments
+        if name not in self._safe_names:
+            raise RoomException(
+                f"Invalid tool name {name}, check the name of the tool"
             )
-            logger.info("success calling %s %s %s", tool_call.id, name, result)
-            return result
 
-        except Exception as e:
-            logger.error("failed calling %s %s", tool_call.id, name, exc_info=e)
-            raise
+        name = self._safe_names[name]
+
+        if name not in self._executors:
+            raise Exception(f"Unregistered tool name {name}")
+
+        proxy = self._executors[name]
+        result = await proxy.execute(
+            context=context, name=name, arguments=arguments
+        )
+        return result
+
+    
 
     def contains(self, name: str) -> bool:
         return name in self._open_ai_tools
