@@ -1022,7 +1022,8 @@ class LocalShellTool(OpenAIResponsesTool):
         except asyncio.TimeoutError:
             proc.kill()  # send SIGKILL / TerminateProcess
             stdout, stderr = await proc.communicate()
-            raise  # re-raise so caller sees the timeout
+            return f"The command timed out after {timeout_ms}ms"
+            # re-raise so caller sees the timeout
 
         encoding = os.device_encoding(1) or "utf-8"
         stdout = stdout.decode(encoding, errors="replace")
