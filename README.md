@@ -1,4 +1,4 @@
-## MeshAgent OpenAI
+# [Meshagent](https://www.meshagent.com)
 
 ## MeshAgent OpenAI
 The ``meshagent.openai`` package provides adapters to integrate OpenAI models with MeshAgent tools and agents. 
