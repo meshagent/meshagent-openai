@@ -336,7 +336,11 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                             {"model": self._model, "provider": self._provider}
                         )
 
-                        openai = get_client(room=room)
+                        openai = (
+                            self._client
+                            if self._client is not None
+                            else get_client(room=room)
+                        )
 
                         response_schema = output_schema
                         response_name = "response"
