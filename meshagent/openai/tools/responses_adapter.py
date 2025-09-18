@@ -279,6 +279,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
         parallel_tool_calls: Optional[bool] = None,
         client: Optional[AsyncOpenAI] = None,
         response_options: Optional[dict] = None,
+        reasoning_effort: Optional[str] = "minimal",
         provider: str = "openai",
     ):
         self._model = model
@@ -286,6 +287,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
         self._client = client
         self._response_options = response_options
         self._provider = provider
+        self._reasoning_effort = reasoning_effort
 
     def create_chat_context(self):
         system_role = "system"
@@ -386,9 +388,15 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                         stream = event_handler is not None
 
                         with tracer.start_as_current_span("llm.invoke") as span:
-                            response_options = self._response_options
+                            response_options = copy.deepcopy(self._response_options)
                             if response_options is None:
                                 response_options = {}
+
+                            if self._reasoning_effort is not None:
+                                response_options["reasoning"] = {
+                                    "effort": self._reasoning_effort
+                                }
+
                             response: Response = await openai.responses.create(
                                 stream=stream,
                                 model=self._model,
