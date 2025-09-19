@@ -279,7 +279,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
         parallel_tool_calls: Optional[bool] = None,
         client: Optional[AsyncOpenAI] = None,
         response_options: Optional[dict] = None,
-        reasoning_effort: Optional[str] = "minimal",
+        reasoning_effort: Optional[str] = None,
         provider: str = "openai",
     ):
         self._model = model
