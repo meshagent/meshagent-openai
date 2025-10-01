@@ -394,7 +394,8 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
 
                             if self._reasoning_effort is not None:
                                 response_options["reasoning"] = {
-                                    "effort": self._reasoning_effort
+                                    "effort": self._reasoning_effort,
+                                    "summary": "detailed",
                                 }
 
                             response: Response = await openai.responses.create(
@@ -735,7 +736,6 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                                                 "event": safe_model_dump(event),
                                             }
                                         )
-
                                         event_handler(event)
 
                                         if event.type == "response.completed":
@@ -1450,7 +1450,6 @@ class ReasoningTool(OpenAIResponsesTool):
         part: dict,
         sequence_number: int,
         summary_index: int,
-        text: str,
         type: str,
         **extra,
     ):
@@ -1465,7 +1464,6 @@ class ReasoningTool(OpenAIResponsesTool):
         part: dict,
         sequence_number: int,
         summary_index: int,
-        text: str,
         type: str,
         **extra,
     ):
@@ -1479,7 +1477,6 @@ class ReasoningTool(OpenAIResponsesTool):
         output_index: int,
         sequence_number: int,
         summary_index: int,
-        text: str,
         type: str,
         **extra,
     ):
@@ -1493,7 +1490,6 @@ class ReasoningTool(OpenAIResponsesTool):
         output_index: int,
         sequence_number: int,
         summary_index: int,
-        text: str,
         type: str,
         **extra,
     ):
@@ -1503,7 +1499,8 @@ class ReasoningTool(OpenAIResponsesTool):
         self,
         context: ToolContext,
         *,
-        summary: str,
+        summary: list[str],
+        content: Optional[list[str]] = None,
         encrypted_content: str | None,
         status: Literal["in_progress", "completed", "incomplete"],
     ):
@@ -1514,20 +1511,20 @@ class ReasoningTool(OpenAIResponsesTool):
         context: ToolContext,
         *,
         id: str,
-        summary: str,
+        summary: list[dict],
         type: str,
+        content: Optional[list[dict]],
         encrypted_content: str | None,
         status: str,
         **extra,
     ):
         await self.on_reasoning(
-            context, summary=summary, encrypted_content=encrypted_content, status=status
+            context,
+            summary=summary,
+            content=content,
+            encrypted_content=encrypted_content,
+            status=status,
         )
-
-
-class ReasoningSummaryPart:
-    text: str
-    type: str
 
 
 # TODO: computer tool call
