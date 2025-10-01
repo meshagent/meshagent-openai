@@ -1525,6 +1525,11 @@ class ReasoningTool(OpenAIResponsesTool):
         )
 
 
+class ReasoningSummaryPart:
+    text: str
+    type: str
+
+
 # TODO: computer tool call
 
 
