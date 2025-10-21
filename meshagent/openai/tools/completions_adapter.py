@@ -247,6 +247,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
     async def next(
         self,
         *,
+        model: Optional[str] = None,
         context: AgentChatContext,
         room: RoomClient,
         toolkits: Toolkit,

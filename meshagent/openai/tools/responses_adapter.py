@@ -12,7 +12,12 @@ from meshagent.api.messaging import (
     RawOutputs,
     ensure_response,
 )
-from meshagent.agents.adapter import ToolResponseAdapter, LLMAdapter
+from meshagent.agents.adapter import (
+    ToolResponseAdapter,
+    LLMAdapter,
+    LLMTool,
+    LLMToolConfig,
+)
 import json
 from typing import List, Literal
 from meshagent.openai.proxy import get_client
@@ -272,7 +277,7 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
                 return [message]
 
 
-class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
+class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
     def __init__(
         self,
         model: str = os.getenv("OPENAI_MODEL", "gpt-5"),
@@ -281,6 +286,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
         response_options: Optional[dict] = None,
         reasoning_effort: Optional[str] = None,
         provider: str = "openai",
+        llm_tools: Optional[list[LLMTool]] = None,
     ):
         self._model = model
         self._parallel_tool_calls = parallel_tool_calls
@@ -288,6 +294,15 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
         self._response_options = response_options
         self._provider = provider
         self._reasoning_effort = reasoning_effort
+        if llm_tools is None:
+            llm_tools = [
+                WebSearchLLMTool(),
+                ImageGenerationLLMTool(),
+            ]
+        self._llm_tools = llm_tools
+
+    def default_model(self) -> str:
+        return self._model
 
     def create_chat_context(self):
         system_role = "system"
@@ -304,6 +319,9 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
 
         return context
 
+    def llm_tools(self, *, model: str) -> list[LLMTool]:
+        return self._llm_tools
+
     async def check_for_termination(
         self, *, context: AgentChatContext, room: RoomClient
     ) -> bool:
@@ -318,6 +336,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
     async def next(
         self,
         *,
+        model: Optional[str] = None,
         context: AgentChatContext,
         room: RoomClient,
         toolkits: list[Toolkit],
@@ -325,6 +344,9 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
         output_schema: Optional[dict] = None,
         event_handler: Optional[Callable[[ResponseStreamEvent], None]] = None,
     ):
+        if model is None:
+            model = self.default_model()
+
         with tracer.start_as_current_span("llm.turn") as span:
             span.set_attributes({"chat_context": context.id, "api": "responses"})
 
@@ -335,7 +357,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
                 while True:
                     with tracer.start_as_current_span("llm.turn.iteration") as span:
                         span.set_attributes(
-                            {"model": self._model, "provider": self._provider}
+                            {"model": model, "provider": self._provider}
                         )
 
                         openai = (
@@ -361,7 +383,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
 
                         ptc = self._parallel_tool_calls
                         extra = {}
-                        if ptc is not None and not self._model.startswith("o"):
+                        if ptc is not None and not model.startswith("o"):
                             extra["parallel_tool_calls"] = ptc
                             span.set_attribute("parallel_tool_calls", ptc)
                         else:
@@ -400,7 +422,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponsesToolBundle]):
 
                             response: Response = await openai.responses.create(
                                 stream=stream,
-                                model=self._model,
+                                model=model,
                                 input=context.messages,
                                 tools=open_ai_tools,
                                 text=text,
@@ -823,32 +845,45 @@ class OpenAIResponsesTool(BaseTool):
         return {}
 
 
+class ImageGenerationConfig(LLMToolConfig):
+    name: Literal["image_generation"]
+    background: Literal["transparent", "opaque", "auto"] = None
+    input_image_mask_url: Optional[str] = None
+    model: Optional[str] = None
+    moderation: Optional[str] = None
+    output_compression: Optional[int] = None
+    output_format: Optional[Literal["png", "webp", "jpeg"]] = None
+    partial_images: Optional[int] = None
+    quality: Optional[Literal["auto", "low", "medium", "high"]] = None
+    size: Optional[Literal["1024x1024", "1024x1536", "1536x1024", "auto"]] = None
+
+
+class ImageGenerationLLMTool(LLMTool):
+    def __init__(self):
+        super().__init__(name="image_generation", type=ImageGenerationConfig)
+
+    def make(self, *, model: str, config: ImageGenerationConfig, **kwargs):
+        return ImageGenerationTool(config=config)
+
+
 class ImageGenerationTool(OpenAIResponsesTool):
     def __init__(
         self,
         *,
-        background: Literal["transparent", "opaque", "auto"] = None,
-        input_image_mask_url: Optional[str] = None,
-        model: Optional[str] = None,
-        moderation: Optional[str] = None,
-        output_compression: Optional[int] = None,
-        output_format: Optional[Literal["png", "webp", "jpeg"]] = None,
-        partial_images: Optional[int] = None,
-        quality: Optional[Literal["auto", "low", "medium", "high"]] = None,
-        size: Optional[Literal["1024x1024", "1024x1536", "1536x1024", "auto"]] = None,
+        config: ImageGenerationConfig,
     ):
         super().__init__(name="image_generation")
-        self.background = background
-        self.input_image_mask_url = input_image_mask_url
-        self.model = model
-        self.moderation = moderation
-        self.output_compression = output_compression
-        self.output_format = output_format
-        if partial_images is None:
-            partial_images = 1  # streaming wants non zero, and we stream by default
-        self.partial_images = partial_images
-        self.quality = quality
-        self.size = size
+        self.background = config.background
+        self.input_image_mask_url = config.input_image_mask_url
+        self.model = config.model
+        self.moderation = config.moderation
+        self.output_compression = config.output_compression
+        self.output_format = config.output_format
+        self.partial_images = (
+            config.partial_images if config.partial_images is not None else 1
+        )
+        self.quality = config.quality
+        self.size = config.size
 
     def get_open_ai_tool_definitions(self):
         opts = {"type": "image_generation"}
@@ -994,8 +1029,20 @@ class ImageGenerationTool(OpenAIResponsesTool):
             )
 
 
-class LocalShellTool(OpenAIResponsesTool):
+class LocalShellConfig(LLMToolConfig):
+    name: Literal["local_shell"]
+
+
+class LocalShellLLMTool(LLMTool):
     def __init__(self):
+        super().__init__(name="local_shell", type=LocalShellConfig)
+
+    def make(self, *, model: str, config: LocalShellConfig, **kwargs):
+        return LocalShellTool(config=config)
+
+
+class LocalShellTool(OpenAIResponsesTool):
+    def __init__(self, *, config: LocalShellConfig):
         super().__init__(name="local_shell")
 
     def get_open_ai_tool_definitions(self):
@@ -1161,34 +1208,39 @@ class MCPToolDefinition:
         self.description = description
 
 
-class MCPServer:
-    def __init__(
-        self,
-        *,
-        server_label: str,
-        server_url: str,
-        allowed_tools: Optional[list[str]] = None,
-        headers: Optional[dict] = None,
-        # require approval for all tools
-        require_approval: Optional[Literal["always", "never"]] = None,
-        # list of tools that always require approval
-        always_require_approval: Optional[list[str]] = None,
-        # list of tools that never require approval
-        never_require_approval: Optional[list[str]] = None,
-    ):
-        self.server_label = server_label
-        self.server_url = server_url
-        self.allowed_tools = allowed_tools
-        self.headers = headers
-        self.require_approval = require_approval
-        self.always_require_approval = always_require_approval
-        self.never_require_approval = never_require_approval
+class MCPServer(BaseModel):
+    server_label: str
+    server_url: str
+    allowed_tools: Optional[list[str]] = None
+    headers: Optional[dict] = (None,)
+
+    # require approval for all tools
+    require_approval: Optional[Literal["always", "never"]] = None
+    # list of tools that always require approval
+    always_require_approval: Optional[list[str]] = None
+    # list of tools that never require approval
+    never_require_approval: Optional[list[str]] = None
+
+    openai_connector_id: Optional[str] = None
+
+
+class MCPConfig(LLMToolConfig):
+    name: Literal["mcp"]
+    servers: list[MCPServer]
+
+
+class MCPLLMTool(LLMTool):
+    def __init__(self):
+        super().__init__(name="mcp", type=MCPConfig)
+
+    def make(self, *, model: str, config: MCPConfig, **kwargs):
+        return MCPTool(config=config)
 
 
 class MCPTool(OpenAIResponsesTool):
-    def __init__(self, *, servers: list[MCPServer]):
+    def __init__(self, *, config: MCPConfig):
         super().__init__(name="mcp")
-        self.servers = servers
+        self.servers = config.servers
 
     def get_open_ai_tool_definitions(self):
         defs = []
@@ -1530,8 +1582,20 @@ class ReasoningTool(OpenAIResponsesTool):
 # TODO: computer tool call
 
 
-class WebSearchTool(OpenAIResponsesTool):
+class WebSearchConfig(LLMToolConfig):
+    name: Literal["web_search"]
+
+
+class WebSearchLLMTool(LLMTool):
     def __init__(self):
+        super().__init__(name="web_search", type=WebSearchConfig)
+
+    def make(self, *, model: str, config: WebSearchConfig, **kwargs):
+        return WebSearchTool(config=config)
+
+
+class WebSearchTool(OpenAIResponsesTool):
+    def __init__(self, *, config: WebSearchConfig):
         super().__init__(name="web_search")
 
     def get_open_ai_tool_definitions(self) -> list[dict]:
