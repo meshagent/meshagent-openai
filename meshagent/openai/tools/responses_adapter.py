@@ -256,14 +256,12 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
                         )
 
                         message = {
-                            "output": {
-                                [
-                                    {
-                                        "type": "input_image",
-                                        "image_url": f"data:{response.mime_type};base64,{base64.b64encode(response.data)}",
-                                    }
-                                ]
-                            },
+                            "output": [
+                                {
+                                    "type": "input_image",
+                                    "image_url": f"data:{response.mime_type};base64,{base64.b64encode(response.data).decode()}",
+                                }
+                            ],
                             "call_id": tool_call.call_id,
                             "type": "function_call_output",
                         }
@@ -273,14 +271,13 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
                         )
 
                         message = {
-                            "output": {
-                                [
-                                    {
-                                        "type": "input_file",
-                                        "file_data": base64.b64encode(response.data),
-                                    }
-                                ]
-                            },
+                            "output": [
+                                {
+                                    "type": "input_file",
+                                    "filename": response.name,
+                                    "file_data": f"data:{response.mime_type};base64,{base64.b64encode(response.data).decode()}",
+                                }
+                            ],
                             "call_id": tool_call.call_id,
                             "type": "function_call_output",
                         }
