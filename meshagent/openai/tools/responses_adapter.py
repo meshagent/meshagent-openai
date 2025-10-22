@@ -14,8 +14,8 @@ from meshagent.api.messaging import (
 from meshagent.agents.adapter import (
     ToolResponseAdapter,
     LLMAdapter,
-    ToolProvider,
-    ToolConfig,
+    ToolkitBuilder,
+    ToolkitConfig,
 )
 import json
 from typing import List, Literal
@@ -878,7 +878,7 @@ class OpenAIResponsesTool(BaseTool):
         return {}
 
 
-class ImageGenerationConfig(ToolConfig):
+class ImageGenerationConfig(ToolkitConfig):
     name: Literal["image_generation"]
     background: Literal["transparent", "opaque", "auto"] = None
     input_image_mask_url: Optional[str] = None
@@ -891,12 +891,14 @@ class ImageGenerationConfig(ToolConfig):
     size: Optional[Literal["1024x1024", "1024x1536", "1536x1024", "auto"]] = None
 
 
-class ImageGenerationToolProvider(ToolProvider):
+class ImageGenerationToolkitBuilder(ToolkitBuilder):
     def __init__(self):
         super().__init__(name="image_generation", type=ImageGenerationConfig)
 
     def make(self, *, model: str, config: ImageGenerationConfig):
-        return ImageGenerationTool(config=config)
+        return Toolkit(
+            name="image_generation", tools=[ImageGenerationTool(config=config)]
+        )
 
 
 class ImageGenerationTool(OpenAIResponsesTool):
@@ -1062,16 +1064,16 @@ class ImageGenerationTool(OpenAIResponsesTool):
             )
 
 
-class LocalShellConfig(ToolConfig):
+class LocalShellConfig(ToolkitConfig):
     name: Literal["local_shell"]
 
 
-class LocalShellToolProvider(ToolProvider):
+class LocalShellToolkitBuilder(ToolkitBuilder):
     def __init__(self):
         super().__init__(name="local_shell", type=LocalShellConfig)
 
     def make(self, *, model: str, config: LocalShellConfig):
-        return LocalShellTool(config=config)
+        return Toolkit(name="local_shell", tools=[LocalShellTool(config=config)])
 
 
 class LocalShellTool(OpenAIResponsesTool):
@@ -1257,17 +1259,17 @@ class MCPServer(BaseModel):
     openai_connector_id: Optional[str] = None
 
 
-class MCPConfig(ToolConfig):
+class MCPConfig(ToolkitConfig):
     name: Literal["mcp"]
     servers: list[MCPServer]
 
 
-class MCPToolProvider(ToolProvider):
+class MCPToolkitBuilder(ToolkitBuilder):
     def __init__(self):
         super().__init__(name="mcp", type=MCPConfig)
 
     def make(self, *, model: str, config: MCPConfig):
-        return MCPTool(config=config)
+        return Toolkit(name="mcp", tools=[MCPTool(config=config)])
 
 
 class MCPTool(OpenAIResponsesTool):
@@ -1615,16 +1617,16 @@ class ReasoningTool(OpenAIResponsesTool):
 # TODO: computer tool call
 
 
-class WebSearchConfig(ToolConfig):
+class WebSearchConfig(ToolkitConfig):
     name: Literal["web_search"]
 
 
-class WebSearchToolProvider(ToolProvider):
+class WebSearchToolkitBuilder(ToolkitBuilder):
     def __init__(self):
         super().__init__(name="web_search", type=WebSearchConfig)
 
     def make(self, *, model: str, config: WebSearchConfig):
-        return WebSearchTool(config=config)
+        return Toolkit(name="web_search", tools=[WebSearchTool(config=config)])
 
 
 class WebSearchTool(OpenAIResponsesTool):
