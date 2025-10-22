@@ -1,6 +1,5 @@
 from meshagent.agents.agent import AgentChatContext
 from meshagent.api import RoomClient, RoomException
-from meshagent.tools.blob import Blob, BlobStorage
 from meshagent.tools import Toolkit, ToolContext, Tool, BaseTool
 from meshagent.api.messaging import (
     Response,
@@ -15,8 +14,8 @@ from meshagent.api.messaging import (
 from meshagent.agents.adapter import (
     ToolResponseAdapter,
     LLMAdapter,
-    LLMTool,
-    LLMToolConfig,
+    ToolProvider,
+    ToolConfig,
 )
 import json
 from typing import List, Literal
@@ -170,8 +169,7 @@ class ResponsesToolBundle:
 
 # Converts a tool response into a series of messages that can be inserted into the openai context
 class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
-    def __init__(self, blob_storage: Optional[BlobStorage] = None):
-        self._blob_storage = blob_storage
+    def __init__(self):
         pass
 
     async def to_plain_text(self, *, room: RoomClient, response: Response) -> str:
@@ -190,10 +188,7 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
             return response.text
 
         elif isinstance(response, FileResponse):
-            blob = Blob(mime_type=response.mime_type, data=response.data)
-            uri = self._blob_storage.store(blob=blob)
-
-            return f"The results have been written to a blob with the uri {uri} with the mime type {blob.mime_type}."
+            return f"{response.name}"
 
         elif isinstance(response, EmptyResponse):
             return "ok"
@@ -251,30 +246,81 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
                     )
 
                 return response.outputs
+
             else:
                 span.set_attribute("kind", "text")
-                output = await self.to_plain_text(room=room, response=response)
-                span.set_attribute("output", output)
+                if isinstance(response, FileResponse):
+                    if response.mime_type.startswith("image/"):
+                        span.set_attribute(
+                            "output", f"image: {response.name}, {response.mime_type}"
+                        )
 
-                message = {
-                    "output": output,
-                    "call_id": tool_call.call_id,
-                    "type": "function_call_output",
-                }
+                        message = {
+                            "output": {
+                                [
+                                    {
+                                        "type": "input_image",
+                                        "image_url": f"data:{response.mime_type};base64,{base64.b64encode(response.data)}",
+                                    }
+                                ]
+                            },
+                            "call_id": tool_call.call_id,
+                            "type": "function_call_output",
+                        }
+                    else:
+                        span.set_attribute(
+                            "output", f"file: {response.name}, {response.mime_type}"
+                        )
 
-                room.developer.log_nowait(
-                    type="llm.message",
-                    data={
-                        "context": context.id,
-                        "participant_id": room.local_participant.id,
-                        "participant_name": room.local_participant.get_attribute(
-                            "name"
-                        ),
-                        "message": message,
-                    },
-                )
+                        message = {
+                            "output": {
+                                [
+                                    {
+                                        "type": "input_file",
+                                        "file_data": base64.b64encode(response.data),
+                                    }
+                                ]
+                            },
+                            "call_id": tool_call.call_id,
+                            "type": "function_call_output",
+                        }
 
-                return [message]
+                    room.developer.log_nowait(
+                        type="llm.message",
+                        data={
+                            "context": context.id,
+                            "participant_id": room.local_participant.id,
+                            "participant_name": room.local_participant.get_attribute(
+                                "name"
+                            ),
+                            "message": message,
+                        },
+                    )
+
+                    return [message]
+                else:
+                    output = await self.to_plain_text(room=room, response=response)
+                    span.set_attribute("output", output)
+
+                    message = {
+                        "output": output,
+                        "call_id": tool_call.call_id,
+                        "type": "function_call_output",
+                    }
+
+                    room.developer.log_nowait(
+                        type="llm.message",
+                        data={
+                            "context": context.id,
+                            "participant_id": room.local_participant.id,
+                            "participant_name": room.local_participant.get_attribute(
+                                "name"
+                            ),
+                            "message": message,
+                        },
+                    )
+
+                    return [message]
 
 
 class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
@@ -286,7 +332,6 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         response_options: Optional[dict] = None,
         reasoning_effort: Optional[str] = None,
         provider: str = "openai",
-        llm_tools: Optional[list[LLMTool]] = None,
     ):
         self._model = model
         self._parallel_tool_calls = parallel_tool_calls
@@ -294,12 +339,6 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         self._response_options = response_options
         self._provider = provider
         self._reasoning_effort = reasoning_effort
-        if llm_tools is None:
-            llm_tools = [
-                WebSearchLLMTool(),
-                ImageGenerationLLMTool(),
-            ]
-        self._llm_tools = llm_tools
 
     def default_model(self) -> str:
         return self._model
@@ -318,9 +357,6 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         context = AgentChatContext(system_role=system_role)
 
         return context
-
-    def llm_tools(self, *, model: str) -> list[LLMTool]:
-        return self._llm_tools
 
     async def check_for_termination(
         self, *, context: AgentChatContext, room: RoomClient
@@ -845,7 +881,7 @@ class OpenAIResponsesTool(BaseTool):
         return {}
 
 
-class ImageGenerationConfig(LLMToolConfig):
+class ImageGenerationConfig(ToolConfig):
     name: Literal["image_generation"]
     background: Literal["transparent", "opaque", "auto"] = None
     input_image_mask_url: Optional[str] = None
@@ -858,11 +894,11 @@ class ImageGenerationConfig(LLMToolConfig):
     size: Optional[Literal["1024x1024", "1024x1536", "1536x1024", "auto"]] = None
 
 
-class ImageGenerationLLMTool(LLMTool):
+class ImageGenerationToolProvider(ToolProvider):
     def __init__(self):
         super().__init__(name="image_generation", type=ImageGenerationConfig)
 
-    def make(self, *, model: str, config: ImageGenerationConfig, **kwargs):
+    def make(self, *, model: str, config: ImageGenerationConfig):
         return ImageGenerationTool(config=config)
 
 
@@ -1029,15 +1065,15 @@ class ImageGenerationTool(OpenAIResponsesTool):
             )
 
 
-class LocalShellConfig(LLMToolConfig):
+class LocalShellConfig(ToolConfig):
     name: Literal["local_shell"]
 
 
-class LocalShellLLMTool(LLMTool):
+class LocalShellToolProvider(ToolProvider):
     def __init__(self):
         super().__init__(name="local_shell", type=LocalShellConfig)
 
-    def make(self, *, model: str, config: LocalShellConfig, **kwargs):
+    def make(self, *, model: str, config: LocalShellConfig):
         return LocalShellTool(config=config)
 
 
@@ -1212,7 +1248,7 @@ class MCPServer(BaseModel):
     server_label: str
     server_url: str
     allowed_tools: Optional[list[str]] = None
-    headers: Optional[dict] = (None,)
+    headers: Optional[dict] = None
 
     # require approval for all tools
     require_approval: Optional[Literal["always", "never"]] = None
@@ -1224,16 +1260,16 @@ class MCPServer(BaseModel):
     openai_connector_id: Optional[str] = None
 
 
-class MCPConfig(LLMToolConfig):
+class MCPConfig(ToolConfig):
     name: Literal["mcp"]
     servers: list[MCPServer]
 
 
-class MCPLLMTool(LLMTool):
+class MCPToolProvider(ToolProvider):
     def __init__(self):
         super().__init__(name="mcp", type=MCPConfig)
 
-    def make(self, *, model: str, config: MCPConfig, **kwargs):
+    def make(self, *, model: str, config: MCPConfig):
         return MCPTool(config=config)
 
 
@@ -1582,15 +1618,15 @@ class ReasoningTool(OpenAIResponsesTool):
 # TODO: computer tool call
 
 
-class WebSearchConfig(LLMToolConfig):
+class WebSearchConfig(ToolConfig):
     name: Literal["web_search"]
 
 
-class WebSearchLLMTool(LLMTool):
+class WebSearchToolProvider(ToolProvider):
     def __init__(self):
         super().__init__(name="web_search", type=WebSearchConfig)
 
-    def make(self, *, model: str, config: WebSearchConfig, **kwargs):
+    def make(self, *, model: str, config: WebSearchConfig):
         return WebSearchTool(config=config)
 
 

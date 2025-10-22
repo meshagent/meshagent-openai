@@ -1,6 +1,5 @@
 from meshagent.agents.agent import AgentChatContext
 from meshagent.api import RoomClient, RoomException
-from meshagent.tools.blob import Blob, BlobStorage
 from meshagent.tools import Toolkit, ToolContext
 from meshagent.api.messaging import (
     Response,
@@ -135,8 +134,7 @@ class CompletionsToolBundle:
 
 # Converts a tool response into a series of messages that can be inserted into the openai context
 class OpenAICompletionsToolResponseAdapter(ToolResponseAdapter):
-    def __init__(self, blob_storage: Optional[BlobStorage] = None):
-        self._blob_storage = blob_storage
+    def __init__(self):
         pass
 
     async def to_plain_text(self, *, room: RoomClient, response: Response) -> str:
@@ -155,10 +153,7 @@ class OpenAICompletionsToolResponseAdapter(ToolResponseAdapter):
             return response.text
 
         elif isinstance(response, FileResponse):
-            blob = Blob(mime_type=response.mime_type, data=response.data)
-            uri = self._blob_storage.store(blob=blob)
-
-            return f"The results have been written to a blob with the uri {uri} with the mime type {blob.mime_type}."
+            return f"{response.name}"
 
         elif isinstance(response, EmptyResponse):
             return "ok"
