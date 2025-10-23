@@ -1245,8 +1245,9 @@ class MCPToolDefinition:
 
 class MCPServer(BaseModel):
     server_label: str
-    server_url: str
+    server_url: Optional[str] = None
     allowed_tools: Optional[list[str]] = None
+    authorization: Optional[str] = None
     headers: Optional[dict] = None
 
     # require approval for all tools
@@ -1283,11 +1284,19 @@ class MCPTool(OpenAIResponsesTool):
             opts = {
                 "type": "mcp",
                 "server_label": server.server_label,
-                "server_url": server.server_url,
             }
+
+            if server.server_url is not None:
+                opts["server_url"] = server.server_url
+
+            if server.openai_connector_id is not None:
+                opts["connector_id"] = server.openai_connector_id
 
             if server.allowed_tools is not None:
                 opts["allowed_tools"] = server.allowed_tools
+
+            if server.authorization is not None:
+                opts["authorization"] = server.authorization
 
             if server.headers is not None:
                 opts["headers"] = server.headers
@@ -1491,19 +1500,19 @@ class MCPTool(OpenAIResponsesTool):
         type: str,
         **extra,
     ):
-        logger.info("approval requested for MCP tool {server_label}.{name}")
+        logger.info(f"approval requested for MCP tool {server_label}.{name}")
         should_approve = await self.on_mcp_approval_request(
             context, arguments=arguments, name=name, server_label=server_label
         )
         if should_approve:
-            logger.info("approval granted for MCP tool {server_label}.{name}")
+            logger.info(f"approval granted for MCP tool {server_label}.{name}")
             return {
                 "type": "mcp_approval_response",
                 "approve": True,
                 "approval_request_id": id,
             }
         else:
-            logger.info("approval denied for MCP tool {server_label}.{name}")
+            logger.info(f"approval denied for MCP tool {server_label}.{name}")
             return {
                 "type": "mcp_approval_response",
                 "approve": False,
