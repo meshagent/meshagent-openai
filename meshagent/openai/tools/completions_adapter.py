@@ -1,5 +1,5 @@
 from meshagent.agents.agent import AgentChatContext
-from meshagent.api import RoomClient, RoomException
+from meshagent.api import RoomClient, RoomException, RemoteParticipant
 from meshagent.tools import Toolkit, ToolContext
 from meshagent.api.messaging import (
     Response,
@@ -248,6 +248,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
         toolkits: Toolkit,
         tool_adapter: Optional[ToolResponseAdapter] = None,
         output_schema: Optional[dict] = None,
+        on_behalf_of: Optional[RemoteParticipant] = None,
     ):
         if tool_adapter is None:
             tool_adapter = OpenAICompletionsToolResponseAdapter()

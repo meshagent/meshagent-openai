@@ -1,5 +1,5 @@
 from meshagent.agents.agent import AgentChatContext
-from meshagent.api import RoomClient, RoomException
+from meshagent.api import RoomClient, RoomException, RemoteParticipant
 from meshagent.tools import Toolkit, ToolContext, Tool, BaseTool
 from meshagent.api.messaging import (
     Response,
@@ -376,6 +376,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         tool_adapter: Optional[ToolResponseAdapter] = None,
         output_schema: Optional[dict] = None,
         event_handler: Optional[Callable[[ResponseStreamEvent], None]] = None,
+        on_behalf_of: Optional[RemoteParticipant] = None,
     ):
         if model is None:
             model = self.default_model()
@@ -453,7 +454,18 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                     "summary": "detailed",
                                 }
 
+                            extra_headers = {}
+                            if on_behalf_of is not None:
+                                on_behalf_of_name = on_behalf_of.get_attribute("name")
+                                logger.info(
+                                    f"{room.local_participant.get_attribute('name')} making openai request on behalf of {on_behalf_of_name}"
+                                )
+                                extra_headers["Meshagent-On-Behalf-Of"] = (
+                                    on_behalf_of_name
+                                )
+
                             response: Response = await openai.responses.create(
+                                extra_headers=extra_headers,
                                 stream=stream,
                                 model=model,
                                 input=context.messages,
