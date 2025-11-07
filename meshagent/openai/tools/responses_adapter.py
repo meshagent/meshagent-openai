@@ -1130,6 +1130,8 @@ class LocalShellTool(OpenAIResponsesTool):
             stdout, stderr = await proc.communicate()
             return f"The command timed out after {timeout_ms}ms"
             # re-raise so caller sees the timeout
+        except Exception as ex:
+            return f"The command failed: {ex}"
 
         encoding = os.device_encoding(1) or "utf-8"
         stdout = stdout.decode(encoding, errors="replace")
