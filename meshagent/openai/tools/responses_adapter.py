@@ -323,7 +323,7 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
 class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
     def __init__(
         self,
-        model: str = os.getenv("OPENAI_MODEL", "gpt-5"),
+        model: str = os.getenv("OPENAI_MODEL", "gpt-5.1"),
         parallel_tool_calls: Optional[bool] = None,
         client: Optional[AsyncOpenAI] = None,
         response_options: Optional[dict] = None,
