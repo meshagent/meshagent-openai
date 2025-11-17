@@ -250,7 +250,7 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
             else:
                 span.set_attribute("kind", "text")
                 if isinstance(response, FileResponse):
-                    if response.mime_type.startswith("image/"):
+                    if response.mime_type and response.mime_type.startswith("image/"):
                         span.set_attribute(
                             "output", f"image: {response.name}, {response.mime_type}"
                         )
@@ -270,17 +270,30 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
                             "output", f"file: {response.name}, {response.mime_type}"
                         )
 
-                        message = {
-                            "output": [
-                                {
-                                    "type": "input_file",
-                                    "filename": response.name,
-                                    "file_data": f"data:{response.mime_type};base64,{base64.b64encode(response.data).decode()}",
-                                }
-                            ],
-                            "call_id": tool_call.call_id,
-                            "type": "function_call_output",
-                        }
+                        if response.mime_type == "application/pdf":
+                            message = {
+                                "output": [
+                                    {
+                                        "type": "input_file",
+                                        "filename": response.name,
+                                        "file_data": f"data:{response.mime_type or 'text/plain'};base64,{base64.b64encode(response.data).decode()}",
+                                    }
+                                ],
+                                "call_id": tool_call.call_id,
+                                "type": "function_call_output",
+                            }
+                        elif response.mime_type.startswith("text/"):
+                            message = {
+                                "output": response.data.decode(),
+                                "call_id": tool_call.call_id,
+                                "type": "function_call_output",
+                            }
+                        else:
+                            message = {
+                                "output": f"{response.name} was not in a supported format",
+                                "call_id": tool_call.call_id,
+                                "type": "function_call_output",
+                            }
 
                     room.developer.log_nowait(
                         type="llm.message",
