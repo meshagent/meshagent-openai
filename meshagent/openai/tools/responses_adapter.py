@@ -1174,6 +1174,132 @@ class LocalShellTool(OpenAIResponsesTool):
         return output_item
 
 
+class ShellConfig(ToolkitConfig):
+    name: Literal["shell"]
+
+
+class ShellToolkitBuilder(ToolkitBuilder):
+    def __init__(self):
+        super().__init__(name="shell", type=ShellConfig)
+
+    def make(self, *, model: str, config: LocalShellConfig):
+        return Toolkit(name="shell", tools=[ShellTool(config=config)])
+
+
+class ShellTool(OpenAIResponsesTool):
+    def __init__(self, *, config: ShellConfig):
+        super().__init__(name="shell")
+
+    def get_open_ai_tool_definitions(self):
+        return [{"type": "shell"}]
+
+    def get_open_ai_output_handlers(self):
+        return {"shell_call": self.handle_shell_call}
+
+    async def execute_shell_command(
+        self,
+        context: ToolContext,
+        *,
+        commands: list[str],
+        max_output_length: Optional[int] = None,
+        timeout_ms: Optional[int] = None,
+    ):
+        import shlex
+
+        merged_env = {**os.environ}
+
+        results = []
+        encoding = os.device_encoding(1) or "utf-8"
+
+        left = max_output_length
+
+        def limit(s: str):
+            nonlocal left
+            if left is not None:
+                s = s[0:left]
+                left -= len(s)
+                return s
+            else:
+                return s
+
+        for command in commands:
+            # Spawn the process
+            proc = await asyncio.create_subprocess_exec(
+                *(shlex.split(command)),
+                cwd=os.getcwd(),
+                env=merged_env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=timeout_ms / 1000 if timeout_ms else None,
+                )
+            except asyncio.TimeoutError:
+                proc.kill()  # send SIGKILL / TerminateProcess
+
+                stdout, stderr = await proc.communicate()
+
+                results.append(
+                    {
+                        "outcome": {"type": "timeout"},
+                        "stdout": limit(stdout.decode(encoding, errors="replace")),
+                        "stderr": limit(stderr.decode(encoding, errors="replace")),
+                    }
+                )
+
+                break
+                # re-raise so caller sees the timeout
+            except Exception as ex:
+                results.append(
+                    {
+                        "outcome": {
+                            "type": "exit",
+                            "exit_code": 1,
+                        },
+                        "stdout": "",
+                        "stderr": f"{ex}",
+                    }
+                )
+                break
+
+            results.append(
+                {
+                    "outcome": {
+                        "type": "exit",
+                        "exit_code": proc.returncode,
+                    },
+                    "stdout": limit(stdout.decode(encoding, errors="replace")),
+                    "stderr": limit(stderr.decode(encoding, errors="replace")),
+                }
+            )
+
+        return results
+
+    async def handle_shell_call(
+        self,
+        context,
+        *,
+        id: str,
+        action: dict,
+        call_id: str,
+        status: str,
+        type: str,
+        **extra,
+    ):
+        result = await self.execute_shell_command(context, **action)
+
+        output_item = {
+            "type": "shell_call_output",
+            "call_id": call_id,
+            "output": result,
+        }
+
+        return output_item
+
+
 class ContainerFile:
     def __init__(self, *, file_id: str, mime_type: str, container_id: str):
         self.file_id = file_id
