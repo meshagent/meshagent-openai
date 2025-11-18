@@ -1101,6 +1101,8 @@ class LocalShellToolkitBuilder(ToolkitBuilder):
         return Toolkit(name="local_shell", tools=[LocalShellTool(config=config)])
 
 
+MAX_SHELL_OUTPUT_SIZE = 1024*100
+
 class LocalShellTool(OpenAIResponsesTool):
     def __init__(self, *, config: LocalShellConfig):
         super().__init__(name="local_shell")
@@ -1133,13 +1135,16 @@ class LocalShellTool(OpenAIResponsesTool):
             stderr=asyncio.subprocess.PIPE,
         )
 
+        logger.info(f"executing command {command} with timeout: {timeout_ms}")
+
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(),
-                timeout=timeout_ms / 1000 if timeout_ms else None,
+                timeout=timeout_ms / 1000.0 if timeout_ms else 20,
             )
         except asyncio.TimeoutError:
             proc.kill()  # send SIGKILL / TerminateProcess
+            logger.info(f"The command timed out after {timeout_ms}ms")
             stdout, stderr = await proc.communicate()
             return f"The command timed out after {timeout_ms}ms"
             # re-raise so caller sees the timeout
@@ -1149,8 +1154,12 @@ class LocalShellTool(OpenAIResponsesTool):
         encoding = os.device_encoding(1) or "utf-8"
         stdout = stdout.decode(encoding, errors="replace")
         stderr = stderr.decode(encoding, errors="replace")
+        
+        result = stdout + stderr
+        if len(result) > MAX_SHELL_OUTPUT_SIZE:
+            return f"Error: the command returned too much data ({result} bytes)"
 
-        return stdout + stderr
+        return result
 
     async def handle_local_shell_call(
         self,
@@ -1235,7 +1244,7 @@ class ShellTool(OpenAIResponsesTool):
             try:
                 stdout, stderr = await asyncio.wait_for(
                     proc.communicate(),
-                    timeout=timeout_ms / 1000 if timeout_ms else None,
+                    timeout=timeout_ms / 1000 if timeout_ms else 20,
                 )
             except asyncio.TimeoutError:
                 proc.kill()  # send SIGKILL / TerminateProcess
