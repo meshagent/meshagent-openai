@@ -1141,7 +1141,6 @@ class LocalShellTool(OpenAIResponsesTool):
     ):
         merged_env = {**os.environ, **(env or {})}
 
-       
         try:
             # Spawn the process
             proc = await asyncio.create_subprocess_exec(
@@ -1269,7 +1268,6 @@ class ShellTool(OpenAIResponsesTool):
                     stderr=asyncio.subprocess.PIPE,
                 )
 
-     
                 stdout, stderr = await asyncio.wait_for(
                     proc.communicate(),
                     timeout=timeout,
