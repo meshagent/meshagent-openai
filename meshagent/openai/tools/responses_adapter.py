@@ -1099,19 +1099,28 @@ class LocalShellConfig(ToolkitConfig):
 
 
 class LocalShellToolkitBuilder(ToolkitBuilder):
-    def __init__(self):
+    def __init__(self, *, working_directory: Optional[str] = None):
         super().__init__(name="local_shell", type=LocalShellConfig)
+        self.working_directory = working_directory
 
     def make(self, *, model: str, config: LocalShellConfig):
-        return Toolkit(name="local_shell", tools=[LocalShellTool(config=config)])
+        return Toolkit(
+            name="local_shell",
+            tools=[
+                LocalShellTool(config=config, working_directory=self.working_directory)
+            ],
+        )
 
 
 MAX_SHELL_OUTPUT_SIZE = 1024 * 100
 
 
 class LocalShellTool(OpenAIResponsesTool):
-    def __init__(self, *, config: LocalShellConfig):
+    def __init__(
+        self, *, config: LocalShellConfig, working_directory: Optional[str] = None
+    ):
         super().__init__(name="local_shell")
+        self.working_directory = working_directory
 
     def get_open_ai_tool_definitions(self):
         return [{"type": "local_shell"}]
@@ -1135,7 +1144,7 @@ class LocalShellTool(OpenAIResponsesTool):
         # Spawn the process
         proc = await asyncio.create_subprocess_exec(
             *(command if isinstance(command, (list, tuple)) else [command]),
-            cwd=working_directory or os.getcwd(),
+            cwd=working_directory or self.working_directory or os.getcwd(),
             env=merged_env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -1196,16 +1205,21 @@ class ShellConfig(ToolkitConfig):
 
 
 class ShellToolkitBuilder(ToolkitBuilder):
-    def __init__(self):
+    def __init__(self, *, working_directory: Optional[str] = None):
         super().__init__(name="shell", type=ShellConfig)
+        self.working_directory = working_directory
 
     def make(self, *, model: str, config: LocalShellConfig):
-        return Toolkit(name="shell", tools=[ShellTool(config=config)])
+        return Toolkit(
+            name="shell",
+            tools=[ShellTool(config=config, working_directory=self.working_directory)],
+        )
 
 
 class ShellTool(OpenAIResponsesTool):
-    def __init__(self, *, config: ShellConfig):
+    def __init__(self, *, config: ShellConfig, working_directory: Optional[str] = None):
         super().__init__(name="shell")
+        self.working_directory = working_directory
 
     def get_open_ai_tool_definitions(self):
         return [{"type": "shell"}]
@@ -1247,7 +1261,7 @@ class ShellTool(OpenAIResponsesTool):
             # Spawn the process
             proc = await asyncio.create_subprocess_exec(
                 *(shlex.split(command)),
-                cwd=os.getcwd(),
+                cwd=self.working_directory or os.getcwd(),
                 env=merged_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
