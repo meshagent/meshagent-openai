@@ -1141,18 +1141,20 @@ class LocalShellTool(OpenAIResponsesTool):
             stderr=asyncio.subprocess.PIPE,
         )
 
-        logger.info(f"executing command {command} with timeout: {timeout_ms}")
+        timeout = float(timeout_ms) / 1000.0 if timeout_ms else 20.0
+
+        logger.info(f"executing command {command} with timeout: {timeout}s")
 
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(),
-                timeout=timeout_ms / 1000.0 if timeout_ms else 20,
+                timeout=timeout,
             )
         except asyncio.TimeoutError:
             proc.kill()  # send SIGKILL / TerminateProcess
-            logger.info(f"The command timed out after {timeout_ms}ms")
+            logger.info(f"The command timed out after {timeout}s")
             stdout, stderr = await proc.communicate()
-            return f"The command timed out after {timeout_ms}ms"
+            return f"The command timed out after {timeout}s"
             # re-raise so caller sees the timeout
         except Exception as ex:
             return f"The command failed: {ex}"
@@ -1237,7 +1239,11 @@ class ShellTool(OpenAIResponsesTool):
             else:
                 return s
 
+        timeout = float(timeout_ms) / 1000.0 if timeout_ms else 20.0
+
         for command in commands:
+            logger.info(f"executing command {command} with timeout: {timeout}s")
+
             # Spawn the process
             proc = await asyncio.create_subprocess_exec(
                 *(shlex.split(command)),
@@ -1250,9 +1256,10 @@ class ShellTool(OpenAIResponsesTool):
             try:
                 stdout, stderr = await asyncio.wait_for(
                     proc.communicate(),
-                    timeout=timeout_ms / 1000 if timeout_ms else 20,
+                    timeout=timeout,
                 )
             except asyncio.TimeoutError:
+                logger.info(f"The command timed out after {timeout}s")
                 proc.kill()  # send SIGKILL / TerminateProcess
 
                 stdout, stderr = await proc.communicate()
@@ -1266,7 +1273,7 @@ class ShellTool(OpenAIResponsesTool):
                 )
 
                 break
-                # re-raise so caller sees the timeout
+
             except Exception as ex:
                 results.append(
                     {
