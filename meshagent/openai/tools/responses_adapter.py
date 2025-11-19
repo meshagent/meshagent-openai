@@ -282,7 +282,10 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
                                 "call_id": tool_call.call_id,
                                 "type": "function_call_output",
                             }
-                        elif response.mime_type.startswith("text/"):
+                        elif (
+                            response.mime_type is not None
+                            and response.mime_type.startswith("text/")
+                        ):
                             message = {
                                 "output": response.data.decode(),
                                 "call_id": tool_call.call_id,
@@ -705,14 +708,14 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                     #    return outputs, False
 
                                     else:
-                                        for toolkit in toolkits:
-                                            for tool in toolkit.tools:
-                                                if isinstance(
-                                                    tool, OpenAIResponsesTool
-                                                ):
-                                                    with tracer.start_as_current_span(
-                                                        "llm.handle_tool_call"
-                                                    ) as span:
+                                        with tracer.start_as_current_span(
+                                            "llm.handle_tool_call"
+                                        ) as span:
+                                            for toolkit in toolkits:
+                                                for tool in toolkit.tools:
+                                                    if isinstance(
+                                                        tool, OpenAIResponsesTool
+                                                    ):
                                                         arguments = message.model_dump(
                                                             mode="json"
                                                         )
@@ -746,10 +749,12 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                                     ),
                                                                 )
                                                                 return [result], False
-                                                        else:
-                                                            logger.warning(
-                                                                f"OpenAI response handler was not registered for {message.type}"
-                                                            )
+
+                                                            return [], False
+
+                                            logger.warning(
+                                                f"OpenAI response handler was not registered for {message.type}"
+                                            )
 
                                     return [], False
 
@@ -1101,7 +1106,8 @@ class LocalShellToolkitBuilder(ToolkitBuilder):
         return Toolkit(name="local_shell", tools=[LocalShellTool(config=config)])
 
 
-MAX_SHELL_OUTPUT_SIZE = 1024*100
+MAX_SHELL_OUTPUT_SIZE = 1024 * 100
+
 
 class LocalShellTool(OpenAIResponsesTool):
     def __init__(self, *, config: LocalShellConfig):
@@ -1154,7 +1160,7 @@ class LocalShellTool(OpenAIResponsesTool):
         encoding = os.device_encoding(1) or "utf-8"
         stdout = stdout.decode(encoding, errors="replace")
         stderr = stderr.decode(encoding, errors="replace")
-        
+
         result = stdout + stderr
         if len(result) > MAX_SHELL_OUTPUT_SIZE:
             return f"Error: the command returned too much data ({result} bytes)"
@@ -1976,3 +1982,198 @@ class FileSearchTool(OpenAIResponsesTool):
         await self.on_file_search(
             context, queries=queries, results=search_results, status=status
         )
+
+
+class ApplyPatchConfig(ToolkitConfig):
+    name: Literal["apply_patch"]
+
+
+class ApplyPatchToolkitBuilder(ToolkitBuilder):
+    def __init__(self):
+        super().__init__(name="apply_patch", type=ApplyPatchConfig)
+
+    def make(self, *, model: str, config: ApplyPatchConfig):
+        return Toolkit(name="apply_patch", tools=[ApplyPatchTool(config=config)])
+
+
+class ApplyPatchTool(OpenAIResponsesTool):
+    """
+    Wrapper for the built-in `apply_patch` tool.
+
+    The model will emit `apply_patch_call` items whenever it wants to create,
+    update, or delete a file using a unified diff. The server / host
+    environment is expected to actually apply the patch and, if desired,
+    log results via `apply_patch_call_output`.
+
+    The two key handler entrypoints you can override are:
+
+      * `on_apply_patch_call`       – called when the model requests a patch
+      * `on_apply_patch_call_output` – called when the tool emits a log/output item
+    """
+
+    def __init__(self, *, config: ApplyPatchConfig):
+        super().__init__(name="apply_patch")
+
+    # Tool definition advertised to OpenAI
+    def get_open_ai_tool_definitions(self) -> list[dict]:
+        # No extra options for now – the built-in tool just needs the type
+        return [{"type": "apply_patch"}]
+
+    # Stream callbacks for `response.apply_patch_call.*` events
+    def get_open_ai_stream_callbacks(self):
+        return {
+            "response.apply_patch_call.in_progress": self.on_apply_patch_call_in_progress,
+            "response.apply_patch_call.completed": self.on_apply_patch_call_completed,
+        }
+
+    # Output handlers for item types
+    def get_open_ai_output_handlers(self):
+        return {
+            # The tool call itself (what to apply)
+            "apply_patch_call": self.handle_apply_patch_call,
+        }
+
+    # --- Stream callbacks -------------------------------------------------
+
+    # response.apply_patch_call.in_progress
+    async def on_apply_patch_call_in_progress(
+        self,
+        context: ToolContext,
+        *,
+        item_id: str,
+        output_index: int,
+        sequence_number: int,
+        type: str,
+        **extra,
+    ):
+        # Default: no-op, but you can log progress / show UI here if you want
+        pass
+
+    # response.apply_patch_call.completed
+    async def on_apply_patch_call_completed(
+        self,
+        context: ToolContext,
+        *,
+        item_id: str,
+        output_index: int,
+        sequence_number: int,
+        type: str,
+        **extra,
+    ):
+        # Default: no-op
+        pass
+
+    # --- High-level hooks -------------------------------------------------
+
+    async def on_apply_patch_call(
+        self,
+        context: ToolContext,
+        *,
+        call_id: str,
+        operation: dict,
+        status: str,
+        **extra,
+    ):
+        """
+        Called when the model requests an apply_patch operation.
+
+        operation looks like one of:
+
+        create_file:
+            {
+              "type": "create_file",
+              "path": "relative/path/to/file",
+              "diff": "...unified diff..."
+            }
+
+        update_file:
+            {
+              "type": "update_file",
+              "path": "relative/path/to/file",
+              "diff": "...unified diff..."
+            }
+
+        delete_file:
+            {
+              "type": "delete_file",
+              "path": "relative/path/to/file"
+            }
+        """
+        # Override this to actually apply the patch in your workspace.
+        # Default is no-op.
+
+        from meshagent.openai.tools.apply_patch import apply_diff
+
+        if operation["type"] == "delete_file":
+            path = operation["path"]
+            logger.info(f"applying patch: deleting file {path}")
+            await context.room.storage.delete(path=path)
+            log = f"Deleted file: {path}"
+            logger.info(log)
+            return {"status": "completed", "output": log}
+
+        elif operation["type"] == "create_file":
+            diff = operation["diff"]
+            path = operation["path"]
+            logger.info(f"applying patch: creating file {path} with {diff}")
+            handle = await context.room.storage.open(path=path, overwrite=False)
+            try:
+                patched = apply_diff("", diff, "create")
+            except Exception as ex:
+                return {"status": "failed", "output": f"{ex}"}
+            await context.room.storage.write(handle=handle, data=patched.encode())
+            await context.room.storage.close(handle=handle)
+
+            log = f"Created file: {path} ({len(patched)} bytes)"
+            logger.info(log)
+            return {"status": "completed", "output": log}
+
+        elif operation["type"] == "update_file":
+            path = operation["path"]
+            content = await context.room.storage.download(path=path)
+            text = content.data.decode()
+            diff = operation["diff"]
+
+            logger.info(f"applying patch: updating file {path} with {diff}")
+
+            try:
+                patched = apply_diff(text, diff)
+            except Exception as ex:
+                return {"status": "failed", "output": f"{ex}"}
+
+            handle = await context.room.storage.open(path=path, overwrite=True)
+            await context.room.storage.write(handle=handle, data=patched.encode())
+            await context.room.storage.close(handle=handle)
+
+            log = f"Updated file: {path} ({len(text)} -> {len(patched)} bytes)"
+            logger.info(log)
+            return {"status": "completed", "output": log}
+
+            # apply patch
+        else:
+            raise Exception(f"Unexpected patch operation {operation}")
+
+    async def handle_apply_patch_call(
+        self,
+        context: ToolContext,
+        *,
+        call_id: str,
+        operation: dict,
+        status: str,
+        type: str,
+        id: str | None = None,
+        **extra,
+    ):
+        result = await self.on_apply_patch_call(
+            context,
+            call_id=call_id,
+            operation=operation,
+            status=status,
+            **extra,
+        )
+
+        return {
+            "type": "apply_patch_call_output",
+            "call_id": call_id,
+            **result,
+        }
