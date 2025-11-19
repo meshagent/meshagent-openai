@@ -1235,7 +1235,6 @@ class ShellTool(OpenAIResponsesTool):
         max_output_length: Optional[int] = None,
         timeout_ms: Optional[int] = None,
     ):
-        import shlex
 
         merged_env = {**os.environ}
 
