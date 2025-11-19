@@ -1141,20 +1141,21 @@ class LocalShellTool(OpenAIResponsesTool):
     ):
         merged_env = {**os.environ, **(env or {})}
 
-        # Spawn the process
-        proc = await asyncio.create_subprocess_exec(
-            *(command if isinstance(command, (list, tuple)) else [command]),
-            cwd=working_directory or self.working_directory or os.getcwd(),
-            env=merged_env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        timeout = float(timeout_ms) / 1000.0 if timeout_ms else 20.0
-
-        logger.info(f"executing command {command} with timeout: {timeout}s")
-
+       
         try:
+            # Spawn the process
+            proc = await asyncio.create_subprocess_exec(
+                *(command if isinstance(command, (list, tuple)) else [command]),
+                cwd=working_directory or self.working_directory or os.getcwd(),
+                env=merged_env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            timeout = float(timeout_ms) / 1000.0 if timeout_ms else 20.0
+
+            logger.info(f"executing command {command} with timeout: {timeout}s")
+
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(),
                 timeout=timeout,
@@ -1259,15 +1260,16 @@ class ShellTool(OpenAIResponsesTool):
             logger.info(f"executing command {command} with timeout: {timeout}s")
 
             # Spawn the process
-            proc = await asyncio.create_subprocess_exec(
-                *(shlex.split(command)),
-                cwd=self.working_directory or os.getcwd(),
-                env=merged_env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
             try:
+                proc = await asyncio.create_subprocess_shell(
+                    command,
+                    cwd=self.working_directory or os.getcwd(),
+                    env=merged_env,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+
+     
                 stdout, stderr = await asyncio.wait_for(
                     proc.communicate(),
                     timeout=timeout,
