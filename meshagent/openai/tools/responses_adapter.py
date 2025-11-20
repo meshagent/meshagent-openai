@@ -29,6 +29,7 @@ import base64
 import logging
 import re
 import asyncio
+import os.path
 
 from pydantic import BaseModel
 import copy
@@ -249,7 +250,9 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
 
             else:
                 span.set_attribute("kind", "text")
+
                 if isinstance(response, FileResponse):
+                    _, extension = os.path.splitext(response.name)
                     if response.mime_type and response.mime_type.startswith("image/"):
                         span.set_attribute(
                             "output", f"image: {response.name}, {response.mime_type}"
@@ -288,6 +291,16 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
                         ):
                             message = {
                                 "output": response.data.decode(),
+                                "call_id": tool_call.call_id,
+                                "type": "function_call_output",
+                            }
+                        elif await room.storage.exists(
+                            path=f".schemas/{extension.lstrip('.')}.json"
+                        ):
+                            message = {
+                                "output": json.dumps(
+                                    await room.sync.describe(path=response.name)
+                                ),
                                 "call_id": tool_call.call_id,
                                 "type": "function_call_output",
                             }
