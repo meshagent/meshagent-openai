@@ -282,16 +282,16 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
                                 "call_id": tool_call.call_id,
                                 "type": "function_call_output",
                             }
-                        elif (
-                            response.mime_type is not None
-                            and (response.mime_type.startswith("text/") or response.mime_type == "application/json")
+                        elif response.mime_type is not None and (
+                            response.mime_type.startswith("text/")
+                            or response.mime_type == "application/json"
                         ):
                             message = {
                                 "output": response.data.decode(),
                                 "call_id": tool_call.call_id,
                                 "type": "function_call_output",
                             }
-            
+
                         else:
                             message = {
                                 "output": f"{response.name} was not in a supported format",
