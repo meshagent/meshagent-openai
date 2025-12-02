@@ -481,6 +481,8 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                     on_behalf_of_name
                                 )
 
+                            logger.info(f"sending messages to llm {context.messages}")
+
                             response: Response = await openai.responses.create(
                                 extra_headers=extra_headers,
                                 stream=stream,
@@ -539,6 +541,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                     tool_context = ToolContext(
                                                         room=room,
                                                         caller=room.local_participant,
+                                                        on_behalf_of=on_behalf_of,
                                                         caller_context={
                                                             "chat": context.to_json()
                                                         },
