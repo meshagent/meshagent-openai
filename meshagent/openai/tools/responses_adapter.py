@@ -1128,7 +1128,7 @@ class LocalShellTool(OpenAIResponsesTool):
     ):
         super().__init__(name="local_shell")
         if config is None:
-            config = LocalShellConfig()
+            config = LocalShellConfig(name="local_shell")
 
         self.working_directory = working_directory
 
@@ -1235,7 +1235,7 @@ class ShellTool(OpenAIResponsesTool):
     ):
         super().__init__(name="shell")
         if config is None:
-            config = ShellConfig()
+            config = ShellConfig(name="shell")
         self.working_directory = working_directory
 
     def get_open_ai_tool_definitions(self):
@@ -1845,7 +1845,7 @@ class WebSearchToolkitBuilder(ToolkitBuilder):
 class WebSearchTool(OpenAIResponsesTool):
     def __init__(self, *, config: Optional[WebSearchConfig] = None):
         if config is None:
-            config = WebSearchConfig()
+            config = WebSearchConfig(name="web_search")
         super().__init__(name="web_search")
 
     def get_open_ai_tool_definitions(self) -> list[dict]:
