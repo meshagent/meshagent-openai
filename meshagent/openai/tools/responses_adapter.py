@@ -1121,9 +1121,15 @@ MAX_SHELL_OUTPUT_SIZE = 1024 * 100
 
 class LocalShellTool(OpenAIResponsesTool):
     def __init__(
-        self, *, config: LocalShellConfig, working_directory: Optional[str] = None
+        self,
+        *,
+        config: Optional[LocalShellConfig] = None,
+        working_directory: Optional[str] = None,
     ):
         super().__init__(name="local_shell")
+        if config is None:
+            config = LocalShellConfig()
+
         self.working_directory = working_directory
 
     def get_open_ai_tool_definitions(self):
@@ -1221,8 +1227,15 @@ class ShellToolkitBuilder(ToolkitBuilder):
 
 
 class ShellTool(OpenAIResponsesTool):
-    def __init__(self, *, config: ShellConfig, working_directory: Optional[str] = None):
+    def __init__(
+        self,
+        *,
+        config: Optional[ShellConfig] = None,
+        working_directory: Optional[str] = None,
+    ):
         super().__init__(name="shell")
+        if config is None:
+            config = ShellConfig()
         self.working_directory = working_directory
 
     def get_open_ai_tool_definitions(self):
@@ -1830,7 +1843,9 @@ class WebSearchToolkitBuilder(ToolkitBuilder):
 
 
 class WebSearchTool(OpenAIResponsesTool):
-    def __init__(self, *, config: WebSearchConfig):
+    def __init__(self, *, config: Optional[WebSearchConfig] = None):
+        if config is None:
+            config = WebSearchConfig()
         super().__init__(name="web_search")
 
     def get_open_ai_tool_definitions(self) -> list[dict]:
