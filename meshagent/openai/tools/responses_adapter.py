@@ -358,18 +358,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         return self._model
 
     def create_chat_context(self):
-        system_role = "system"
-        if self._model.startswith("o1"):
-            system_role = "developer"
-        elif self._model.startswith("o3"):
-            system_role = "developer"
-        elif self._model.startswith("o4"):
-            system_role = "developer"
-        elif self._model.startswith("computer-use"):
-            system_role = "developer"
-
-        context = AgentChatContext(system_role=system_role)
-
+        context = AgentChatContext(system_role=None)
         return context
 
     async def check_for_termination(
