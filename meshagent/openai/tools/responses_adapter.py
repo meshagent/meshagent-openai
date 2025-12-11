@@ -358,18 +358,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         return self._model
 
     def create_chat_context(self):
-        system_role = "system"
-        if self._model.startswith("o1"):
-            system_role = "developer"
-        elif self._model.startswith("o3"):
-            system_role = "developer"
-        elif self._model.startswith("o4"):
-            system_role = "developer"
-        elif self._model.startswith("computer-use"):
-            system_role = "developer"
-
-        context = AgentChatContext(system_role=system_role)
-
+        context = AgentChatContext(system_role=None)
         return context
 
     async def check_for_termination(
@@ -455,6 +444,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                             span.set_attribute("response_format", "text")
 
                         previous_response_id = NOT_GIVEN
+                        instructions = context.get_system_instructions()
                         if context.previous_response_id is not None:
                             previous_response_id = context.previous_response_id
 
@@ -481,6 +471,10 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                     on_behalf_of_name
                                 )
 
+                            logger.info(
+                                f"requesting response from openai with model: {model}"
+                            )
+
                             response: Response = await openai.responses.create(
                                 extra_headers=extra_headers,
                                 stream=stream,
@@ -489,6 +483,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                 tools=open_ai_tools,
                                 text=text,
                                 previous_response_id=previous_response_id,
+                                instructions=instructions or NOT_GIVEN,
                                 **response_options,
                             )
 
@@ -539,6 +534,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                     tool_context = ToolContext(
                                                         room=room,
                                                         caller=room.local_participant,
+                                                        on_behalf_of=on_behalf_of,
                                                         caller_context={
                                                             "chat": context.to_json()
                                                         },
@@ -738,9 +734,52 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                                     "chat": context.to_json()
                                                                 },
                                                             )
-                                                            result = await handlers[
-                                                                message.type
-                                                            ](tool_context, **arguments)
+
+                                                            try:
+                                                                if (
+                                                                    event_handler
+                                                                    is not None
+                                                                ):
+                                                                    event_handler(
+                                                                        {
+                                                                            "type": "meshagent.handler.added",
+                                                                            "item": message.model_dump(
+                                                                                mode="json"
+                                                                            ),
+                                                                        }
+                                                                    )
+
+                                                                result = await handlers[
+                                                                    message.type
+                                                                ](
+                                                                    tool_context,
+                                                                    **arguments,
+                                                                )
+
+                                                            except Exception as e:
+                                                                if (
+                                                                    event_handler
+                                                                    is not None
+                                                                ):
+                                                                    event_handler(
+                                                                        {
+                                                                            "type": "meshagent.handler.done",
+                                                                            "error": f"{e}",
+                                                                        }
+                                                                    )
+
+                                                                raise
+
+                                                            if (
+                                                                event_handler
+                                                                is not None
+                                                            ):
+                                                                event_handler(
+                                                                    {
+                                                                        "type": "meshagent.handler.done",
+                                                                        "item": result,
+                                                                    }
+                                                                )
 
                                                             if result is not None:
                                                                 span.set_attribute(
@@ -1118,9 +1157,15 @@ MAX_SHELL_OUTPUT_SIZE = 1024 * 100
 
 class LocalShellTool(OpenAIResponsesTool):
     def __init__(
-        self, *, config: LocalShellConfig, working_directory: Optional[str] = None
+        self,
+        *,
+        config: Optional[LocalShellConfig] = None,
+        working_directory: Optional[str] = None,
     ):
         super().__init__(name="local_shell")
+        if config is None:
+            config = LocalShellConfig(name="local_shell")
+
         self.working_directory = working_directory
 
     def get_open_ai_tool_definitions(self):
@@ -1218,8 +1263,15 @@ class ShellToolkitBuilder(ToolkitBuilder):
 
 
 class ShellTool(OpenAIResponsesTool):
-    def __init__(self, *, config: ShellConfig, working_directory: Optional[str] = None):
+    def __init__(
+        self,
+        *,
+        config: Optional[ShellConfig] = None,
+        working_directory: Optional[str] = None,
+    ):
         super().__init__(name="shell")
+        if config is None:
+            config = ShellConfig(name="shell")
         self.working_directory = working_directory
 
     def get_open_ai_tool_definitions(self):
@@ -1827,7 +1879,9 @@ class WebSearchToolkitBuilder(ToolkitBuilder):
 
 
 class WebSearchTool(OpenAIResponsesTool):
-    def __init__(self, *, config: WebSearchConfig):
+    def __init__(self, *, config: Optional[WebSearchConfig] = None):
+        if config is None:
+            config = WebSearchConfig(name="web_search")
         super().__init__(name="web_search")
 
     def get_open_ai_tool_definitions(self) -> list[dict]:
