@@ -444,10 +444,9 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                             span.set_attribute("response_format", "text")
 
                         previous_response_id = NOT_GIVEN
-                        instructions = None
+                        instructions = context.get_system_instructions()
                         if context.previous_response_id is not None:
                             previous_response_id = context.previous_response_id
-                            instructions = context.get_system_instructions()
 
                         stream = event_handler is not None
 
