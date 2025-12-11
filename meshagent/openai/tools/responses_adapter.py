@@ -455,8 +455,10 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                             span.set_attribute("response_format", "text")
 
                         previous_response_id = NOT_GIVEN
+                        instructions = None
                         if context.previous_response_id is not None:
                             previous_response_id = context.previous_response_id
+                            instructions = context.get_system_instructions()
 
                         stream = event_handler is not None
 
@@ -481,7 +483,9 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                     on_behalf_of_name
                                 )
 
-                            logger.info(f"sending messages to llm {context.messages}")
+                            logger.info(
+                                f"requesting response from openai with model: {model}"
+                            )
 
                             response: Response = await openai.responses.create(
                                 extra_headers=extra_headers,
@@ -491,6 +495,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                 tools=open_ai_tools,
                                 text=text,
                                 previous_response_id=previous_response_id,
+                                instructions=instructions or NOT_GIVEN,
                                 **response_options,
                             )
 
@@ -741,9 +746,52 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                                     "chat": context.to_json()
                                                                 },
                                                             )
-                                                            result = await handlers[
-                                                                message.type
-                                                            ](tool_context, **arguments)
+
+                                                            try:
+                                                                if (
+                                                                    event_handler
+                                                                    is not None
+                                                                ):
+                                                                    event_handler(
+                                                                        {
+                                                                            "type": "meshagent.handler.added",
+                                                                            "item": message.model_dump(
+                                                                                mode="json"
+                                                                            ),
+                                                                        }
+                                                                    )
+
+                                                                result = await handlers[
+                                                                    message.type
+                                                                ](
+                                                                    tool_context,
+                                                                    **arguments,
+                                                                )
+
+                                                            except Exception as e:
+                                                                if (
+                                                                    event_handler
+                                                                    is not None
+                                                                ):
+                                                                    event_handler(
+                                                                        {
+                                                                            "type": "meshagent.handler.done",
+                                                                            "error": f"{e}",
+                                                                        }
+                                                                    )
+
+                                                                raise
+
+                                                            if (
+                                                                event_handler
+                                                                is not None
+                                                            ):
+                                                                event_handler(
+                                                                    {
+                                                                        "type": "meshagent.handler.done",
+                                                                        "item": result,
+                                                                    }
+                                                                )
 
                                                             if result is not None:
                                                                 span.set_attribute(
