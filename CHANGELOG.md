@@ -1,3 +1,6 @@
+## [0.12.0]
+- Reduce worker-queue logging verbosity to avoid logging full message payloads
+
 ## [0.11.0]
 - Stability
 
