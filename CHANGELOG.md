@@ -1,3 +1,10 @@
+## [0.13.0]
+- Added `initial_json` and explicit schema support when opening MeshDocuments, enabling schema-first document initialization
+- Added binary attachment support when invoking agent tools so tool calls can include raw payload data
+- Breaking change: toolkit construction is now async and receives the active room client, enabling toolkits that introspect room state during build
+- Added database schema inspection and JSON Schema mappings for data types to support tool input validation and generation
+- Introduced database toolkits (list/inspect/search/insert/update/delete) and integrated optional per-table enablement into the chatbot/mailbot/helpers CLI flows
+
 ## [0.12.0]
 - Reduce worker-queue logging verbosity to avoid logging full message payloads
 
