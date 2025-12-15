@@ -965,7 +965,9 @@ class ImageGenerationToolkitBuilder(ToolkitBuilder):
     def __init__(self):
         super().__init__(name="image_generation", type=ImageGenerationConfig)
 
-    def make(self, *, model: str, config: ImageGenerationConfig):
+    async def make(
+        self, *, room: RoomClient, model: str, config: ImageGenerationConfig
+    ):
         return Toolkit(
             name="image_generation", tools=[ImageGenerationTool(config=config)]
         )
@@ -1143,7 +1145,7 @@ class LocalShellToolkitBuilder(ToolkitBuilder):
         super().__init__(name="local_shell", type=LocalShellConfig)
         self.working_directory = working_directory
 
-    def make(self, *, model: str, config: LocalShellConfig):
+    async def make(self, *, room: RoomClient, model: str, config: LocalShellConfig):
         return Toolkit(
             name="local_shell",
             tools=[
@@ -1255,7 +1257,7 @@ class ShellToolkitBuilder(ToolkitBuilder):
         super().__init__(name="shell", type=ShellConfig)
         self.working_directory = working_directory
 
-    def make(self, *, model: str, config: LocalShellConfig):
+    async def make(self, *, room: RoomClient, model: str, config: LocalShellConfig):
         return Toolkit(
             name="shell",
             tools=[ShellTool(config=config, working_directory=self.working_directory)],
@@ -1509,7 +1511,7 @@ class MCPToolkitBuilder(ToolkitBuilder):
     def __init__(self):
         super().__init__(name="mcp", type=MCPConfig)
 
-    def make(self, *, model: str, config: MCPConfig):
+    async def make(self, *, room: RoomClient, model: str, config: MCPConfig):
         return Toolkit(name="mcp", tools=[MCPTool(config=config)])
 
 
@@ -1874,7 +1876,7 @@ class WebSearchToolkitBuilder(ToolkitBuilder):
     def __init__(self):
         super().__init__(name="web_search", type=WebSearchConfig)
 
-    def make(self, *, model: str, config: WebSearchConfig):
+    async def make(self, *, room: RoomClient, model: str, config: WebSearchConfig):
         return Toolkit(name="web_search", tools=[WebSearchTool(config=config)])
 
 
@@ -2066,7 +2068,7 @@ class ApplyPatchToolkitBuilder(ToolkitBuilder):
     def __init__(self):
         super().__init__(name="apply_patch", type=ApplyPatchConfig)
 
-    def make(self, *, model: str, config: ApplyPatchConfig):
+    async def make(self, *, room: RoomClient, model: str, config: ApplyPatchConfig):
         return Toolkit(name="apply_patch", tools=[ApplyPatchTool(config=config)])
 
 
