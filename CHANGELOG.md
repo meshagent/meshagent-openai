@@ -1,3 +1,7 @@
+## [0.15.0]
+- Added new UI schema widgets for `tabs`/`tab` (including initial tab selection and active background styling) plus a `visible` boolean widget property for conditional rendering.
+- Updated Python LiveKit integration dependencies to include `livekit==1.0.20`.
+
 ## [0.14.0]
 - Breaking change: toolkit extension hooks were simplified to a synchronous `get_toolkit_builders()` API and tool selection now uses per-toolkit configuration objects (not just tool names)
 - `LLMTaskRunner` now supports per-client and per-room rules, plus dynamically injected required toolkits at call time
