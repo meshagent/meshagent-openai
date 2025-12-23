@@ -1,3 +1,7 @@
+## [0.16.0]
+- Add optional `namespace` support across database client operations (list/inspect/create/drop/index/etc.) to target namespaced tables
+- Update dependencies `livekit-api` to `~1.1` (from `>=1.0`) and `livekit-agents`/`livekit-plugins-openai`/`livekit-plugins-silero`/`livekit-plugins-turn-detector` to `~1.3` (from `~1.2`)
+
 ## [0.15.0]
 - Added new UI schema widgets for `tabs`/`tab` (including initial tab selection and active background styling) plus a `visible` boolean widget property for conditional rendering.
 - Updated Python LiveKit integration dependencies to include `livekit==1.0.20`.
