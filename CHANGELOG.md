@@ -1,3 +1,11 @@
+## [0.17.0]
+- Added scheduled tasks support to the Python accounts client (create/update/list/delete scheduled tasks) with typed models
+- Added mailbox CRUD helpers to the Python accounts client and improved error handling with typed HTTP exceptions (404/403/409/400/5xx)
+- Added `RequiredTable` requirement type plus helper to create required tables, indexes, and optimize them automatically
+- Added database namespace support for database toolkit operations (inspect/search/insert/update/delete in a namespace)
+- Enhanced worker and mail agents (per-message tool selection, optional remote toolkit exposure for queue task submission, reply-all/cc support)
+- Updated Python dependency: `supabase-auth` from `~2.12.3` to `~2.22.3`
+
 ## [0.16.0]
 - Add optional `namespace` support across database client operations (list/inspect/create/drop/index/etc.) to target namespaced tables
 - Update dependencies `livekit-api` to `~1.1` (from `>=1.0`) and `livekit-agents`/`livekit-plugins-openai`/`livekit-plugins-silero`/`livekit-plugins-turn-detector` to `~1.3` (from `~1.2`)
