@@ -1,3 +1,7 @@
+## [0.17.1]
+- Prevented worker toolkit lifecycle collisions when running alongside other toolkits by isolating the worker’s remote toolkit handling.
+- Improved the error message when attempting to start a single-room agent more than once.
+
 ## [0.17.0]
 - Added scheduled tasks support to the Python accounts client (create/update/list/delete scheduled tasks) with typed models
 - Added mailbox CRUD helpers to the Python accounts client and improved error handling with typed HTTP exceptions (404/403/409/400/5xx)
