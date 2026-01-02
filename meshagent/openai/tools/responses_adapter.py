@@ -1254,15 +1254,35 @@ class ShellConfig(ToolkitConfig):
     name: Literal["shell"] = ("shell",)
 
 
+DEFAULT_CONTAINER_MOUNT_SPEC = ContainerMountSpec(
+    room=[RoomStorageMountSpec(path="/data")]
+)
+
+
 class ShellToolkitBuilder(ToolkitBuilder):
-    def __init__(self, *, working_directory: Optional[str] = None):
+    def __init__(
+        self,
+        *,
+        working_directory: Optional[str] = None,
+        image: Optional[str] = "ubuntu:latest",
+        mounts: Optional[ContainerMountSpec] = DEFAULT_CONTAINER_MOUNT_SPEC,
+    ):
         super().__init__(name="shell", type=ShellConfig)
         self.working_directory = working_directory
+        self.image = image
+        self.mounts = mounts
 
     async def make(self, *, room: RoomClient, model: str, config: LocalShellConfig):
         return Toolkit(
             name="shell",
-            tools=[ShellTool(config=config, working_directory=self.working_directory)],
+            tools=[
+                ShellTool(
+                    config=config,
+                    working_directory=self.working_directory,
+                    image=self.image,
+                    mounts=self.mounts,
+                )
+            ],
         )
 
 
@@ -1273,9 +1293,7 @@ class ShellTool(OpenAIResponsesTool):
         config: Optional[ShellConfig] = None,
         working_directory: Optional[str] = None,
         image: Optional[str] = "ubuntu:latest",
-        mounts: Optional[ContainerMountSpec] = ContainerMountSpec(
-            room=[RoomStorageMountSpec(path="/data")]
-        ),
+        mounts: Optional[ContainerMountSpec] = DEFAULT_CONTAINER_MOUNT_SPEC,
     ):
         super().__init__(name="shell")
         if config is None:
