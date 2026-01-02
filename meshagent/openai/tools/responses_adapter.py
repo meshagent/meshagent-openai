@@ -1249,7 +1249,7 @@ class LocalShellTool(OpenAIResponsesTool):
 
 
 class ShellConfig(ToolkitConfig):
-    name: Literal["shell"] = "shell"
+    name: Literal["shell"] = ("shell",)
 
 
 class ShellToolkitBuilder(ToolkitBuilder):
@@ -1270,11 +1270,17 @@ class ShellTool(OpenAIResponsesTool):
         *,
         config: Optional[ShellConfig] = None,
         working_directory: Optional[str] = None,
+        image: Optional[str] = "ubuntu:latest",
+        mount_path: Optional[str] = "/data",
+        mount_subpath: Optional[str] = None,
     ):
         super().__init__(name="shell")
         if config is None:
             config = ShellConfig(name="shell")
         self.working_directory = working_directory
+        self.image = image
+        self.mount_path = mount_path
+        self.mount_subpath = mount_subpath
 
     def get_open_ai_tool_definitions(self):
         return [{"type": "shell"}]
@@ -1308,40 +1314,77 @@ class ShellTool(OpenAIResponsesTool):
 
         timeout = float(timeout_ms) / 1000.0 if timeout_ms else 20.0
 
-        for command in commands:
-            logger.info(f"executing command {command} with timeout: {timeout}s")
+        if self.image is not None:
+            container_id = await context.room.containers.run(
+                command="sleep infinity",
+                image=self.image,
+                mount_path=self.mount_path,
+                mount_subpath=self.mount_subpath,
+            )
 
-            # Spawn the process
             try:
-                proc = await asyncio.create_subprocess_shell(
-                    command,
-                    cwd=self.working_directory or os.getcwd(),
-                    env=merged_env,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
 
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=timeout,
-                )
-            except asyncio.TimeoutError:
-                logger.info(f"The command timed out after {timeout}s")
-                proc.kill()  # send SIGKILL / TerminateProcess
+                # TODO: what if container start fails
 
-                stdout, stderr = await proc.communicate()
+                logger.info(f"executing shell commands in container {container_id}")
 
-                results.append(
-                    {
-                        "outcome": {"type": "timeout"},
-                        "stdout": limit(stdout.decode(encoding, errors="replace")),
-                        "stderr": limit(stderr.decode(encoding, errors="replace")),
-                    }
-                )
+                for command in commands:
+                    exec = await context.room.containers.exec(
+                        container_id=container_id, command=command, tty=False
+                    )
 
-                break
+                    stdout = bytearray()
+                    stderr = bytearray()
 
+                    async for se in exec.stderr():
+                        stdout.extend(se)
+
+                    async for so in exec.stdout():
+                        stdout.extend(so)
+
+                    try:
+                        async with asyncio.Timeout(timeout):
+                            exit_code = await exec.result
+
+                            results.append(
+                                {
+                                    "outcome": {
+                                        "type": "exit",
+                                        "exit_code": exit_code,
+                                    },
+                                    "stdout": stdout.decode(),
+                                    "stderr": stderr.decode(),
+                                }
+                            )
+
+                    except asyncio.TimeoutError:
+                        logger.info(f"The command timed out after {timeout}s")
+                        await exec.close()
+
+                        results.append(
+                            {
+                                "outcome": {"type": "timeout"},
+                                "stdout": limit(stdout.decode(encoding, errors="replace")),
+                                "stderr": limit(stderr.decode(encoding, errors="replace")),
+                            }
+                        )
+                        break
+
+                    except Exception as ex:
+                        results.append(
+                            {
+                                "outcome": {
+                                    "type": "exit",
+                                    "exit_code": 1,
+                                },
+                                "stdout": "",
+                                "stderr": f"{ex}",
+                            }
+                        )
+                        break
+            
             except Exception as ex:
+
                 results.append(
                     {
                         "outcome": {
@@ -1352,18 +1395,69 @@ class ShellTool(OpenAIResponsesTool):
                         "stderr": f"{ex}",
                     }
                 )
-                break
+            
+            if container_id is not None:
+                await context.room.containers.stop(container_id=container_id) 
+                await context.room.containers.delete(container_id=container_id) 
 
-            results.append(
-                {
-                    "outcome": {
-                        "type": "exit",
-                        "exit_code": proc.returncode,
-                    },
-                    "stdout": limit(stdout.decode(encoding, errors="replace")),
-                    "stderr": limit(stderr.decode(encoding, errors="replace")),
-                }
-            )
+
+        else:
+            for command in commands:
+                logger.info(f"executing command {command} with timeout: {timeout}s")
+
+                # Spawn the process
+                try:
+                    proc = await asyncio.create_subprocess_shell(
+                        command,
+                        cwd=self.working_directory or os.getcwd(),
+                        env=merged_env,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+
+                    stdout, stderr = await asyncio.wait_for(
+                        proc.communicate(),
+                        timeout=timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.info(f"The command timed out after {timeout}s")
+                    proc.kill()  # send SIGKILL / TerminateProcess
+
+                    stdout, stderr = await proc.communicate()
+
+                    results.append(
+                        {
+                            "outcome": {"type": "timeout"},
+                            "stdout": limit(stdout.decode(encoding, errors="replace")),
+                            "stderr": limit(stderr.decode(encoding, errors="replace")),
+                        }
+                    )
+
+                    break
+
+                except Exception as ex:
+                    results.append(
+                        {
+                            "outcome": {
+                                "type": "exit",
+                                "exit_code": 1,
+                            },
+                            "stdout": "",
+                            "stderr": f"{ex}",
+                        }
+                    )
+                    break
+
+                results.append(
+                    {
+                        "outcome": {
+                            "type": "exit",
+                            "exit_code": proc.returncode,
+                        },
+                        "stdout": limit(stdout.decode(encoding, errors="replace")),
+                        "stderr": limit(stderr.decode(encoding, errors="replace")),
+                    }
+                )
 
         return results
 
