@@ -17,6 +17,8 @@ from meshagent.agents.adapter import (
     ToolkitBuilder,
     ToolkitConfig,
 )
+
+from meshagent.api.specs.service import ContainerMountSpec, RoomStorageMountSpec
 import json
 from typing import List, Literal
 from meshagent.openai.proxy import get_client
@@ -1271,16 +1273,16 @@ class ShellTool(OpenAIResponsesTool):
         config: Optional[ShellConfig] = None,
         working_directory: Optional[str] = None,
         image: Optional[str] = "ubuntu:latest",
-        mount_path: Optional[str] = "/data",
-        mount_subpath: Optional[str] = None,
+        mounts: Optional[ContainerMountSpec] = ContainerMountSpec(
+            room=[RoomStorageMountSpec(path="/data")]
+        ),
     ):
         super().__init__(name="shell")
         if config is None:
             config = ShellConfig(name="shell")
         self.working_directory = working_directory
         self.image = image
-        self.mount_path = mount_path
-        self.mount_subpath = mount_subpath
+        self.mounts = mounts
 
     def get_open_ai_tool_definitions(self):
         return [{"type": "shell"}]
@@ -1318,8 +1320,7 @@ class ShellTool(OpenAIResponsesTool):
             container_id = await context.room.containers.run(
                 command="sleep infinity",
                 image=self.image,
-                mount_path=self.mount_path,
-                mount_subpath=self.mount_subpath,
+                mounts=self.mounts,
             )
 
             try:
