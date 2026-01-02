@@ -1323,7 +1323,6 @@ class ShellTool(OpenAIResponsesTool):
             )
 
             try:
-
                 # TODO: what if container start fails
 
                 logger.info(f"executing shell commands in container {container_id}")
@@ -1364,8 +1363,12 @@ class ShellTool(OpenAIResponsesTool):
                         results.append(
                             {
                                 "outcome": {"type": "timeout"},
-                                "stdout": limit(stdout.decode(encoding, errors="replace")),
-                                "stderr": limit(stderr.decode(encoding, errors="replace")),
+                                "stdout": limit(
+                                    stdout.decode(encoding, errors="replace")
+                                ),
+                                "stderr": limit(
+                                    stderr.decode(encoding, errors="replace")
+                                ),
                             }
                         )
                         break
@@ -1382,9 +1385,8 @@ class ShellTool(OpenAIResponsesTool):
                             }
                         )
                         break
-            
-            except Exception as ex:
 
+            except Exception as ex:
                 results.append(
                     {
                         "outcome": {
@@ -1395,11 +1397,10 @@ class ShellTool(OpenAIResponsesTool):
                         "stderr": f"{ex}",
                     }
                 )
-            
-            if container_id is not None:
-                await context.room.containers.stop(container_id=container_id) 
-                await context.room.containers.delete(container_id=container_id) 
 
+            if container_id is not None:
+                await context.room.containers.stop(container_id=container_id)
+                await context.room.containers.delete(container_id=container_id)
 
         else:
             for command in commands:
