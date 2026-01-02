@@ -949,7 +949,7 @@ class OpenAIResponsesTool(BaseTool):
 
 
 class ImageGenerationConfig(ToolkitConfig):
-    name: Literal["image_generation"]
+    name: Literal["image_generation"] = "image_generation"
     background: Literal["transparent", "opaque", "auto"] = None
     input_image_mask_url: Optional[str] = None
     model: Optional[str] = None
@@ -1137,7 +1137,7 @@ class ImageGenerationTool(OpenAIResponsesTool):
 
 
 class LocalShellConfig(ToolkitConfig):
-    name: Literal["local_shell"]
+    name: Literal["local_shell"] = "local_shell"
 
 
 class LocalShellToolkitBuilder(ToolkitBuilder):
@@ -1249,7 +1249,7 @@ class LocalShellTool(OpenAIResponsesTool):
 
 
 class ShellConfig(ToolkitConfig):
-    name: Literal["shell"]
+    name: Literal["shell"] = "shell"
 
 
 class ShellToolkitBuilder(ToolkitBuilder):
@@ -1503,7 +1503,7 @@ class MCPServer(BaseModel):
 
 
 class MCPConfig(ToolkitConfig):
-    name: Literal["mcp"]
+    name: Literal["mcp"] = "mcp"
     servers: list[MCPServer]
 
 
@@ -1869,7 +1869,7 @@ class ReasoningTool(OpenAIResponsesTool):
 
 
 class WebSearchConfig(ToolkitConfig):
-    name: Literal["web_search"]
+    name: Literal["web_search"] = "web_search"
 
 
 class WebSearchToolkitBuilder(ToolkitBuilder):
@@ -2061,7 +2061,7 @@ class FileSearchTool(OpenAIResponsesTool):
 
 
 class ApplyPatchConfig(ToolkitConfig):
-    name: Literal["apply_patch"]
+    name: Literal["apply_patch"] = "apply_patch"
 
 
 class ApplyPatchToolkitBuilder(ToolkitBuilder):
