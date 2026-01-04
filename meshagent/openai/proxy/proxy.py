@@ -1,11 +1,48 @@
 from meshagent.api import RoomClient
 from openai import AsyncOpenAI
 import logging
+import json
+import httpx
 
 logger = logging.getLogger("openai.client")
 
 
-def get_client(*, room: RoomClient) -> AsyncOpenAI:
+def _redact_headers(headers: httpx.Headers) -> dict:
+    h = dict(headers)
+    if "authorization" in {k.lower() for k in h.keys()}:
+        # Remove any case variant of Authorization
+        for k in list(h.keys()):
+            if k.lower() == "authorization":
+                h[k] = "***REDACTED***"
+    return h
+
+
+def _truncate_bytes(b: bytes, limit: int = 4000) -> str:
+    # Avoid dumping giant base64 screenshots into logs
+    s = b.decode("utf-8", errors="replace")
+    return (
+        s
+        if len(s) <= limit
+        else (s[:limit] + f"\n... (truncated, {len(s)} chars total)")
+    )
+
+
+async def log_request(request: httpx.Request):
+    logging.info("==> %s %s", request.method, request.url)
+    logging.info("headers=%s", json.dumps(_redact_headers(request.headers), indent=2))
+    if request.content:
+        logging.info("body=%s", _truncate_bytes(request.content))
+
+
+async def log_response(response: httpx.Response):
+    body = await response.aread()
+    logging.info("<== %s %s", response.status_code, response.request.url)
+    logging.info("headers=%s", json.dumps(_redact_headers(response.headers), indent=2))
+    if body:
+        logging.info("body=%s", _truncate_bytes(body))
+
+
+def get_client(*, room: RoomClient, log_requests: bool = False) -> AsyncOpenAI:
     token: str = room.protocol.token
 
     # when running inside the room pod, the room.room_url currently points to the external url
@@ -25,7 +62,16 @@ def get_client(*, room: RoomClient) -> AsyncOpenAI:
     if room_proxy_url.startswith("ws:") or room_proxy_url.startswith("wss:"):
         room_proxy_url = room_proxy_url.replace("ws", "http", 1)
 
+    http_client = None
+
+    if log_requests:
+        http_client = httpx.AsyncClient(
+            event_hooks={"request": [log_request], "response": [log_response]},
+            timeout=60.0,
+        )
+
     openai = AsyncOpenAI(
+        http_client=http_client,
         api_key=token,
         base_url=room_proxy_url,
         default_headers={"Meshagent-Session": room.session_id},
