@@ -1,3 +1,9 @@
+## [0.18.1]
+- Updated OpenAI Python SDK dependency to `openai~=2.14.0` (from `~2.6.0`).
+- Breaking: OpenAI Responses adapter no longer sends tool definitions with requests, disabling tool/function calling via the Responses API.
+- CLI deploy commands now report “Deployed service” on successful deploys.
+- Shell toolkit/tool builders now pass the configured shell image via the `image` field.
+
 ## [0.18.0]
 - Added local TCP port-forwarding helper that bridges to the remote tunnel WebSocket
 - Added a CLI `port forward` command to expose container ports locally
