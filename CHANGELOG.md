@@ -1,3 +1,13 @@
+## [0.18.0]
+- Added local TCP port-forwarding helper that bridges to the remote tunnel WebSocket
+- Added a CLI `port forward` command to expose container ports locally
+- Added `writable_root_fs` support when running containers
+- Added `host_port` support for service port specs
+- Added `ApiScope.tunnels` support in participant tokens (including `agent_default(tunnels=...)`)
+- Added container-based Playwright “computer use” and enabled computer-use toolkits for chatbot/worker/mailbot flows
+- Removed `scrapybara` from the computers package dependencies
+- OpenAI proxy client can now optionally log requests/responses with redacted authorization headers
+
 ## [0.17.1]
 - Prevented worker toolkit lifecycle collisions when running alongside other toolkits by isolating the worker’s remote toolkit handling.
 - Improved the error message when attempting to start a single-room agent more than once.
