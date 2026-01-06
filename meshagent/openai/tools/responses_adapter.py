@@ -482,7 +482,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                 stream=stream,
                                 model=model,
                                 input=context.messages,
-                                tools=open_ai_tools,
+                                # tools=open_ai_tools,
                                 text=text,
                                 previous_response_id=previous_response_id,
                                 instructions=instructions or NOT_GIVEN,
