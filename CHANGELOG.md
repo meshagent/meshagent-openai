@@ -1,3 +1,6 @@
+## [0.18.2]
+- Stability
+
 ## [0.18.1]
 - Updated OpenAI Python SDK dependency to `openai~=2.14.0` (from `~2.6.0`).
 - Breaking: OpenAI Responses adapter no longer sends tool definitions with requests, disabling tool/function calling via the Responses API.
