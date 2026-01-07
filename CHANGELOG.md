@@ -1,3 +1,10 @@
+## [0.19.0]
+- Add a reusable transcript logger/transcriber agent that writes conversation segments to transcript documents from live conversation events or user-turn completion
+- Add optional voicebot transcription via a provided transcript path, wrapping the voice agent to persist user/assistant speech to a transcript document
+- Refactor meeting transcription to use the shared transcript logger with per-participant sessions and improved session lifecycle cleanup
+- Breaking change: starting a new email thread no longer accepts attachments; attachments are now handled by a dedicated “new thread with attachments” tool that downloads files from room storage before sending
+- Simplify CLI agent room-rules loading and ensure worker message toolkits include inherited toolkits
+
 ## [0.18.2]
 - Stability
 
