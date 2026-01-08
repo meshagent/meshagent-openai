@@ -1,3 +1,7 @@
+## [0.19.1]
+- Add optional metadata to agent chat contexts and propagate it through message-stream LLM delegation, including recording thread participant lists
+- Add an option for the mailbot CLI to delegate LLM interactions to a remote participant instead of using the local LLM adapter
+
 ## [0.19.0]
 - Add a reusable transcript logger/transcriber agent that writes conversation segments to transcript documents from live conversation events or user-turn completion
 - Add optional voicebot transcription via a provided transcript path, wrapping the voice agent to persist user/assistant speech to a transcript document
