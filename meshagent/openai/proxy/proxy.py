@@ -3,6 +3,7 @@ from openai import AsyncOpenAI
 import logging
 import json
 import httpx
+from typing import Optional
 
 logger = logging.getLogger("openai.client")
 
@@ -42,7 +43,16 @@ async def log_response(response: httpx.Response):
         logging.info("body=%s", _truncate_bytes(body))
 
 
-def get_client(*, room: RoomClient, log_requests: bool = False) -> AsyncOpenAI:
+def get_logging_httpx_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        event_hooks={"request": [log_request], "response": [log_response]},
+        timeout=60.0,
+    )
+
+
+def get_client(
+    *, room: RoomClient, http_client: Optional[httpx.AsyncClient] = None
+) -> AsyncOpenAI:
     token: str = room.protocol.token
 
     # when running inside the room pod, the room.room_url currently points to the external url
@@ -61,14 +71,6 @@ def get_client(*, room: RoomClient, log_requests: bool = False) -> AsyncOpenAI:
 
     if room_proxy_url.startswith("ws:") or room_proxy_url.startswith("wss:"):
         room_proxy_url = room_proxy_url.replace("ws", "http", 1)
-
-    http_client = None
-
-    if log_requests:
-        http_client = httpx.AsyncClient(
-            event_hooks={"request": [log_request], "response": [log_response]},
-            timeout=60.0,
-        )
 
     openai = AsyncOpenAI(
         http_client=http_client,

@@ -21,7 +21,7 @@ from meshagent.agents.adapter import (
 from meshagent.api.specs.service import ContainerMountSpec, RoomStorageMountSpec
 import json
 from typing import List, Literal
-from meshagent.openai.proxy import get_client
+from meshagent.openai.proxy import get_client, get_logging_httpx_client
 from openai import AsyncOpenAI, NOT_GIVEN, APIStatusError
 from openai.types.responses import ResponseFunctionToolCall, ResponseStreamEvent
 import os
@@ -348,6 +348,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         response_options: Optional[dict] = None,
         reasoning_effort: Optional[str] = None,
         provider: str = "openai",
+        log_requests: bool = False,
     ):
         self._model = model
         self._parallel_tool_calls = parallel_tool_calls
@@ -355,6 +356,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         self._response_options = response_options
         self._provider = provider
         self._reasoning_effort = reasoning_effort
+        self._log_requests = log_requests
 
     def default_model(self) -> str:
         return self._model
@@ -371,6 +373,13 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                 return False
 
         return True
+
+    def get_openai_client(self, *, room: RoomClient) -> AsyncOpenAI:
+        if self._client is not None:
+            return self._client
+        else:
+            http_client = get_logging_httpx_client() if self._log_requests else None
+            return get_client(room=room, http_client=http_client)
 
     # Takes the current chat context, executes a completion request and processes the response.
     # If a tool calls are requested, invokes the tools, processes the tool calls results, and appends the tool call results to the context
@@ -402,11 +411,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                             {"model": model, "provider": self._provider}
                         )
 
-                        openai = (
-                            self._client
-                            if self._client is not None
-                            else get_client(room=room)
-                        )
+                        openai: self.get_openai_client(room=room)
 
                         response_schema = output_schema
                         response_name = "response"
@@ -476,6 +481,8 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                             logger.info(
                                 f"requesting response from openai with model: {model}"
                             )
+
+                            openai = self.get_openai_client(room=room)
 
                             response: Response = await openai.responses.create(
                                 extra_headers=extra_headers,
