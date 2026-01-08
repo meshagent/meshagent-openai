@@ -1264,7 +1264,7 @@ class ShellToolkitBuilder(ToolkitBuilder):
         self,
         *,
         working_directory: Optional[str] = None,
-        image: Optional[str] = "ubuntu:latest",
+        image: Optional[str] = "python:3.13",
         mounts: Optional[ContainerMountSpec] = DEFAULT_CONTAINER_MOUNT_SPEC,
     ):
         super().__init__(name="shell", type=ShellConfig)
@@ -1301,6 +1301,7 @@ class ShellTool(OpenAIResponsesTool):
         self.working_directory = working_directory
         self.image = image
         self.mounts = mounts
+        self._container_id = None
 
     def get_open_ai_tool_definitions(self):
         return [{"type": "shell"}]
@@ -1335,12 +1336,15 @@ class ShellTool(OpenAIResponsesTool):
         timeout = float(timeout_ms) / 1000.0 if timeout_ms else 20.0
 
         if self.image is not None:
-            container_id = await context.room.containers.run(
-                command="sleep infinity",
-                image=self.image,
-                mounts=self.mounts,
-                writable_root_fs=True,
-            )
+            if self._container_id is None:
+                self._container_id = await context.room.containers.run(
+                    command="sleep infinity",
+                    image=self.image,
+                    mounts=self.mounts,
+                    writable_root_fs=True,
+                )
+
+            container_id = self._container_id
 
             try:
                 # TODO: what if container start fails
@@ -1419,10 +1423,6 @@ class ShellTool(OpenAIResponsesTool):
                         "stderr": f"{ex}",
                     }
                 )
-
-            if container_id is not None:
-                await context.room.containers.stop(container_id=container_id)
-                await context.room.containers.delete(container_id=container_id)
 
         else:
             for command in commands:
