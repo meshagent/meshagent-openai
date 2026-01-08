@@ -1349,26 +1349,29 @@ class ShellTool(OpenAIResponsesTool):
             try:
                 # TODO: what if container start fails
 
-                logger.info(f"executing shell commands in container {container_id}")
+                logger.info(
+                    f"executing shell commands in container {container_id} with timemout {timeout}: {commands}"
+                )
+                import shlex
 
                 for command in commands:
                     exec = await context.room.containers.exec(
                         container_id=container_id,
-                        command=command,
+                        command=shlex.join(["bash", "-lc", command]),
                         tty=False,
                     )
 
                     stdout = bytearray()
                     stderr = bytearray()
 
-                    async for se in exec.stderr():
-                        stdout.extend(se)
-
-                    async for so in exec.stdout():
-                        stdout.extend(so)
-
                     try:
-                        async with asyncio.Timeout(timeout):
+                        async with asyncio.timeout(timeout):
+                            async for se in exec.stderr():
+                                stderr.extend(se)
+
+                            async for so in exec.stdout():
+                                stdout.extend(so)
+
                             exit_code = await exec.result
 
                             results.append(
@@ -1384,7 +1387,7 @@ class ShellTool(OpenAIResponsesTool):
 
                     except asyncio.TimeoutError:
                         logger.info(f"The command timed out after {timeout}s")
-                        await exec.close()
+                        await exec.kill()
 
                         results.append(
                             {
@@ -1430,8 +1433,10 @@ class ShellTool(OpenAIResponsesTool):
 
                 # Spawn the process
                 try:
+                    import shlex
+
                     proc = await asyncio.create_subprocess_shell(
-                        command,
+                        shlex.join(["bash", "-c", command]),
                         cwd=self.working_directory or os.getcwd(),
                         env=merged_env,
                         stdout=asyncio.subprocess.PIPE,
