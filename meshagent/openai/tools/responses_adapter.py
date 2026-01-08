@@ -1292,7 +1292,7 @@ class ShellTool(OpenAIResponsesTool):
         *,
         config: Optional[ShellConfig] = None,
         working_directory: Optional[str] = None,
-        image: Optional[str] = "ubuntu:latest",
+        image: Optional[str] = "python:3.13",
         mounts: Optional[ContainerMountSpec] = DEFAULT_CONTAINER_MOUNT_SPEC,
     ):
         super().__init__(name="shell")
@@ -1339,6 +1339,7 @@ class ShellTool(OpenAIResponsesTool):
                 command="sleep infinity",
                 image=self.image,
                 mounts=self.mounts,
+                writable_root_fs=True,
             )
 
             try:
@@ -1348,7 +1349,9 @@ class ShellTool(OpenAIResponsesTool):
 
                 for command in commands:
                     exec = await context.room.containers.exec(
-                        container_id=container_id, command=command, tty=False
+                        container_id=container_id,
+                        command=command,
+                        tty=False,
                     )
 
                     stdout = bytearray()
