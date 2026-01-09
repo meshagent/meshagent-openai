@@ -1,3 +1,9 @@
+## [0.19.2]
+- Add boolean data type support plus `nullable`/`metadata` on schema types and generated JSON Schema.
+- BREAKING: OpenAI proxy client creation now takes an optional `http_client` (request logging is configured via a separate logging client helper).
+- Shell tool now reuses a long-lived container with a writable root filesystem, runs commands via `bash -lc`, and defaults to the `python:3.13` image.
+- Add `log_llm_requests` support to enable OpenAI request/response logging.
+
 ## [0.19.1]
 - Add optional metadata to agent chat contexts and propagate it through message-stream LLM delegation, including recording thread participant lists
 - Add an option for the mailbot CLI to delegate LLM interactions to a remote participant instead of using the local LLM adapter
