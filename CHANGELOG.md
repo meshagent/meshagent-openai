@@ -1,3 +1,6 @@
+## [0.19.3]
+- Stability
+
 ## [0.19.2]
 - Add boolean data type support plus `nullable`/`metadata` on schema types and generated JSON Schema.
 - BREAKING: OpenAI proxy client creation now takes an optional `http_client` (request logging is configured via a separate logging client helper).
