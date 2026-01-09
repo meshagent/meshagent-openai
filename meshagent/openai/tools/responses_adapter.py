@@ -1343,7 +1343,16 @@ class ShellTool(OpenAIResponsesTool):
         timeout = float(timeout_ms) / 1000.0 if timeout_ms else 20.0
 
         if self.image is not None:
-            if self._container_id is None:
+            running = False
+
+            if self._container_id:
+                # make sure container is still running
+
+                for c in await context.room.containers.list():
+                    if c.id == self._container_id:
+                        running = True
+
+            if not running:
                 self._container_id = await context.room.containers.run(
                     command="sleep infinity",
                     image=self.image,
