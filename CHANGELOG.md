@@ -1,3 +1,13 @@
+## [0.20.0]
+- Breaking: mailbox create/update requests must now include a `public` flag (SDK defaults to `False` when omitted in method calls)
+- Mailbox response models include a `public` field
+- Breaking: service specs now require either `external` or `container` to be set
+- External service specs allow omitting the base URL
+- Service template variables include optional `annotations` metadata
+- CLI mailbox commands support `--public` and include the `public` value in listings
+- Mailbot whitelist parsing accepts comma-separated values
+- Fixed JSON schema generation for database delete/search tools
+
 ## [0.19.5]
 - Stability
 
