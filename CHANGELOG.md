@@ -1,3 +1,6 @@
+## [0.20.1]
+- Stability
+
 ## [0.20.0]
 - Breaking: mailbox create/update requests must now include a `public` flag (SDK defaults to `False` when omitted in method calls)
 - Mailbox response models include a `public` field
