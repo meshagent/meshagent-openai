@@ -1,3 +1,10 @@
+## [0.21.0]
+- Breaking: the Image model no longer exposes manifest/template metadata in image listings.
+- Add token-backed environment variables in service specs so Python clients can inject participant tokens instead of static values.
+- Add `on_demand` and `writable_root_fs` flags on container specs to control per-request services and filesystem mutability.
+- Breaking: the agent schedule annotation key is corrected to `meshagent.agent.schedule`; update any existing annotations using the old spelling.
+- Add a Shell agent type and a shell command annotation for service metadata.
+
 ## [0.20.6]
 - Stability
 
