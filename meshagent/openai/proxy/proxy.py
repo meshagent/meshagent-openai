@@ -67,7 +67,7 @@ def get_client(
     else:
         logger.debug(f"protocol had url, openai client will use {url}")
 
-    room_proxy_url = f"{url}/v1"
+    room_proxy_url = f"{url}/openai/v1"
 
     if room_proxy_url.startswith("ws:") or room_proxy_url.startswith("wss:"):
         room_proxy_url = room_proxy_url.replace("ws", "http", 1)
