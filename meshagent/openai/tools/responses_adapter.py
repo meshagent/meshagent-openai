@@ -466,6 +466,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         model: str,
         room: Optional[RoomClient] = None,
         toolkits: Optional[list[Toolkit]] = None,
+        output_schema: Optional[dict] = None,
     ) -> int:
         tool_bundle = ResponsesToolBundle(
             toolkits=[
@@ -479,10 +480,23 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
 
         openai = self.get_openai_client(room=room)
 
+        response_name = "response"
+        text = NOT_GIVEN
+        if output_schema is not None:
+            text = {
+                "format": {
+                    "type": "json_schema",
+                    "name": response_name,
+                    "schema": output_schema,
+                    "strict": True,
+                }
+            }
+
         response = await openai.responses.input_tokens.count(
             tools=open_ai_tools,
             instructions=context.instructions,
             input=context.messages,
+            text=text,
             previous_response_id=context.previous_response_id,
         )
 
@@ -544,7 +558,6 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
 
                         openai: self.get_openai_client(room=room)
 
-                        response_schema = output_schema
                         response_name = "response"
 
                         # We need to do this inside the loop because tools can change mid loop
@@ -574,7 +587,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                 "format": {
                                     "type": "json_schema",
                                     "name": response_name,
-                                    "schema": response_schema,
+                                    "schema": output_schema,
                                     "strict": True,
                                 }
                             }
@@ -779,7 +792,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
 
                                     elif message.type == "message":
                                         contents = message.content
-                                        if response_schema is None:
+                                        if output_schema is None:
                                             return [], False
                                         else:
                                             for content in contents:
@@ -802,7 +815,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                             try:
                                                                 self.validate(
                                                                     response=full_response,
-                                                                    output_schema=response_schema,
+                                                                    output_schema=output_schema,
                                                                 )
                                                             except Exception as e:
                                                                 logger.error(
