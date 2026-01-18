@@ -460,52 +460,34 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         context.metadata["last_response_usage"] = usage_dict
         context.metadata["last_response_model"] = model
 
-    async def truncate(
+    async def get_input_tokens(
         self,
         *,
         context: AgentChatContext,
         model: str,
         room: Optional[RoomClient] = None,
         toolkits: Optional[list[Toolkit]] = None,
-    ) -> None:
-        context_window = self.context_window_size(model)
-        if context_window == float("inf"):
-            return
-        usable = context_window - self.max_output_tokens
-        if usable <= 0:
-            return
-        if room is None or not context.messages:
-            return
+    ) -> int:
+        tool_bundle = ResponsesToolBundle(
+            toolkits=[
+                *toolkits,
+            ]
+        )
+        open_ai_tools = tool_bundle.to_json()
 
-        tool_bundle = ResponsesToolBundle(toolkits=[*(toolkits or [])])
-        tool_param = tool_bundle.to_json()
-        instructions_param = context.instructions or ""
+        if open_ai_tools is None:
+            open_ai_tools = NOT_GIVEN
 
-        try:
-            encoding = tiktoken.encoding_for_model(model)
-        except KeyError:
-            encoding = tiktoken.get_encoding("cl100k_base")
+        openai = self.get_openai_client(room=room)
 
-        def count_tokens(value: str) -> int:
-            return len(encoding.encode(value))
+        response = await openai.responses.input_tokens.count(
+            tools=open_ai_tools,
+            instructions=context.instructions,
+            input=context.messages,
+            previous_response_id=context.previous_response_id,
+        )
 
-        def dump_payload(payload: object) -> str:
-            return json.dumps(
-                payload, ensure_ascii=False, separators=(",", ":"), default=str
-            )
-
-        def current_total() -> int:
-            total = count_tokens(instructions_param)
-            if tool_param is not None:
-                total += count_tokens(dump_payload(tool_param))
-            for message in context.messages:
-                total += count_tokens(dump_payload(message))
-            return total
-
-        total = current_total()
-        while context.messages and total > usable:
-            context.messages.pop(0)
-            total = current_total()
+        return response.input_tokens
 
     async def check_for_termination(
         self, *, context: AgentChatContext, room: RoomClient
@@ -534,7 +516,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         toolkits: list[Toolkit],
         tool_adapter: Optional[ToolResponseAdapter] = None,
         output_schema: Optional[dict] = None,
-        event_handler: Optional[Callable[[ResponseStreamEvent], None]] = None,
+        event_handler: Optional[Callable[[dict], None]] = None,
         on_behalf_of: Optional[RemoteParticipant] = None,
     ):
         if model is None:
@@ -1028,7 +1010,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                 "event": safe_model_dump(event),
                                             }
                                         )
-                                        event_handler(event)
+                                        event_handler(event.model_dump(mode="json"))
 
                                         if event.type == "response.completed":
                                             context.track_response(event.response.id)
