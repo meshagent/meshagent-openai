@@ -21,7 +21,6 @@ from meshagent.agents.adapter import (
 from meshagent.api.specs.service import ContainerMountSpec, RoomStorageMountSpec
 import json
 from typing import List, Literal
-import tiktoken
 from meshagent.openai.proxy import get_client, get_logging_httpx_client
 from openai import AsyncOpenAI, NOT_GIVEN, APIStatusError
 from openai.types.responses import ResponseFunctionToolCall, ResponseStreamEvent
