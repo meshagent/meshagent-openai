@@ -21,6 +21,7 @@ from meshagent.agents.adapter import (
 from meshagent.api.specs.service import ContainerMountSpec, RoomStorageMountSpec
 import json
 from typing import List, Literal
+import tiktoken
 from meshagent.openai.proxy import get_client, get_logging_httpx_client
 from openai import AsyncOpenAI, NOT_GIVEN, APIStatusError
 from openai.types.responses import ResponseFunctionToolCall, ResponseStreamEvent
@@ -340,6 +341,15 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
 
 
 class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
+    _context_window_sizes = {
+        "gpt-4.1": 128000,
+        "gpt-4o": 128000,
+        "gpt-5": 128000,
+        "o1": 200000,
+        "o3": 200000,
+        "o4": 200000,
+    }
+
     def __init__(
         self,
         model: str = os.getenv("OPENAI_MODEL", "gpt-5.2"),
@@ -349,6 +359,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         reasoning_effort: Optional[str] = None,
         provider: str = "openai",
         log_requests: bool = False,
+        max_output_tokens: Optional[int] = 32000,
     ):
         self._model = model
         self._parallel_tool_calls = parallel_tool_calls
@@ -357,6 +368,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         self._provider = provider
         self._reasoning_effort = reasoning_effort
         self._log_requests = log_requests
+        self.max_output_tokens = max_output_tokens
 
     def default_model(self) -> str:
         return self._model
@@ -364,6 +376,136 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
     def create_chat_context(self):
         context = AgentChatContext(system_role=None)
         return context
+
+    def context_window_size(self, model: str) -> float:
+        model_key = model.lower()
+        for prefix, size in self._context_window_sizes.items():
+            if model_key.startswith(prefix):
+                return size
+        return float("inf")
+
+    def needs_compaction(self, *, context: AgentChatContext) -> bool:
+        if self.max_output_tokens is None:
+            return False
+        usage = context.metadata.get("last_response_usage")
+        if not usage:
+            return False
+        model = context.metadata.get("last_response_model", self.default_model())
+        context_window = self.context_window_size(model)
+        if context_window == float("inf"):
+            return False
+        input_tokens = int(usage.get("input_tokens", 0) or 0)
+        cached_tokens = int(
+            usage.get("input_tokens_details", {}).get("cached_tokens", 0) or 0
+        )
+        output_tokens = int(usage.get("output_tokens", 0) or 0)
+        total = input_tokens + cached_tokens + output_tokens
+        usable = context_window - self.max_output_tokens
+        return total > usable
+
+    async def compact(
+        self,
+        *,
+        context: AgentChatContext,
+        room: RoomClient,
+        model: Optional[str] = None,
+    ) -> None:
+        if model is None:
+            model = self.default_model()
+        if not context.messages and not context.previous_messages:
+            return
+        instructions = context.instructions
+        previous_response_id = (
+            context.previous_response_id
+            if context.previous_response_id is not None
+            else NOT_GIVEN
+        )
+        openai = self.get_openai_client(room=room)
+        response = await openai.responses.compact(
+            model=model,
+            input=[*context.messages],
+            instructions=instructions or NOT_GIVEN,
+            previous_response_id=previous_response_id,
+        )
+        context.messages.clear()
+        context.messages.extend(
+            [*(x.model_dump(mode="json", exclude_none=True) for x in response.output)]
+        )
+        context.previous_messages.clear()
+        context.previous_response_id = None
+        usage = self._normalize_usage(response.usage)
+        if usage is not None:
+            context.metadata["last_compaction_usage"] = usage
+        context.metadata.pop("last_response_usage", None)
+        context.metadata.pop("last_response_model", None)
+
+    def _normalize_usage(self, usage: object) -> dict | None:
+        if usage is None:
+            return None
+        if isinstance(usage, BaseModel):
+            try:
+                return usage.model_dump(mode="json")
+            except Exception:
+                return None
+        if not isinstance(usage, dict):
+            return None
+        return usage
+
+    def _store_usage(
+        self, *, context: AgentChatContext, usage: object, model: str
+    ) -> None:
+        usage_dict = self._normalize_usage(usage)
+        if usage_dict is None:
+            return
+        context.metadata["last_response_usage"] = usage_dict
+        context.metadata["last_response_model"] = model
+
+    async def truncate(
+        self,
+        *,
+        context: AgentChatContext,
+        model: str,
+        room: Optional[RoomClient] = None,
+        toolkits: Optional[list[Toolkit]] = None,
+    ) -> None:
+        context_window = self.context_window_size(model)
+        if context_window == float("inf"):
+            return
+        usable = context_window - self.max_output_tokens
+        if usable <= 0:
+            return
+        if room is None or not context.messages:
+            return
+
+        tool_bundle = ResponsesToolBundle(toolkits=[*(toolkits or [])])
+        tool_param = tool_bundle.to_json()
+        instructions_param = context.instructions or ""
+
+        try:
+            encoding = tiktoken.encoding_for_model(model)
+        except KeyError:
+            encoding = tiktoken.get_encoding("cl100k_base")
+
+        def count_tokens(value: str) -> int:
+            return len(encoding.encode(value))
+
+        def dump_payload(payload: object) -> str:
+            return json.dumps(
+                payload, ensure_ascii=False, separators=(",", ":"), default=str
+            )
+
+        def current_total() -> int:
+            total = count_tokens(instructions_param)
+            if tool_param is not None:
+                total += count_tokens(dump_payload(tool_param))
+            for message in context.messages:
+                total += count_tokens(dump_payload(message))
+            return total
+
+        total = current_total()
+        while context.messages and total > usable:
+            context.messages.pop(0)
+            total = current_total()
 
     async def check_for_termination(
         self, *, context: AgentChatContext, room: RoomClient
@@ -397,6 +539,14 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
     ):
         if model is None:
             model = self.default_model()
+
+        if self.needs_compaction(context=context):
+            logger.error("llm request needs compaction, compacting request")
+            await self.compact(
+                context=context,
+                room=room,
+                model=model,
+            )
 
         with tracer.start_as_current_span("llm.turn") as span:
             span.set_attributes({"chat_context": context.id, "api": "responses"})
@@ -493,8 +643,16 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                 text=text,
                                 previous_response_id=previous_response_id,
                                 instructions=instructions or NOT_GIVEN,
+                                max_output_tokens=self.max_output_tokens,
                                 **response_options,
                             )
+
+                            if not stream:
+                                self._store_usage(
+                                    context=context,
+                                    usage=response.usage,
+                                    model=model,
+                                )
 
                             async def handle_message(message: BaseModel):
                                 with tracer.start_as_current_span(
@@ -874,6 +1032,11 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
 
                                         if event.type == "response.completed":
                                             context.track_response(event.response.id)
+                                            self._store_usage(
+                                                context=context,
+                                                usage=event.response.usage,
+                                                model=model,
+                                            )
 
                                             context.messages.extend(all_outputs)
 
@@ -1369,7 +1532,7 @@ class ShellTool(OpenAIResponsesTool):
                 # TODO: what if container start fails
 
                 logger.info(
-                    f"executing shell commands in container {container_id} with timemout {timeout}: {commands}"
+                    f"executing shell commands in container {container_id} with timeout {timeout}: {commands}"
                 )
                 import shlex
 

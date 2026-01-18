@@ -18,7 +18,7 @@ def _redact_headers(headers: httpx.Headers) -> dict:
     return h
 
 
-def _truncate_bytes(b: bytes, limit: int = 4000) -> str:
+def _truncate_bytes(b: bytes, limit: int = 128000) -> str:
     # Avoid dumping giant base64 screenshots into logs
     s = b.decode("utf-8", errors="replace")
     return (
