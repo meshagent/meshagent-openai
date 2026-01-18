@@ -1301,6 +1301,7 @@ class ShellTool(OpenAIResponsesTool):
         working_directory: Optional[str] = None,
         image: Optional[str] = "python:3.13",
         mounts: Optional[ContainerMountSpec] = DEFAULT_CONTAINER_MOUNT_SPEC,
+        env: Optional[dict[str, str]] = None,
     ):
         super().__init__(name="shell")
         if config is None:
@@ -1309,6 +1310,7 @@ class ShellTool(OpenAIResponsesTool):
         self.image = image
         self.mounts = mounts
         self._container_id = None
+        self.env = env
 
     def get_open_ai_tool_definitions(self):
         return [{"type": "shell"}]
@@ -1358,6 +1360,7 @@ class ShellTool(OpenAIResponsesTool):
                     image=self.image,
                     mounts=self.mounts,
                     writable_root_fs=True,
+                    env=self.env,
                 )
 
             container_id = self._container_id
