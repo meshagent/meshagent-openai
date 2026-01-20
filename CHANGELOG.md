@@ -1,3 +1,14 @@
+## [0.22.0]
+- Added meshagent-anthropic with Anthropic Messages adapter, MCP connector toolkit support, and an OpenAI-Responses-compatible stream adapter (depends on anthropic>=0.25,<1.0).
+- Breaking: agent naming now derives from participant name (Agent.name deprecated; TaskRunner/LLMRunner/Worker/VoiceBot constructors no longer require name; Voicebot alias removed; MailWorker renamed to MailBot with queue default).
+- Breaking: SecretsClient methods renamed to list_secrets/delete_secret and expanded with request_secret/provide_secret/get_secret/set_secret/delete_requested_secret flows.
+- Breaking: Meshagent client create_service/update_service now return ServiceSpec objects; service-template create/update helpers added for project and room services.
+- OpenAI Responses adapter adds context window tracking, compaction via responses.compact, input-token counting, usage storage, max_output_tokens control, and shell tool env injection.
+- RoomClient can auto-initialize from MESHAGENT_ROOM/MESHAGENT_TOKEN; websocket URL helper added.
+- Schema documents add grep/tag queries and ChatBotClient; chat reply routing now targets the requesting participant reliably.
+- Database toolkit now expects update values as a list of column updates and defaults to advanced search/delete tools.
+- Dependency addition: prompt-toolkit~=3.0.52 added to CLI 'all' extras.
+
 ## [0.21.0]
 - Breaking: the Image model no longer exposes manifest/template metadata in image listings.
 - Add token-backed environment variables in service specs so Python clients can inject participant tokens instead of static values.
