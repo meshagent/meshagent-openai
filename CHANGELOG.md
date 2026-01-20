@@ -1,3 +1,6 @@
+## [0.22.1]
+- Stability
+
 ## [0.22.0]
 - Added meshagent-anthropic with Anthropic Messages adapter, MCP connector toolkit support, and an OpenAI-Responses-compatible stream adapter (depends on anthropic>=0.25,<1.0).
 - Breaking: agent naming now derives from participant name (Agent.name deprecated; TaskRunner/LLMRunner/Worker/VoiceBot constructors no longer require name; Voicebot alias removed; MailWorker renamed to MailBot with queue default).
