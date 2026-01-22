@@ -1,3 +1,9 @@
+## [0.23.0]
+- Breaking: service template APIs now expect YAML template strings and ServiceTemplateSpec.to_service_spec() no longer accepts values; use ServiceTemplateSpec.from_yaml(..., values) for Jinja rendering
+- Added Jinja/YAML template parsing and ServiceSpec.from_yaml for loading service specs from YAML
+- Added file storage mounts and token role fields in service/container specs
+- Added render_template client method plus new User/UserRoomGrant models and a none project role
+
 ## [0.22.2]
 - Stability
 
