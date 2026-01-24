@@ -9,8 +9,9 @@ from meshagent.api.messaging import (
     TextResponse,
     EmptyResponse,
     RawOutputs,
-    ensure_response,
 )
+
+from meshagent.api.messaging import ensure_response
 from meshagent.agents.adapter import (
     ToolResponseAdapter,
     LLMAdapter,
