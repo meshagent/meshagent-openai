@@ -14,9 +14,9 @@ dependencies = [
   "pytest~=8.4",
   "pytest-asyncio~=0.26",
   "openai~=2.14.0",
-  "meshagent-api~=0.24.0",
-  "meshagent-agents~=0.24.0",
-  "meshagent-tools~=0.24.0",
+  "meshagent-api~=0.24.1",
+  "meshagent-agents~=0.24.1",
+  "meshagent-tools~=0.24.1",
 ]
 
 [project.urls]

@@ -1,3 +1,6 @@
+## [0.24.1]
+- Stability
+
 ## [0.24.0]
 - Breaking: removed `AgentsClient.ask` and `list_agents` from the Python SDK.
 - Breaking: `AgentCallContext` renamed to `TaskContext`, planning module and Pydantic agent utilities removed, and discovery toolkit no longer lists agents.
