@@ -1,3 +1,9 @@
+## [0.24.0]
+- Breaking: removed `AgentsClient.ask` and `list_agents` from the Python SDK.
+- Breaking: `AgentCallContext` renamed to `TaskContext`, planning module and Pydantic agent utilities removed, and discovery toolkit no longer lists agents.
+- Feature: TaskRunner refactor adds RunTaskTool/RemoteToolkit support plus a `run()` helper for direct execution.
+- Feature: task-runner CLI adds `run` and an `allow_model_selection` toggle for LLM task runners; legacy agent ask/list CLI commands removed.
+
 ## [0.23.0]
 - Breaking: service template APIs now expect YAML template strings and ServiceTemplateSpec.to_service_spec() no longer accepts values; use ServiceTemplateSpec.from_yaml(..., values) for Jinja rendering
 - Added Jinja/YAML template parsing and ServiceSpec.from_yaml for loading service specs from YAML
