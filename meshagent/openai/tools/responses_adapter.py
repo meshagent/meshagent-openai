@@ -628,7 +628,6 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                             )
 
                             openai = self.get_openai_client(room=room)
-
                             response: Response = await openai.responses.create(
                                 extra_headers=extra_headers,
                                 stream=stream,
