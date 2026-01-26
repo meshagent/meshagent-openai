@@ -19,7 +19,9 @@ from meshagent.agents.adapter import (
     ToolkitConfig,
 )
 
-from meshagent.api.specs.service import ContainerMountSpec, RoomStorageMountSpec
+from meshagent.tools.script import DEFAULT_CONTAINER_MOUNT_SPEC
+
+from meshagent.api.specs.service import ContainerMountSpec
 import json
 from typing import List, Literal
 from meshagent.openai.proxy import get_client, get_logging_httpx_client
@@ -1415,12 +1417,7 @@ class LocalShellTool(OpenAIResponsesTool):
 
 
 class ShellConfig(ToolkitConfig):
-    name: Literal["shell"] = ("shell",)
-
-
-DEFAULT_CONTAINER_MOUNT_SPEC = ContainerMountSpec(
-    room=[RoomStorageMountSpec(path="/data")]
-)
+    name: Literal["shell"] = "shell"
 
 
 class ShellToolkitBuilder(ToolkitBuilder):
@@ -1436,7 +1433,7 @@ class ShellToolkitBuilder(ToolkitBuilder):
         self.image = image
         self.mounts = mounts
 
-    async def make(self, *, room: RoomClient, model: str, config: LocalShellConfig):
+    async def make(self, *, room: RoomClient, model: str, config: ShellConfig):
         return Toolkit(
             name="shell",
             tools=[
@@ -1499,7 +1496,7 @@ class ShellTool(OpenAIResponsesTool):
             else:
                 return s
 
-        timeout = float(timeout_ms) / 1000.0 if timeout_ms else 20.0
+        timeout = float(timeout_ms) / 1000.0 if timeout_ms else 20 * 1000.0
 
         if self.image is not None:
             running = False
