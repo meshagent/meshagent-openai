@@ -1,5 +1,11 @@
-## [0.24.6]
-- Stability
+## [0.25.0]
+- Added SQL column-schema parsing and CLI support for SQL-like `--columns` when creating tables or adding columns.
+- Breaking: SQL query requests now use a single `params` map for typed bindings instead of `parameters`/`param_values`.
+- Added `published`/`public` port fields in service specs for externally routed services.
+- Secrets set now supports `for_identity` to set secrets on behalf of another identity.
+- Added a Slack events HTTP bot package with dependencies including `pyjwt` 2.10.
+- Breaking: the CLI `exec` command was removed.
+- ThreadAdapter message writing now uses `write_text_message` and accepts participant name strings.
 
 ## [0.24.5]
 - Stability
