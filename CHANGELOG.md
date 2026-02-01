@@ -1,3 +1,11 @@
+## [0.25.1]
+- Added Anthropic web search and web fetch toolkits, including beta header injection and request middleware support.
+- Added a container-based shell tool to run commands in persistent containers with configurable image, mounts, and environment.
+- Expanded the web fetch tool to return text, JSON, or file responses with HTML-to-Markdown conversion and content-type handling.
+- Breaking: CLI commands now reject OpenAI-only tool flags when using Claude models (image generation, local shell, apply patch, computer use).
+- CLI MCP bridge adds streamable HTTP connections plus custom headers and secret-backed headers; OAuth2 secret set now accepts text/base64 input and identity-scoped secrets.
+- Dependency updates: mcp to ~1.26.0; html-to-markdown to ~2.24.3.
+
 ## [0.25.0]
 - Added SQL column-schema parsing and CLI support for SQL-like `--columns` when creating tables or adding columns.
 - Breaking: SQL query requests now use a single `params` map for typed bindings instead of `parameters`/`param_values`.
