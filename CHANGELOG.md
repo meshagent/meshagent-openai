@@ -1,3 +1,10 @@
+## [0.25.2]
+- BREAKING: Agent metadata field renamed from labels to annotations across Python agents and examples.
+- Thread history now limits appended messages to a context window and exposes search/count/range tools for conversation history outside that window.
+- Tool decorator now supports bound instance/class methods as tools.
+- Anthropic adapters omit null/unset fields in serialized payloads and log tool call errors for easier diagnostics.
+- Schema document grep now requires keyword arguments for options like ignore_case.
+
 ## [0.25.1]
 - Added Anthropic web search and web fetch toolkits, including beta header injection and request middleware support.
 - Added a container-based shell tool to run commands in persistent containers with configurable image, mounts, and environment.
