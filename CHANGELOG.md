@@ -1,3 +1,6 @@
+## [0.25.3]
+- Stability
+
 ## [0.25.2]
 - BREAKING: Agent metadata field renamed from labels to annotations across Python agents and examples.
 - Thread history now limits appended messages to a context window and exposes search/count/range tools for conversation history outside that window.
