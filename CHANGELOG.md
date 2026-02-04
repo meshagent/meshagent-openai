@@ -1,3 +1,6 @@
+## [0.25.5]
+- Stability
+
 ## [0.25.4]
 - Stability
 
