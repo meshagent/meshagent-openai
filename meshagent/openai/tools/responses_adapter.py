@@ -1507,8 +1507,11 @@ class ShellTool(OpenAIResponsesTool):
                 for c in await context.room.containers.list():
                     if c.id == self._container_id:
                         running = True
+            else:
+                logger.info("not currently a running shell")
 
             if not running:
+                logger.info("starting a new container for shell command")
                 self._container_id = await context.room.containers.run(
                     command="sleep infinity",
                     image=self.image,
