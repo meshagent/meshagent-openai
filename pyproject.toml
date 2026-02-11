@@ -17,6 +17,7 @@ dependencies = [
   "meshagent-api~=0.26.0",
   "meshagent-agents~=0.26.0",
   "meshagent-tools~=0.26.0",
+  "html-to-markdown~=2.24.3",
 ]
 
 [project.urls]

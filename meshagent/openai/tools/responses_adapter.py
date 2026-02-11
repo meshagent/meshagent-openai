@@ -37,9 +37,21 @@ import asyncio
 from pydantic import BaseModel
 import copy
 from opentelemetry import trace
+from html_to_markdown import convert
 
 logger = logging.getLogger("openai_agent")
 tracer = trace.get_tracer("openai.llm.responses")
+
+
+def _is_html_mime_type(mime_type: str | None) -> bool:
+    if not mime_type:
+        return False
+    normalized = mime_type.split(";")[0].strip().lower()
+    return normalized in {"text/html", "application/xhtml+xml"}
+
+
+def _decode_text(data: bytes) -> str:
+    return data.decode("utf-8", errors="replace")
 
 
 def safe_json_dump(data: dict):
@@ -290,9 +302,14 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
                         elif response.mime_type is not None and (
                             response.mime_type.startswith("text/")
                             or response.mime_type == "application/json"
+                            or response.mime_type == "application/xhtml+xml"
                         ):
+                            if _is_html_mime_type(response.mime_type):
+                                text = convert(_decode_text(response.data))
+                            else:
+                                text = _decode_text(response.data)
                             message = {
-                                "output": response.data.decode(),
+                                "output": text,
                                 "call_id": tool_call.call_id,
                                 "type": "function_call_output",
                             }
