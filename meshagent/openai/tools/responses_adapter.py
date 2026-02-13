@@ -1545,12 +1545,10 @@ class ShellTool(OpenAIResponsesTool):
                 logger.info(
                     f"executing shell commands in container {container_id} with timeout {timeout}: {commands}"
                 )
-                import shlex
-
                 for command in commands:
                     exec = await context.room.containers.exec(
                         container_id=container_id,
-                        command=shlex.join(["bash", "-lc", command]),
+                        command=["bash", "-lc", command],
                         tty=False,
                     )
 
