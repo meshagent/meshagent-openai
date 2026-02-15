@@ -479,6 +479,27 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         context.metadata["last_response_usage"] = usage_dict
         context.metadata["last_response_model"] = model
 
+    def _should_publish_stream_event(self, *, event: ResponseStreamEvent) -> bool:
+        event_type = getattr(event, "type", None)
+        if not isinstance(event_type, str):
+            return True
+
+        # Prefer response.output_item.added/done for tool items because those carry
+        # richer payload details. Suppress duplicate tool lifecycle stream events.
+        if (
+            event_type.startswith("response.mcp_call.")
+            or event_type.startswith("response.mcp_list_tools.")
+            or event_type.startswith("response.web_search_call.")
+            or event_type.startswith("response.file_search_call.")
+            or event_type.startswith("response.apply_patch_call.")
+            or event_type.startswith("response.code_interpreter_call.")
+            or event_type.startswith("response.function_call.")
+            or event_type.startswith("response.function_call_arguments.")
+        ):
+            return False
+
+        return True
+
     async def get_input_tokens(
         self,
         *,
@@ -1041,7 +1062,10 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                 "event": safe_model_dump(event),
                                             }
                                         )
-                                        event_handler(event.model_dump(mode="json"))
+                                        if self._should_publish_stream_event(
+                                            event=event
+                                        ):
+                                            event_handler(event.model_dump(mode="json"))
 
                                         if event.type == "response.completed":
                                             context.track_response(event.response.id)
