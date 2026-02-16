@@ -1,3 +1,18 @@
+## [0.27.0]
+- Added project route/domain APIs to the Python client and CLI, covering create/update/get/list/delete operations with per-route annotations.
+- Added mailbox annotations support across Python client and CLI mailbox workflows.
+- Added secret-based container environment variable support in service specs (`SecretValue`).
+- Added a new webserver CLI workflow for serving static/Python routes and packaging/deploying them as services.
+- Added a new `meshagent-codex` integration package plus Codex CLI workflows for chatbot/task-runner/worker agents.
+- Added Codex approval/sandbox policy controls, skill directory support, and container runtime defaults with mount controls.
+- Added multi-rules-file loading and expanded agent CLI options (`--skill-dir`, `--shell-image`, `--shell-image-mount`, `--require-time`).
+- Added normalized agent event ingestion in thread adapters and persisted `event` elements in thread schema.
+- Updated OpenAI/Anthropic tool adapters to convert HTML responses to Markdown and reduce duplicate tool lifecycle stream events.
+- Updated shell/container execution paths to pass argv arrays instead of shell-joined command strings.
+- Updated third-party Python dependencies: added `html-to-markdown~=2.24.3`.
+- Breaking change: annotation constants moved from `meshagent.webhook.*` to `meshagent.request.*`.
+- Breaking change: CLI secret usage changed from `meshagent secrets --secret-id ...` to `meshagent secret --id ...`.
+
 ## [0.26.0]
 - Stability
 
