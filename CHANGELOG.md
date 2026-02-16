@@ -1,3 +1,6 @@
+## [0.27.1]
+- Stability
+
 ## [0.27.0]
 - Added project route/domain APIs to the Python client and CLI, covering create/update/get/list/delete operations with per-route annotations.
 - Added mailbox annotations support across Python client and CLI mailbox workflows.
