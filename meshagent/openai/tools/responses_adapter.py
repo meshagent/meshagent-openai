@@ -1357,9 +1357,7 @@ class LocalShellToolkitBuilder(ToolkitBuilder):
     async def make(self, *, room: RoomClient, model: str, config: LocalShellConfig):
         return Toolkit(
             name="local_shell",
-            tools=[
-                LocalShellTool(config=config, working_dir=self.working_dir)
-            ],
+            tools=[LocalShellTool(config=config, working_dir=self.working_dir)],
         )
 
 
