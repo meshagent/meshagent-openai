@@ -1350,15 +1350,15 @@ class LocalShellConfig(ToolkitConfig):
 
 
 class LocalShellToolkitBuilder(ToolkitBuilder):
-    def __init__(self, *, working_directory: Optional[str] = None):
+    def __init__(self, *, working_dir: Optional[str] = None):
         super().__init__(name="local_shell", type=LocalShellConfig)
-        self.working_directory = working_directory
+        self.working_dir = working_dir
 
     async def make(self, *, room: RoomClient, model: str, config: LocalShellConfig):
         return Toolkit(
             name="local_shell",
             tools=[
-                LocalShellTool(config=config, working_directory=self.working_directory)
+                LocalShellTool(config=config, working_dir=self.working_dir)
             ],
         )
 
@@ -1371,13 +1371,13 @@ class LocalShellTool(OpenAIResponsesTool):
         self,
         *,
         config: Optional[LocalShellConfig] = None,
-        working_directory: Optional[str] = None,
+        working_dir: Optional[str] = None,
     ):
         super().__init__(name="local_shell")
         if config is None:
             config = LocalShellConfig(name="local_shell")
 
-        self.working_directory = working_directory
+        self.working_dir = working_dir
 
     def get_open_ai_tool_definitions(self):
         return [{"type": "local_shell"}]
@@ -1394,7 +1394,7 @@ class LocalShellTool(OpenAIResponsesTool):
         type: str,
         timeout_ms: int | None = None,
         user: str | None = None,
-        working_directory: str | None = None,
+        working_dir: str | None = None,
     ):
         merged_env = {**os.environ, **(env or {})}
 
@@ -1402,7 +1402,7 @@ class LocalShellTool(OpenAIResponsesTool):
             # Spawn the process
             proc = await asyncio.create_subprocess_exec(
                 *(command if isinstance(command, (list, tuple)) else [command]),
-                cwd=working_directory or self.working_directory or os.getcwd(),
+                cwd=working_dir or self.working_dir or os.getcwd(),
                 env=merged_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -1465,13 +1465,13 @@ class ShellToolkitBuilder(ToolkitBuilder):
     def __init__(
         self,
         *,
-        working_directory: Optional[str] = None,
+        working_dir: Optional[str] = None,
         image: Optional[str] = "python:3.13",
         mounts: Optional[ContainerMountSpec] = DEFAULT_CONTAINER_MOUNT_SPEC,
         env: Optional[dict[str, str]] = None,
     ):
         super().__init__(name="shell", type=ShellConfig)
-        self.working_directory = working_directory
+        self.working_dir = working_dir
         self.image = image
         self.mounts = mounts
         self.env = env
@@ -1482,7 +1482,7 @@ class ShellToolkitBuilder(ToolkitBuilder):
             tools=[
                 ShellTool(
                     config=config,
-                    working_directory=self.working_directory,
+                    working_dir=self.working_dir,
                     image=self.image,
                     mounts=self.mounts,
                     env=self.env,
@@ -1496,7 +1496,7 @@ class ShellTool(OpenAIResponsesTool):
         self,
         *,
         config: Optional[ShellConfig] = None,
-        working_directory: Optional[str] = None,
+        working_dir: Optional[str] = None,
         image: Optional[str] = "python:3.13",
         mounts: Optional[ContainerMountSpec] = DEFAULT_CONTAINER_MOUNT_SPEC,
         env: Optional[dict[str, str]] = None,
@@ -1504,7 +1504,7 @@ class ShellTool(OpenAIResponsesTool):
         super().__init__(name="shell")
         if config is None:
             config = ShellConfig(name="shell")
-        self.working_directory = working_directory
+        self.working_dir = working_dir
         self.image = image
         self.mounts = mounts
         self._container_id = None
@@ -1655,7 +1655,7 @@ class ShellTool(OpenAIResponsesTool):
 
                     proc = await asyncio.create_subprocess_shell(
                         shlex.join(["bash", "-c", command]),
-                        cwd=self.working_directory or os.getcwd(),
+                        cwd=self.working_dir or os.getcwd(),
                         env=merged_env,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
