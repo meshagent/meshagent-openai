@@ -1468,11 +1468,13 @@ class ShellToolkitBuilder(ToolkitBuilder):
         working_directory: Optional[str] = None,
         image: Optional[str] = "python:3.13",
         mounts: Optional[ContainerMountSpec] = DEFAULT_CONTAINER_MOUNT_SPEC,
+        env: Optional[dict[str, str]] = None,
     ):
         super().__init__(name="shell", type=ShellConfig)
         self.working_directory = working_directory
         self.image = image
         self.mounts = mounts
+        self.env = env
 
     async def make(self, *, room: RoomClient, model: str, config: ShellConfig):
         return Toolkit(
@@ -1483,6 +1485,7 @@ class ShellToolkitBuilder(ToolkitBuilder):
                     working_directory=self.working_directory,
                     image=self.image,
                     mounts=self.mounts,
+                    env=self.env,
                 )
             ],
         )
