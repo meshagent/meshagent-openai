@@ -43,6 +43,45 @@ logger = logging.getLogger("openai_agent")
 tracer = trace.get_tracer("openai.llm.responses")
 
 
+class OpenAIResponsesChatContext(AgentChatContext):
+    @property
+    def supports_images(self) -> bool:
+        return True
+
+    @property
+    def supports_files(self) -> bool:
+        return True
+
+    def append_image_message(self, *, mime_type: str, data: bytes) -> dict:
+        message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_image",
+                    "image_url": f"data:{mime_type};base64,{base64.b64encode(data).decode()}",
+                },
+            ],
+        }
+        self.messages.append(message)
+        return message
+
+    def append_file_message(
+        self, *, filename: str, mime_type: str, data: bytes
+    ) -> dict:
+        message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_file",
+                    "filename": filename,
+                    "file_data": f"data:{mime_type or 'text/plain'};base64,{base64.b64encode(data).decode()}",
+                }
+            ],
+        }
+        self.messages.append(message)
+        return message
+
+
 def _is_html_mime_type(mime_type: str | None) -> bool:
     if not mime_type:
         return False
@@ -393,7 +432,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         return self._model
 
     def create_chat_context(self):
-        context = AgentChatContext(system_role=None)
+        context = OpenAIResponsesChatContext(system_role=None)
         return context
 
     def context_window_size(self, model: str) -> float:
