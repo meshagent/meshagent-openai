@@ -17,7 +17,7 @@ from openai import AsyncOpenAI, APIStatusError
 from openai.types.chat import ChatCompletion, ChatCompletionMessageToolCall
 
 import os
-from typing import Optional, Any
+from typing import Optional, Any, Callable
 
 import logging
 import re
@@ -248,6 +248,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
         toolkits: Toolkit,
         tool_adapter: Optional[ToolResponseAdapter] = None,
         output_schema: Optional[dict] = None,
+        event_handler: Optional[Callable[[dict], None]] = None,
         on_behalf_of: Optional[RemoteParticipant] = None,
     ):
         if tool_adapter is None:
@@ -322,7 +323,8 @@ class OpenAICompletionsAdapter(LLMAdapter):
                             tool_context = ToolContext(
                                 room=room,
                                 caller=room.local_participant,
-                                caller_context={"chat": context.to_json},
+                                caller_context={"chat": context.to_json()},
+                                event_handler=event_handler,
                             )
                             tool_response = await tool_bundle.execute(
                                 context=tool_context, tool_call=tool_call

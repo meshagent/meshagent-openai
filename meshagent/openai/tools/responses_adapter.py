@@ -25,7 +25,7 @@ from meshagent.api.specs.service import ContainerMountSpec
 import json
 from typing import List, Literal
 from meshagent.openai.proxy import get_client, get_logging_httpx_client
-from openai import AsyncOpenAI, NOT_GIVEN, APIStatusError
+from openai import AsyncOpenAI, NOT_GIVEN, APIError, APIStatusError
 from openai.types.responses import ResponseFunctionToolCall, ResponseStreamEvent
 import os
 from typing import Optional, Callable
@@ -407,6 +407,9 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         "o3": 200000,
         "o4": 200000,
     }
+    _default_max_retries = 10
+    _default_retry_backoff_seconds = 1.0
+    _max_retry_backoff_seconds = 30.0
 
     def __init__(
         self,
@@ -418,7 +421,10 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         provider: str = "openai",
         log_requests: bool = False,
         max_output_tokens: Optional[int] = 32000,
+        max_retries: int = _default_max_retries,
     ):
+        if max_retries < 0:
+            raise ValueError("max_retries must be greater than or equal to 0")
         self._model = model
         self._parallel_tool_calls = parallel_tool_calls
         self._client = client
@@ -427,6 +433,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         self._reasoning_effort = reasoning_effort
         self._log_requests = log_requests
         self.max_output_tokens = max_output_tokens
+        self._max_retries = max_retries
 
     def default_model(self) -> str:
         return self._model
@@ -598,6 +605,94 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
             http_client = get_logging_httpx_client() if self._log_requests else None
             return get_client(room=room, http_client=http_client)
 
+    def _is_retryable_openai_error(self, *, error: APIError) -> bool:
+        if isinstance(error, APIStatusError):
+            return (
+                error.status_code == 408
+                or error.status_code == 409
+                or error.status_code == 429
+                or error.status_code >= 500
+            )
+        return True
+
+    def _retry_delay_seconds(self, *, retry_number: int, error: APIError) -> float:
+        if isinstance(error, APIStatusError):
+            retry_after = error.response.headers.get("retry-after")
+            if retry_after is not None:
+                retry_after = retry_after.strip()
+                if retry_after != "":
+                    try:
+                        retry_after_seconds = float(retry_after)
+                        if retry_after_seconds > 0:
+                            return min(
+                                retry_after_seconds,
+                                self._max_retry_backoff_seconds,
+                            )
+                    except ValueError:
+                        pass
+
+        return min(
+            self._default_retry_backoff_seconds * (2 ** (retry_number - 1)),
+            self._max_retry_backoff_seconds,
+        )
+
+    def _log_retry(
+        self,
+        *,
+        error: APIError,
+        retry_number: int,
+        delay_seconds: float,
+    ) -> None:
+        request_id = None
+        if isinstance(error, APIStatusError):
+            request_id = error.request_id
+
+        if request_id:
+            logger.warning(
+                "openai request failed, retrying (%s/%s) in %.2fs (request_id=%s): %s",
+                retry_number,
+                self._max_retries,
+                delay_seconds,
+                request_id,
+                error,
+            )
+        else:
+            logger.warning(
+                "openai request failed, retrying (%s/%s) in %.2fs: %s",
+                retry_number,
+                self._max_retries,
+                delay_seconds,
+                error,
+            )
+
+    async def _create_response_with_retries(
+        self,
+        *,
+        openai: AsyncOpenAI,
+        create_kwargs: dict,
+    ):
+        retry_number = 0
+        while True:
+            try:
+                return await openai.responses.create(**create_kwargs)
+            except APIError as error:
+                if not self._is_retryable_openai_error(error=error):
+                    raise
+                if retry_number >= self._max_retries:
+                    raise
+
+                retry_number += 1
+                delay_seconds = self._retry_delay_seconds(
+                    retry_number=retry_number,
+                    error=error,
+                )
+                self._log_retry(
+                    error=error,
+                    retry_number=retry_number,
+                    delay_seconds=delay_seconds,
+                )
+                await asyncio.sleep(delay_seconds)
+
     # Takes the current chat context, executes a completion request and processes the response.
     # If a tool calls are requested, invokes the tools, processes the tool calls results, and appends the tool call results to the context
     async def next(
@@ -680,6 +775,13 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                             previous_response_id = context.previous_response_id
 
                         stream = event_handler is not None
+                        context_messages_snapshot = copy.deepcopy(context.messages)
+                        context_previous_messages_snapshot = copy.deepcopy(
+                            context.previous_messages
+                        )
+                        context_previous_response_id_snapshot = (
+                            context.previous_response_id
+                        )
 
                         with tracer.start_as_current_span("llm.invoke") as span:
                             response_options = copy.deepcopy(self._response_options)
@@ -707,17 +809,23 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                             )
 
                             openai = self.get_openai_client(room=room)
-                            response: Response = await openai.responses.create(
-                                extra_headers=extra_headers,
-                                stream=stream,
-                                model=model,
-                                input=context.messages,
-                                tools=open_ai_tools,
-                                text=text,
-                                previous_response_id=previous_response_id,
-                                instructions=instructions or NOT_GIVEN,
-                                max_output_tokens=self.max_output_tokens,
+                            create_kwargs = {
+                                "extra_headers": extra_headers,
+                                "stream": stream,
+                                "model": model,
+                                "input": context.messages,
+                                "tools": open_ai_tools,
+                                "text": text,
+                                "previous_response_id": previous_response_id,
+                                "instructions": instructions or NOT_GIVEN,
+                                "max_output_tokens": self.max_output_tokens,
                                 **response_options,
+                            }
+                            response: Response = (
+                                await self._create_response_with_retries(
+                                    openai=openai,
+                                    create_kwargs=create_kwargs,
+                                )
                             )
 
                             if not stream:
@@ -778,6 +886,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                         caller_context={
                                                             "chat": context.to_json()
                                                         },
+                                                        event_handler=event_handler,
                                                     )
                                                     tool_response = (
                                                         await tool_bundle.execute(
@@ -973,6 +1082,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                                 caller_context={
                                                                     "chat": context.to_json()
                                                                 },
+                                                                event_handler=event_handler,
                                                             )
 
                                                             try:
@@ -1088,100 +1198,171 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                         span.set_attribute("terminate", False)
 
                             else:
-                                final_outputs = []
-                                all_outputs = []
-                                async for e in response:
-                                    with tracer.start_as_current_span(
-                                        "llm.stream.event"
-                                    ) as span:
-                                        event: ResponseStreamEvent = e
-                                        span.set_attributes(
-                                            {
-                                                "type": event.type,
-                                                "event": safe_model_dump(event),
-                                            }
-                                        )
-                                        if self._should_publish_stream_event(
-                                            event=event
-                                        ):
-                                            event_handler(event.model_dump(mode="json"))
-
-                                        if event.type == "response.completed":
-                                            context.track_response(event.response.id)
-                                            self._store_usage(
-                                                context=context,
-                                                usage=event.response.usage,
-                                                model=model,
-                                            )
-
-                                            context.messages.extend(all_outputs)
-
+                                stream_retry_number = 0
+                                while True:
+                                    final_outputs = []
+                                    all_outputs = []
+                                    try:
+                                        async for e in response:
                                             with tracer.start_as_current_span(
-                                                "llm.turn.check_for_termination"
+                                                "llm.stream.event"
                                             ) as span:
-                                                term = await self.check_for_termination(
-                                                    context=context, room=room
+                                                event: ResponseStreamEvent = e
+                                                span.set_attributes(
+                                                    {
+                                                        "type": event.type,
+                                                        "event": safe_model_dump(event),
+                                                    }
                                                 )
-
-                                                if term:
-                                                    span.set_attribute(
-                                                        "terminate", True
+                                                if self._should_publish_stream_event(
+                                                    event=event
+                                                ):
+                                                    event_handler(
+                                                        event.model_dump(mode="json")
                                                     )
 
-                                                    text = ""
-                                                    for output in event.response.output:
-                                                        if output.type == "message":
+                                                if event.type == "response.completed":
+                                                    context.track_response(
+                                                        event.response.id
+                                                    )
+                                                    self._store_usage(
+                                                        context=context,
+                                                        usage=event.response.usage,
+                                                        model=model,
+                                                    )
+
+                                                    context.messages.extend(all_outputs)
+
+                                                    with tracer.start_as_current_span(
+                                                        "llm.turn.check_for_termination"
+                                                    ) as span:
+                                                        term = await self.check_for_termination(
+                                                            context=context, room=room
+                                                        )
+
+                                                        if term:
+                                                            span.set_attribute(
+                                                                "terminate", True
+                                                            )
+
+                                                            text = ""
                                                             for (
-                                                                content
-                                                            ) in output.content:
-                                                                text += content.text
+                                                                output
+                                                            ) in event.response.output:
+                                                                if (
+                                                                    output.type
+                                                                    == "message"
+                                                                ):
+                                                                    for (
+                                                                        content
+                                                                    ) in output.content:
+                                                                        text += (
+                                                                            content.text
+                                                                        )
 
-                                                    return text
+                                                            return text
 
-                                                span.set_attribute("terminate", False)
+                                                        span.set_attribute(
+                                                            "terminate", False
+                                                        )
 
-                                            all_outputs = []
+                                                    all_outputs = []
 
-                                        elif event.type == "response.output_item.done":
-                                            context.previous_messages.append(
-                                                event.item.to_dict()
+                                                elif (
+                                                    event.type
+                                                    == "response.output_item.done"
+                                                ):
+                                                    context.previous_messages.append(
+                                                        event.item.to_dict()
+                                                    )
+
+                                                    (
+                                                        outputs,
+                                                        done,
+                                                    ) = await handle_message(
+                                                        message=event.item
+                                                    )
+                                                    if done:
+                                                        final_outputs.extend(outputs)
+                                                    else:
+                                                        for output in outputs:
+                                                            all_outputs.append(output)
+
+                                                else:
+                                                    for toolkit in toolkits:
+                                                        for tool in toolkit.tools:
+                                                            if isinstance(
+                                                                tool,
+                                                                OpenAIResponsesTool,
+                                                            ):
+                                                                callbacks = tool.get_open_ai_stream_callbacks()
+
+                                                                if (
+                                                                    event.type
+                                                                    in callbacks
+                                                                ):
+                                                                    tool_context = ToolContext(
+                                                                        room=room,
+                                                                        caller=room.local_participant,
+                                                                        caller_context={
+                                                                            "chat": context.to_json()
+                                                                        },
+                                                                        event_handler=event_handler,
+                                                                    )
+
+                                                                    await callbacks[
+                                                                        event.type
+                                                                    ](
+                                                                        tool_context,
+                                                                        **event.to_dict(),
+                                                                    )
+
+                                                if len(final_outputs) > 0:
+                                                    return final_outputs[0]
+                                        break
+
+                                    except APIError as error:
+                                        if not self._is_retryable_openai_error(
+                                            error=error
+                                        ):
+                                            raise
+                                        if stream_retry_number >= self._max_retries:
+                                            raise
+
+                                        stream_retry_number += 1
+                                        delay_seconds = self._retry_delay_seconds(
+                                            retry_number=stream_retry_number,
+                                            error=error,
+                                        )
+                                        self._log_retry(
+                                            error=error,
+                                            retry_number=stream_retry_number,
+                                            delay_seconds=delay_seconds,
+                                        )
+
+                                        context.messages.clear()
+                                        context.messages.extend(
+                                            copy.deepcopy(context_messages_snapshot)
+                                        )
+                                        context.previous_messages.clear()
+                                        context.previous_messages.extend(
+                                            copy.deepcopy(
+                                                context_previous_messages_snapshot
                                             )
+                                        )
+                                        context.previous_response_id = (
+                                            context_previous_response_id_snapshot
+                                        )
 
-                                            outputs, done = await handle_message(
-                                                message=event.item
+                                        await asyncio.sleep(delay_seconds)
+                                        response = (
+                                            await self._create_response_with_retries(
+                                                openai=openai,
+                                                create_kwargs=create_kwargs,
                                             )
-                                            if done:
-                                                final_outputs.extend(outputs)
-                                            else:
-                                                for output in outputs:
-                                                    all_outputs.append(output)
+                                        )
 
-                                        else:
-                                            for toolkit in toolkits:
-                                                for tool in toolkit.tools:
-                                                    if isinstance(
-                                                        tool, OpenAIResponsesTool
-                                                    ):
-                                                        callbacks = tool.get_open_ai_stream_callbacks()
-
-                                                        if event.type in callbacks:
-                                                            tool_context = ToolContext(
-                                                                room=room,
-                                                                caller=room.local_participant,
-                                                                caller_context={
-                                                                    "chat": context.to_json()
-                                                                },
-                                                            )
-
-                                                            await callbacks[event.type](
-                                                                tool_context,
-                                                                **event.to_dict(),
-                                                            )
-
-                                        if len(final_outputs) > 0:
-                                            return final_outputs[0]
-
-            except APIStatusError as e:
+            except APIError as e:
                 raise RoomException(f"Error from OpenAI: {e}")
 
 
