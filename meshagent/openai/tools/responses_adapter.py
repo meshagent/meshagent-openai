@@ -2,13 +2,14 @@ from meshagent.agents.agent import AgentChatContext
 from meshagent.api import RoomClient, RoomException, RemoteParticipant
 from meshagent.tools import Toolkit, ToolContext, Tool, BaseTool
 from meshagent.api.messaging import (
-    Response,
-    LinkResponse,
-    FileResponse,
-    JsonResponse,
-    TextResponse,
-    EmptyResponse,
-    RawOutputs,
+    Chunk,
+    LinkChunk,
+    FileChunk,
+    JsonChunk,
+    TextChunk,
+    EmptyChunk,
+    RawOutputsChunk,
+    _ControlChunk,
 )
 
 from meshagent.api.messaging import ensure_response
@@ -23,7 +24,8 @@ from meshagent.tools.script import DEFAULT_CONTAINER_MOUNT_SPEC
 
 from meshagent.api.specs.service import ContainerMountSpec
 import json
-from typing import List, Literal
+from collections.abc import AsyncIterable
+from typing import Any, List, Literal
 from meshagent.openai.proxy import get_client, get_logging_httpx_client
 from openai import AsyncOpenAI, NOT_GIVEN, APIError, APIStatusError
 from openai.types.responses import ResponseFunctionToolCall, ResponseStreamEvent
@@ -102,6 +104,65 @@ def safe_model_dump(model: BaseModel):
         return safe_json_dump(model.model_dump(mode="json"))
     except Exception:
         return {"error": "unable to dump json for model"}
+
+
+def _emit_stream_json_item(
+    *, item: Any, event_handler: Optional[Callable[[dict], None]]
+) -> None:
+    if event_handler is None:
+        return
+    if isinstance(item, JsonChunk):
+        event_handler(item.json)
+
+
+async def _consume_streaming_tool_items(
+    *,
+    tool_name: str,
+    tool_call_id: Optional[str],
+    item_id: Optional[str],
+    stream: AsyncIterable[Any],
+    event_handler: Optional[Callable[[dict], None]],
+) -> Any:
+    del tool_name
+    del tool_call_id
+    del item_id
+    has_last = False
+    last_item: Any = None
+    async for item in stream:
+        if has_last:
+            _emit_stream_json_item(item=last_item, event_handler=event_handler)
+        last_item = item
+        has_last = True
+
+    if not has_last:
+        return None
+
+    if isinstance(last_item, _ControlChunk):
+        return None
+    if isinstance(last_item, dict):
+        last_type = last_item.get("type")
+        if last_type in ("agent.event", "codex.event"):
+            return None
+
+    return last_item
+
+
+async def _consume_streaming_tool_result(
+    *,
+    tool_name: str,
+    tool_call_id: Optional[str],
+    item_id: Optional[str],
+    stream: AsyncIterable[Any],
+    event_handler: Optional[Callable[[dict], None]],
+) -> Chunk:
+    item = await _consume_streaming_tool_items(
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        item_id=item_id,
+        stream=stream,
+        event_handler=event_handler,
+    )
+    return ensure_response(item)
 
 
 def _replace_non_matching(text: str, allowed_chars: str, replacement: str) -> str:
@@ -194,7 +255,7 @@ class ResponsesToolBundle:
 
     async def execute(
         self, *, context: ToolContext, tool_call: ResponseFunctionToolCall
-    ) -> Response:
+    ) -> Chunk | AsyncIterable[Any]:
         name = tool_call.name
         arguments = json.loads(tool_call.arguments)
 
@@ -208,6 +269,8 @@ class ResponsesToolBundle:
 
         proxy = self._executors[name]
         result = await proxy.execute(context=context, name=name, arguments=arguments)
+        if isinstance(result, AsyncIterable):
+            return result
         return ensure_response(result)
 
     def get_tool(self, name: str) -> BaseTool | None:
@@ -227,8 +290,8 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
     def __init__(self):
         pass
 
-    async def to_plain_text(self, *, room: RoomClient, response: Response) -> str:
-        if isinstance(response, LinkResponse):
+    async def to_plain_text(self, *, room: RoomClient, response: Chunk) -> str:
+        if isinstance(response, LinkChunk):
             return json.dumps(
                 {
                     "name": response.name,
@@ -236,16 +299,16 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
                 }
             )
 
-        elif isinstance(response, JsonResponse):
+        elif isinstance(response, JsonChunk):
             return json.dumps(response.json)
 
-        elif isinstance(response, TextResponse):
+        elif isinstance(response, TextChunk):
             return response.text
 
-        elif isinstance(response, FileResponse):
+        elif isinstance(response, FileChunk):
             return f"{response.name}"
 
-        elif isinstance(response, EmptyResponse):
+        elif isinstance(response, EmptyChunk):
             return "ok"
 
         # elif isinstance(response, ImageResponse):
@@ -282,10 +345,10 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
         context: AgentChatContext,
         tool_call: ResponseFunctionToolCall,
         room: RoomClient,
-        response: Response,
+        response: Chunk,
     ) -> list:
         with tracer.start_as_current_span("llm.tool_adapter.create_messages") as span:
-            if isinstance(response, RawOutputs):
+            if isinstance(response, RawOutputsChunk):
                 span.set_attribute("kind", "raw")
                 for output in response.outputs:
                     room.developer.log_nowait(
@@ -305,7 +368,7 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
             else:
                 span.set_attribute("kind", "text")
 
-                if isinstance(response, FileResponse):
+                if isinstance(response, FileChunk):
                     if response.mime_type and response.mime_type.startswith("image/"):
                         span.set_attribute(
                             "output", f"image: {response.name}, {response.mime_type}"
@@ -821,11 +884,9 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                 "max_output_tokens": self.max_output_tokens,
                                 **response_options,
                             }
-                            response: Response = (
-                                await self._create_response_with_retries(
-                                    openai=openai,
-                                    create_kwargs=create_kwargs,
-                                )
+                            response: Chunk = await self._create_response_with_retries(
+                                openai=openai,
+                                create_kwargs=create_kwargs,
                             )
 
                             if not stream:
@@ -886,14 +947,25 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                         caller_context={
                                                             "chat": context.to_json()
                                                         },
-                                                        event_handler=event_handler,
                                                     )
-                                                    tool_response = (
+                                                    tool_result = (
                                                         await tool_bundle.execute(
                                                             context=tool_context,
                                                             tool_call=tool_call,
                                                         )
                                                     )
+                                                    if isinstance(
+                                                        tool_result, AsyncIterable
+                                                    ):
+                                                        tool_response = await _consume_streaming_tool_result(
+                                                            tool_name=tool_call.name,
+                                                            tool_call_id=tool_call.call_id,
+                                                            item_id=tool_call.id,
+                                                            stream=tool_result,
+                                                            event_handler=event_handler,
+                                                        )
+                                                    else:
+                                                        tool_response = tool_result
                                                     if (
                                                         tool_response.caller_context
                                                         is not None
@@ -1082,7 +1154,6 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                                 caller_context={
                                                                     "chat": context.to_json()
                                                                 },
-                                                                event_handler=event_handler,
                                                             )
 
                                                             try:
@@ -1105,6 +1176,35 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                                     tool_context,
                                                                     **arguments,
                                                                 )
+                                                                if isinstance(
+                                                                    result,
+                                                                    AsyncIterable,
+                                                                ):
+                                                                    result = await _consume_streaming_tool_items(
+                                                                        tool_name=message.type,
+                                                                        tool_call_id=(
+                                                                            arguments.get(
+                                                                                "call_id"
+                                                                            )
+                                                                            if isinstance(
+                                                                                arguments,
+                                                                                dict,
+                                                                            )
+                                                                            else None
+                                                                        ),
+                                                                        item_id=(
+                                                                            arguments.get(
+                                                                                "id"
+                                                                            )
+                                                                            if isinstance(
+                                                                                arguments,
+                                                                                dict,
+                                                                            )
+                                                                            else None
+                                                                        ),
+                                                                        stream=result,
+                                                                        event_handler=event_handler,
+                                                                    )
 
                                                             except Exception as e:
                                                                 if (
@@ -1124,18 +1224,25 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                                 event_handler
                                                                 is not None
                                                             ):
+                                                                done_item = result
+                                                                if isinstance(
+                                                                    done_item, Chunk
+                                                                ):
+                                                                    done_item = done_item.to_json()
                                                                 event_handler(
                                                                     {
                                                                         "type": "meshagent.handler.done",
-                                                                        "item": result,
+                                                                        "item": done_item,
                                                                     }
                                                                 )
 
                                                             if result is not None:
                                                                 span.set_attribute(
                                                                     "result",
-                                                                    safe_json_dump(
-                                                                        result
+                                                                    json.dumps(
+                                                                        result,
+                                                                        ensure_ascii=False,
+                                                                        default=str,
                                                                     ),
                                                                 )
                                                                 return [result], False
@@ -1307,7 +1414,6 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                                         caller_context={
                                                                             "chat": context.to_json()
                                                                         },
-                                                                        event_handler=event_handler,
                                                                     )
 
                                                                     await callbacks[

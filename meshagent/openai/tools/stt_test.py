@@ -3,7 +3,7 @@ import asyncio
 import pytest
 
 from openai import AsyncOpenAI
-from meshagent.tools import JsonResponse, TextResponse
+from meshagent.tools import JsonChunk, TextChunk
 
 from .tts import _transcribe
 
@@ -29,7 +29,7 @@ def audio_bytes() -> bytes:
 ################################################################################
 @pytest.mark.asyncio
 async def test_transcribe_text(client, audio_bytes):
-    """_transcribe should return non-empty TextResponse for plain-text format."""
+    """_transcribe should return non-empty TextChunk for plain-text format."""
     result = await asyncio.wait_for(
         _transcribe(
             client=client,
@@ -43,13 +43,13 @@ async def test_transcribe_text(client, audio_bytes):
     )
 
     # Basic sanity checks
-    assert isinstance(result, TextResponse)
+    assert isinstance(result, TextChunk)
     assert result.text.strip() != ""
 
 
 @pytest.mark.asyncio
 async def test_transcribe_json(client, audio_bytes):
-    """_transcribe should return a well-formed JsonResponse for JSON format."""
+    """_transcribe should return a well-formed JsonChunk for JSON format."""
     result = await asyncio.wait_for(
         _transcribe(
             client=client,
@@ -63,13 +63,13 @@ async def test_transcribe_json(client, audio_bytes):
     )
 
     # Basic sanity checks
-    assert isinstance(result, JsonResponse)
+    assert isinstance(result, JsonChunk)
     assert isinstance(result.json["text"], str)
 
 
 @pytest.mark.asyncio
 async def test_transcribe_verbose_json(client, audio_bytes):
-    """_transcribe should return a well-formed JsonResponse for JSON format."""
+    """_transcribe should return a well-formed JsonChunk for JSON format."""
     result = await asyncio.wait_for(
         _transcribe(
             client=client,
@@ -83,5 +83,5 @@ async def test_transcribe_verbose_json(client, audio_bytes):
     )
 
     # Basic sanity checks
-    assert isinstance(result, JsonResponse)
+    assert isinstance(result, JsonChunk)
     assert isinstance(result.json["segments"], list)

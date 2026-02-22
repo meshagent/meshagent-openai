@@ -2,13 +2,15 @@ from meshagent.agents.agent import AgentChatContext
 from meshagent.api import RoomClient, RoomException, RemoteParticipant
 from meshagent.tools import Toolkit, ToolContext
 from meshagent.api.messaging import (
-    Response,
-    LinkResponse,
-    FileResponse,
-    JsonResponse,
-    TextResponse,
-    EmptyResponse,
+    Chunk,
+    LinkChunk,
+    FileChunk,
+    JsonChunk,
+    TextChunk,
+    EmptyChunk,
+    _ControlChunk,
 )
+from meshagent.api.messaging import ensure_response
 from meshagent.agents.adapter import ToolResponseAdapter, LLMAdapter
 import json
 from typing import List
@@ -18,6 +20,7 @@ from openai.types.chat import ChatCompletion, ChatCompletionMessageToolCall
 
 import os
 from typing import Optional, Any, Callable
+from collections.abc import AsyncIterable
 
 import logging
 import re
@@ -55,6 +58,31 @@ def _replace_non_matching(text: str, allowed_chars: str, replacement: str) -> st
 
 def safe_tool_name(name: str):
     return _replace_non_matching(name, "a-zA-Z0-9_-", "_")
+
+
+async def _consume_streaming_tool_result(
+    *, stream: AsyncIterable[Any], event_handler: Optional[Callable[[dict], None]]
+) -> Chunk:
+    has_last = False
+    last_item: Any = None
+    async for item in stream:
+        if has_last and isinstance(last_item, JsonChunk) and event_handler is not None:
+            event_handler(last_item.json)
+        last_item = item
+        has_last = True
+
+    if not has_last:
+        return ensure_response(None)
+
+    if isinstance(last_item, _ControlChunk):
+        return ensure_response(None)
+
+    if isinstance(last_item, dict):
+        last_type = last_item.get("type")
+        if last_type in ("agent.event", "codex.event"):
+            return ensure_response(None)
+
+    return ensure_response(last_item)
 
 
 # Collects a group of tool proxies and manages execution of openai tool calls
@@ -106,7 +134,7 @@ class CompletionsToolBundle:
 
     async def execute(
         self, *, context: ToolContext, tool_call: ChatCompletionMessageToolCall
-    ) -> Response:
+    ) -> Chunk | AsyncIterable[Any]:
         function = tool_call.function
         name = function.name
         arguments = json.loads(function.arguments)
@@ -137,8 +165,8 @@ class OpenAICompletionsToolResponseAdapter(ToolResponseAdapter):
     def __init__(self):
         pass
 
-    async def to_plain_text(self, *, room: RoomClient, response: Response) -> str:
-        if isinstance(response, LinkResponse):
+    async def to_plain_text(self, *, room: RoomClient, response: Chunk) -> str:
+        if isinstance(response, LinkChunk):
             return json.dumps(
                 {
                     "name": response.name,
@@ -146,16 +174,16 @@ class OpenAICompletionsToolResponseAdapter(ToolResponseAdapter):
                 }
             )
 
-        elif isinstance(response, JsonResponse):
+        elif isinstance(response, JsonChunk):
             return json.dumps(response.json)
 
-        elif isinstance(response, TextResponse):
+        elif isinstance(response, TextChunk):
             return response.text
 
-        elif isinstance(response, FileResponse):
+        elif isinstance(response, FileChunk):
             return f"{response.name}"
 
-        elif isinstance(response, EmptyResponse):
+        elif isinstance(response, EmptyChunk):
             return "ok"
 
         # elif isinstance(response, ImageResponse):
@@ -192,7 +220,7 @@ class OpenAICompletionsToolResponseAdapter(ToolResponseAdapter):
         context: AgentChatContext,
         tool_call: Any,
         room: RoomClient,
-        response: Response,
+        response: Chunk,
     ) -> list:
         message = {
             "role": "tool",
@@ -324,11 +352,17 @@ class OpenAICompletionsAdapter(LLMAdapter):
                                 room=room,
                                 caller=room.local_participant,
                                 caller_context={"chat": context.to_json()},
-                                event_handler=event_handler,
                             )
                             tool_response = await tool_bundle.execute(
                                 context=tool_context, tool_call=tool_call
                             )
+                            if isinstance(tool_response, AsyncIterable):
+                                tool_response = await _consume_streaming_tool_result(
+                                    stream=tool_response,
+                                    event_handler=event_handler,
+                                )
+                            else:
+                                tool_response = ensure_response(tool_response)
                             logger.info(f"tool response {tool_response}")
                             return await tool_adapter.create_messages(
                                 context=context,

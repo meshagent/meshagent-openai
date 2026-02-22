@@ -3,7 +3,11 @@ import pytest
 from openai import APIError
 
 from meshagent.api import RoomException
-from meshagent.openai.tools.responses_adapter import OpenAIResponsesAdapter
+from meshagent.api.messaging import JsonChunk, TextChunk
+from meshagent.openai.tools.responses_adapter import (
+    OpenAIResponsesAdapter,
+    _consume_streaming_tool_result,
+)
 
 
 class _FakeDeveloper:
@@ -105,9 +109,70 @@ class _FakeOpenAIClient:
         self.responses = _FakeResponsesClient(outcomes=outcomes)
 
 
+class _ToolItemStream:
+    def __init__(self, *, items: list[object]):
+        self._items = items
+
+    def __aiter__(self):
+        return self._run()
+
+    async def _run(self):
+        for item in self._items:
+            yield item
+
+
 def _make_api_error(message: str) -> APIError:
     request = httpx.Request("POST", "https://api.openai.com/v1/responses")
     return APIError(message, request=request, body=None)
+
+
+@pytest.mark.asyncio
+async def test_consume_streaming_tool_result_emits_intermediate_json_events():
+    events: list[dict] = []
+    result = await _consume_streaming_tool_result(
+        tool_name="computer_call",
+        tool_call_id="call_1",
+        item_id="item_1",
+        stream=_ToolItemStream(
+            items=[
+                JsonChunk(
+                    json={
+                        "type": "agent.event",
+                        "headline": "Starting Playwright container",
+                    }
+                ),
+                TextChunk(text="tool-finished"),
+            ]
+        ),
+        event_handler=events.append,
+    )
+
+    assert isinstance(result, TextChunk)
+    assert result.text == "tool-finished"
+    assert events == [
+        {"type": "agent.event", "headline": "Starting Playwright container"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_consume_streaming_tool_result_ignores_non_json_intermediate_items():
+    events: list[dict] = []
+    result = await _consume_streaming_tool_result(
+        tool_name="computer_call",
+        tool_call_id="call_1",
+        item_id="item_1",
+        stream=_ToolItemStream(
+            items=[
+                {"type": "agent.event", "headline": "Preparing browser"},
+                TextChunk(text="done"),
+            ]
+        ),
+        event_handler=events.append,
+    )
+
+    assert isinstance(result, TextChunk)
+    assert result.text == "done"
+    assert events == []
 
 
 @pytest.mark.asyncio
