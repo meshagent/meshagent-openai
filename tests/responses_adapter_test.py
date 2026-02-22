@@ -3,7 +3,7 @@ import pytest
 from openai import APIError
 
 from meshagent.api import RoomException
-from meshagent.api.messaging import JsonChunk, TextChunk
+from meshagent.api.messaging import JsonContent, TextContent
 from meshagent.openai.tools.responses_adapter import (
     OpenAIResponsesAdapter,
     _consume_streaming_tool_result,
@@ -135,19 +135,19 @@ async def test_consume_streaming_tool_result_emits_intermediate_json_events():
         item_id="item_1",
         stream=_ToolItemStream(
             items=[
-                JsonChunk(
+                JsonContent(
                     json={
                         "type": "agent.event",
                         "headline": "Starting Playwright container",
                     }
                 ),
-                TextChunk(text="tool-finished"),
+                TextContent(text="tool-finished"),
             ]
         ),
         event_handler=events.append,
     )
 
-    assert isinstance(result, TextChunk)
+    assert isinstance(result, TextContent)
     assert result.text == "tool-finished"
     assert events == [
         {"type": "agent.event", "headline": "Starting Playwright container"}
@@ -164,13 +164,13 @@ async def test_consume_streaming_tool_result_ignores_non_json_intermediate_items
         stream=_ToolItemStream(
             items=[
                 {"type": "agent.event", "headline": "Preparing browser"},
-                TextChunk(text="done"),
+                TextContent(text="done"),
             ]
         ),
         event_handler=events.append,
     )
 
-    assert isinstance(result, TextChunk)
+    assert isinstance(result, TextContent)
     assert result.text == "done"
     assert events == []
 

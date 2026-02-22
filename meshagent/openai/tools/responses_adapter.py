@@ -2,17 +2,17 @@ from meshagent.agents.agent import AgentChatContext
 from meshagent.api import RoomClient, RoomException, RemoteParticipant
 from meshagent.tools import Toolkit, ToolContext, Tool, BaseTool
 from meshagent.api.messaging import (
-    Chunk,
-    LinkChunk,
-    FileChunk,
-    JsonChunk,
-    TextChunk,
-    EmptyChunk,
-    RawOutputsChunk,
-    _ControlChunk,
+    Content,
+    LinkContent,
+    FileContent,
+    JsonContent,
+    TextContent,
+    EmptyContent,
+    RawOutputsContent,
+    _ControlContent,
 )
 
-from meshagent.api.messaging import ensure_response
+from meshagent.api.messaging import ensure_content
 from meshagent.agents.adapter import (
     ToolResponseAdapter,
     LLMAdapter,
@@ -111,7 +111,7 @@ def _emit_stream_json_item(
 ) -> None:
     if event_handler is None:
         return
-    if isinstance(item, JsonChunk):
+    if isinstance(item, JsonContent):
         event_handler(item.json)
 
 
@@ -137,7 +137,7 @@ async def _consume_streaming_tool_items(
     if not has_last:
         return None
 
-    if isinstance(last_item, _ControlChunk):
+    if isinstance(last_item, _ControlContent):
         return None
     if isinstance(last_item, dict):
         last_type = last_item.get("type")
@@ -154,7 +154,7 @@ async def _consume_streaming_tool_result(
     item_id: Optional[str],
     stream: AsyncIterable[Any],
     event_handler: Optional[Callable[[dict], None]],
-) -> Chunk:
+) -> Content:
     item = await _consume_streaming_tool_items(
         tool_name=tool_name,
         tool_call_id=tool_call_id,
@@ -162,7 +162,7 @@ async def _consume_streaming_tool_result(
         stream=stream,
         event_handler=event_handler,
     )
-    return ensure_response(item)
+    return ensure_content(item)
 
 
 def _replace_non_matching(text: str, allowed_chars: str, replacement: str) -> str:
@@ -255,7 +255,7 @@ class ResponsesToolBundle:
 
     async def execute(
         self, *, context: ToolContext, tool_call: ResponseFunctionToolCall
-    ) -> Chunk | AsyncIterable[Any]:
+    ) -> Content | AsyncIterable[Any]:
         name = tool_call.name
         arguments = json.loads(tool_call.arguments)
 
@@ -271,7 +271,7 @@ class ResponsesToolBundle:
         result = await proxy.execute(context=context, name=name, arguments=arguments)
         if isinstance(result, AsyncIterable):
             return result
-        return ensure_response(result)
+        return ensure_content(result)
 
     def get_tool(self, name: str) -> BaseTool | None:
         return self._tools_by_name.get(name, None)
@@ -290,8 +290,8 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
     def __init__(self):
         pass
 
-    async def to_plain_text(self, *, room: RoomClient, response: Chunk) -> str:
-        if isinstance(response, LinkChunk):
+    async def to_plain_text(self, *, room: RoomClient, response: Content) -> str:
+        if isinstance(response, LinkContent):
             return json.dumps(
                 {
                     "name": response.name,
@@ -299,16 +299,16 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
                 }
             )
 
-        elif isinstance(response, JsonChunk):
+        elif isinstance(response, JsonContent):
             return json.dumps(response.json)
 
-        elif isinstance(response, TextChunk):
+        elif isinstance(response, TextContent):
             return response.text
 
-        elif isinstance(response, FileChunk):
+        elif isinstance(response, FileContent):
             return f"{response.name}"
 
-        elif isinstance(response, EmptyChunk):
+        elif isinstance(response, EmptyContent):
             return "ok"
 
         # elif isinstance(response, ImageResponse):
@@ -345,10 +345,10 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
         context: AgentChatContext,
         tool_call: ResponseFunctionToolCall,
         room: RoomClient,
-        response: Chunk,
+        response: Content,
     ) -> list:
         with tracer.start_as_current_span("llm.tool_adapter.create_messages") as span:
-            if isinstance(response, RawOutputsChunk):
+            if isinstance(response, RawOutputsContent):
                 span.set_attribute("kind", "raw")
                 for output in response.outputs:
                     room.developer.log_nowait(
@@ -368,7 +368,7 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
             else:
                 span.set_attribute("kind", "text")
 
-                if isinstance(response, FileChunk):
+                if isinstance(response, FileContent):
                     if response.mime_type and response.mime_type.startswith("image/"):
                         span.set_attribute(
                             "output", f"image: {response.name}, {response.mime_type}"
@@ -884,9 +884,11 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                 "max_output_tokens": self.max_output_tokens,
                                 **response_options,
                             }
-                            response: Chunk = await self._create_response_with_retries(
-                                openai=openai,
-                                create_kwargs=create_kwargs,
+                            response: Content = (
+                                await self._create_response_with_retries(
+                                    openai=openai,
+                                    create_kwargs=create_kwargs,
+                                )
                             )
 
                             if not stream:
@@ -966,29 +968,6 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                         )
                                                     else:
                                                         tool_response = tool_result
-                                                    if (
-                                                        tool_response.caller_context
-                                                        is not None
-                                                    ):
-                                                        if (
-                                                            tool_response.caller_context.get(
-                                                                "chat", None
-                                                            )
-                                                            is not None
-                                                        ):
-                                                            tool_chat_context = AgentChatContext.from_json(
-                                                                tool_response.caller_context[
-                                                                    "chat"
-                                                                ]
-                                                            )
-                                                            if (
-                                                                tool_chat_context.previous_response_id
-                                                                is not None
-                                                            ):
-                                                                context.track_response(
-                                                                    tool_chat_context.previous_response_id
-                                                                )
-
                                                     logger.info(
                                                         f"tool response {tool_response}"
                                                     )
@@ -1226,7 +1205,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                             ):
                                                                 done_item = result
                                                                 if isinstance(
-                                                                    done_item, Chunk
+                                                                    done_item, Content
                                                                 ):
                                                                     done_item = done_item.to_json()
                                                                 event_handler(

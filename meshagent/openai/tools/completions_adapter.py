@@ -2,15 +2,15 @@ from meshagent.agents.agent import AgentChatContext
 from meshagent.api import RoomClient, RoomException, RemoteParticipant
 from meshagent.tools import Toolkit, ToolContext
 from meshagent.api.messaging import (
-    Chunk,
-    LinkChunk,
-    FileChunk,
-    JsonChunk,
-    TextChunk,
-    EmptyChunk,
-    _ControlChunk,
+    Content,
+    LinkContent,
+    FileContent,
+    JsonContent,
+    TextContent,
+    EmptyContent,
+    _ControlContent,
 )
-from meshagent.api.messaging import ensure_response
+from meshagent.api.messaging import ensure_content
 from meshagent.agents.adapter import ToolResponseAdapter, LLMAdapter
 import json
 from typing import List
@@ -62,27 +62,31 @@ def safe_tool_name(name: str):
 
 async def _consume_streaming_tool_result(
     *, stream: AsyncIterable[Any], event_handler: Optional[Callable[[dict], None]]
-) -> Chunk:
+) -> Content:
     has_last = False
     last_item: Any = None
     async for item in stream:
-        if has_last and isinstance(last_item, JsonChunk) and event_handler is not None:
+        if (
+            has_last
+            and isinstance(last_item, JsonContent)
+            and event_handler is not None
+        ):
             event_handler(last_item.json)
         last_item = item
         has_last = True
 
     if not has_last:
-        return ensure_response(None)
+        return ensure_content(None)
 
-    if isinstance(last_item, _ControlChunk):
-        return ensure_response(None)
+    if isinstance(last_item, _ControlContent):
+        return ensure_content(None)
 
     if isinstance(last_item, dict):
         last_type = last_item.get("type")
         if last_type in ("agent.event", "codex.event"):
-            return ensure_response(None)
+            return ensure_content(None)
 
-    return ensure_response(last_item)
+    return ensure_content(last_item)
 
 
 # Collects a group of tool proxies and manages execution of openai tool calls
@@ -134,7 +138,7 @@ class CompletionsToolBundle:
 
     async def execute(
         self, *, context: ToolContext, tool_call: ChatCompletionMessageToolCall
-    ) -> Chunk | AsyncIterable[Any]:
+    ) -> Content | AsyncIterable[Any]:
         function = tool_call.function
         name = function.name
         arguments = json.loads(function.arguments)
@@ -165,8 +169,8 @@ class OpenAICompletionsToolResponseAdapter(ToolResponseAdapter):
     def __init__(self):
         pass
 
-    async def to_plain_text(self, *, room: RoomClient, response: Chunk) -> str:
-        if isinstance(response, LinkChunk):
+    async def to_plain_text(self, *, room: RoomClient, response: Content) -> str:
+        if isinstance(response, LinkContent):
             return json.dumps(
                 {
                     "name": response.name,
@@ -174,16 +178,16 @@ class OpenAICompletionsToolResponseAdapter(ToolResponseAdapter):
                 }
             )
 
-        elif isinstance(response, JsonChunk):
+        elif isinstance(response, JsonContent):
             return json.dumps(response.json)
 
-        elif isinstance(response, TextChunk):
+        elif isinstance(response, TextContent):
             return response.text
 
-        elif isinstance(response, FileChunk):
+        elif isinstance(response, FileContent):
             return f"{response.name}"
 
-        elif isinstance(response, EmptyChunk):
+        elif isinstance(response, EmptyContent):
             return "ok"
 
         # elif isinstance(response, ImageResponse):
@@ -220,7 +224,7 @@ class OpenAICompletionsToolResponseAdapter(ToolResponseAdapter):
         context: AgentChatContext,
         tool_call: Any,
         room: RoomClient,
-        response: Chunk,
+        response: Content,
     ) -> list:
         message = {
             "role": "tool",
@@ -362,7 +366,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
                                     event_handler=event_handler,
                                 )
                             else:
-                                tool_response = ensure_response(tool_response)
+                                tool_response = ensure_content(tool_response)
                             logger.info(f"tool response {tool_response}")
                             return await tool_adapter.create_messages(
                                 context=context,

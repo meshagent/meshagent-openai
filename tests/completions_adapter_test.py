@@ -1,7 +1,7 @@
 import json
 import pytest
 
-from meshagent.api.messaging import JsonChunk, TextChunk
+from meshagent.api.messaging import JsonContent, TextContent
 from meshagent.openai.tools.completions_adapter import (
     OpenAICompletionsAdapter,
     _consume_streaming_tool_result,
@@ -44,8 +44,8 @@ class _StreamingTool(Tool):
         del kwargs
 
         async def _run():
-            yield JsonChunk(json={"type": "agent.event", "headline": "working"})
-            yield TextChunk(text="tool-output")
+            yield JsonContent(json={"type": "agent.event", "headline": "working"})
+            yield TextContent(text="tool-output")
 
         return _run()
 
@@ -120,15 +120,15 @@ async def test_consume_streaming_tool_result_emits_intermediate_json_chunk_event
     result = await _consume_streaming_tool_result(
         stream=_ToolItemStream(
             items=[
-                JsonChunk(json={"type": "agent.event", "headline": "starting"}),
-                TextChunk(text="done"),
+                JsonContent(json={"type": "agent.event", "headline": "starting"}),
+                TextContent(text="done"),
             ]
         ),
         event_handler=events.append,
     )
 
     assert events == [{"type": "agent.event", "headline": "starting"}]
-    assert isinstance(result, TextChunk)
+    assert isinstance(result, TextContent)
     assert result.text == "done"
 
 
@@ -138,15 +138,15 @@ async def test_consume_streaming_tool_result_uses_final_item_as_result():
     result = await _consume_streaming_tool_result(
         stream=_ToolItemStream(
             items=[
-                JsonChunk(json={"progress": 50}),
-                JsonChunk(json={"answer": "ok"}),
+                JsonContent(json={"progress": 50}),
+                JsonContent(json={"answer": "ok"}),
             ]
         ),
         event_handler=events.append,
     )
 
     assert events == [{"progress": 50}]
-    assert isinstance(result, JsonChunk)
+    assert isinstance(result, JsonContent)
     assert result.json == {"answer": "ok"}
 
 
