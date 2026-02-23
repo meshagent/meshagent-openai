@@ -1,4 +1,4 @@
-from meshagent.tools import ToolContext, Tool, Toolkit, JsonContent, TextContent
+from meshagent.tools import ToolContext, FunctionTool, Toolkit, JsonContent, TextContent
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 from meshagent.openai.proxy import get_client
@@ -36,7 +36,7 @@ async def _transcribe(
     return JsonContent(json=transcript.model_dump(mode="json"))
 
 
-class OpenAIAudioFileSTT(Tool):
+class OpenAIAudioFileSTT(FunctionTool):
     def __init__(self, *, client: Optional[AsyncOpenAI] = None):
         super().__init__(
             name="openai-file-stt",

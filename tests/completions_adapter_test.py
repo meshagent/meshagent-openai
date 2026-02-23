@@ -6,7 +6,7 @@ from meshagent.openai.tools.completions_adapter import (
     OpenAICompletionsAdapter,
     _consume_streaming_tool_result,
 )
-from meshagent.tools import Tool, Toolkit
+from meshagent.tools import FunctionTool, Toolkit
 
 
 class _FakeDeveloper:
@@ -31,7 +31,7 @@ class _FakeRoom:
         self.developer = _FakeDeveloper()
 
 
-class _StreamingTool(Tool):
+class _StreamingTool(FunctionTool):
     def __init__(self):
         super().__init__(
             name="stream_tool",

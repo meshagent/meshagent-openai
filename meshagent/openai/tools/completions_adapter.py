@@ -152,7 +152,11 @@ class CompletionsToolBundle:
             raise Exception(f"Unregistered tool name {name}")
 
         proxy = self._executors[name]
-        result = await proxy.execute(context=context, name=name, arguments=arguments)
+        result = await proxy.execute(
+            context=context,
+            name=name,
+            input=JsonContent(json=arguments),
+        )
         return result
 
     def contains(self, name: str) -> bool:

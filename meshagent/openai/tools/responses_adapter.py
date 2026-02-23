@@ -1,6 +1,6 @@
 from meshagent.agents.agent import AgentChatContext
 from meshagent.api import RoomClient, RoomException, RemoteParticipant
-from meshagent.tools import Toolkit, ToolContext, Tool, BaseTool
+from meshagent.tools import Toolkit, ToolContext, FunctionTool, BaseTool
 from meshagent.api.messaging import (
     Content,
     LinkContent,
@@ -225,7 +225,7 @@ class ResponsesToolBundle:
                     for fn in fns:
                         open_ai_tools.append(fn)
 
-                elif isinstance(v, Tool):
+                elif isinstance(v, FunctionTool):
                     strict = True
                     if hasattr(v, "strict"):
                         strict = getattr(v, "strict")
@@ -268,7 +268,11 @@ class ResponsesToolBundle:
             raise Exception(f"Unregistered tool name {name}")
 
         proxy = self._executors[name]
-        result = await proxy.execute(context=context, name=name, arguments=arguments)
+        result = await proxy.execute(
+            context=context,
+            name=name,
+            input=JsonContent(json=arguments),
+        )
         if isinstance(result, AsyncIterable):
             return result
         return ensure_content(result)
@@ -2733,7 +2737,7 @@ class ApplyPatchTool(OpenAIResponsesTool):
     def __init__(self, *, config: ApplyPatchConfig):
         super().__init__(name="apply_patch")
 
-    # Tool definition advertised to OpenAI
+    # FunctionTool definition advertised to OpenAI
     def get_open_ai_tool_definitions(self) -> list[dict]:
         # No extra options for now – the built-in tool just needs the type
         return [{"type": "apply_patch"}]
