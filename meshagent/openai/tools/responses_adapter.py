@@ -1,4 +1,4 @@
-from meshagent.agents.agent import AgentChatContext
+from meshagent.agents.agent import AgentSessionContext
 from meshagent.api import RoomClient, RoomException, RemoteParticipant
 from meshagent.tools import Toolkit, ToolContext, FunctionTool, BaseTool
 from meshagent.api.messaging import (
@@ -25,9 +25,10 @@ from meshagent.tools.script import DEFAULT_CONTAINER_MOUNT_SPEC
 from meshagent.api.specs.service import ContainerMountSpec
 import json
 from collections.abc import AsyncIterable
-from typing import Any, List, Literal
+from typing import Any, List, Literal, cast
 from meshagent.openai.proxy import get_client, get_logging_httpx_client
 from openai import AsyncOpenAI, NOT_GIVEN, APIError, APIStatusError
+from openai._models import construct_type
 from openai.types.responses import ResponseFunctionToolCall, ResponseStreamEvent
 import os
 from typing import Optional, Callable
@@ -36,16 +37,165 @@ import base64
 import logging
 import re
 import asyncio
+import aiohttp
 from pydantic import BaseModel
 import copy
 from opentelemetry import trace
 from html_to_markdown import convert
+from urllib.parse import urlparse, urlunparse
 
 logger = logging.getLogger("openai_agent")
 tracer = trace.get_tracer("openai.llm.responses")
 
 
-class OpenAIResponsesChatContext(AgentChatContext):
+class OpenAIResponsesSessionContext(AgentSessionContext):
+    _default_websocket_ping_interval_seconds = 20.0
+    _default_websocket_timeout_seconds = 60 * 60
+
+    def __init__(
+        self,
+        *,
+        websocket_timeout: float = _default_websocket_timeout_seconds,
+        websocket_ping_interval_seconds: float = _default_websocket_ping_interval_seconds,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        if websocket_timeout <= 0:
+            raise ValueError("websocket_timeout must be greater than 0")
+        if websocket_ping_interval_seconds <= 0:
+            raise ValueError("websocket_ping_interval_seconds must be greater than 0")
+        self._websocket_timeout = websocket_timeout
+        self._websocket_ping_interval_seconds = websocket_ping_interval_seconds
+        self._websocket: aiohttp.ClientWebSocketResponse | None = None
+        self._websocket_session: aiohttp.ClientSession | None = None
+        self._websocket_url: str | None = None
+        self._websocket_headers_signature: tuple[tuple[str, str], ...] | None = None
+        self._websocket_ping_task: asyncio.Task[None] | None = None
+        self._websocket_timeout_task: asyncio.Task[None] | None = None
+        self._websocket_lock = asyncio.Lock()
+
+    @staticmethod
+    def _headers_signature(headers: dict[str, str]) -> tuple[tuple[str, str], ...]:
+        return tuple(sorted((k.lower(), v) for k, v in headers.items()))
+
+    @property
+    def has_valid_websocket(self) -> bool:
+        return self._websocket is not None and not self._websocket.closed
+
+    async def _run_websocket_ping(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._websocket_ping_interval_seconds)
+                websocket = self._websocket
+                if websocket is None or websocket.closed:
+                    return
+                await websocket.ping()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning("responses websocket ping failed, closing socket: %s", error)
+            await self.close_websocket()
+
+    async def _run_websocket_timeout(self) -> None:
+        try:
+            await asyncio.sleep(self._websocket_timeout)
+        except asyncio.CancelledError:
+            raise
+        logger.info(
+            "responses websocket session timed out after %.1f seconds",
+            self._websocket_timeout,
+        )
+        await self.close_websocket()
+
+    async def _close_websocket_locked(self) -> None:
+        current_task = asyncio.current_task()
+
+        tasks_to_cancel: list[asyncio.Task[None]] = []
+        if (
+            self._websocket_ping_task is not None
+            and self._websocket_ping_task is not current_task
+        ):
+            tasks_to_cancel.append(self._websocket_ping_task)
+        if (
+            self._websocket_timeout_task is not None
+            and self._websocket_timeout_task is not current_task
+        ):
+            tasks_to_cancel.append(self._websocket_timeout_task)
+
+        self._websocket_ping_task = None
+        self._websocket_timeout_task = None
+
+        for task in tasks_to_cancel:
+            task.cancel()
+        for task in tasks_to_cancel:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+        websocket = self._websocket
+        self._websocket = None
+        self._websocket_url = None
+        self._websocket_headers_signature = None
+        if websocket is not None and not websocket.closed:
+            await websocket.close()
+
+        session = self._websocket_session
+        self._websocket_session = None
+        if session is not None and not session.closed:
+            await session.close()
+
+    async def close_websocket(self) -> None:
+        async with self._websocket_lock:
+            await self._close_websocket_locked()
+
+    async def ensure_websocket(
+        self, *, url: str, headers: dict[str, str]
+    ) -> aiohttp.ClientWebSocketResponse:
+        headers_signature = self._headers_signature(headers)
+        async with self._websocket_lock:
+            if (
+                self._websocket is not None
+                and not self._websocket.closed
+                and self._websocket_url == url
+                and self._websocket_headers_signature == headers_signature
+            ):
+                return self._websocket
+
+            await self._close_websocket_locked()
+
+            session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
+            websocket = await session.ws_connect(
+                url,
+                headers=headers,
+                heartbeat=None,
+                autoping=True,
+            )
+
+            self._websocket_session = session
+            self._websocket = websocket
+            self._websocket_url = url
+            self._websocket_headers_signature = headers_signature
+            self._websocket_ping_task = asyncio.create_task(self._run_websocket_ping())
+            self._websocket_timeout_task = asyncio.create_task(
+                self._run_websocket_timeout()
+            )
+
+            return websocket
+
+    async def close(self) -> None:
+        await self.close_websocket()
+
+    def copy(self) -> "OpenAIResponsesSessionContext":
+        return self.__class__(
+            messages=copy.deepcopy(self.messages),
+            system_role=self.system_role,
+            websocket_timeout=self._websocket_timeout,
+            websocket_ping_interval_seconds=self._websocket_ping_interval_seconds,
+        )
+
     @property
     def supports_images(self) -> bool:
         return True
@@ -82,6 +232,10 @@ class OpenAIResponsesChatContext(AgentChatContext):
         }
         self.messages.append(message)
         return message
+
+
+# Backwards compatibility for code still importing the old class name.
+OpenAIResponsesChatContext = OpenAIResponsesSessionContext
 
 
 def _is_html_mime_type(mime_type: str | None) -> bool:
@@ -346,7 +500,7 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
     async def create_messages(
         self,
         *,
-        context: AgentChatContext,
+        context: AgentSessionContext,
         tool_call: ResponseFunctionToolCall,
         room: RoomClient,
         response: Content,
@@ -477,6 +631,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
     _default_max_retries = 10
     _default_retry_backoff_seconds = 1.0
     _max_retry_backoff_seconds = 30.0
+    _default_websocket_timeout_seconds = 60 * 60
 
     def __init__(
         self,
@@ -489,9 +644,15 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         log_requests: bool = False,
         max_output_tokens: Optional[int] = 32000,
         max_retries: int = _default_max_retries,
+        mode: Literal["request", "websocket"] = "websocket",
+        websocket_timeout: float = _default_websocket_timeout_seconds,
     ):
         if max_retries < 0:
             raise ValueError("max_retries must be greater than or equal to 0")
+        if mode not in ("request", "websocket"):
+            raise ValueError("mode must be either 'request' or 'websocket'")
+        if websocket_timeout <= 0:
+            raise ValueError("websocket_timeout must be greater than 0")
         self._model = model
         self._parallel_tool_calls = parallel_tool_calls
         self._client = client
@@ -501,12 +662,17 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         self._log_requests = log_requests
         self.max_output_tokens = max_output_tokens
         self._max_retries = max_retries
+        self._mode = mode
+        self._websocket_timeout = websocket_timeout
 
     def default_model(self) -> str:
         return self._model
 
-    def create_chat_context(self):
-        context = OpenAIResponsesChatContext(system_role=None)
+    def create_session(self):
+        context = OpenAIResponsesSessionContext(
+            system_role=None,
+            websocket_timeout=self._websocket_timeout,
+        )
         return context
 
     def context_window_size(self, model: str) -> float:
@@ -516,7 +682,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                 return size
         return float("inf")
 
-    def needs_compaction(self, *, context: AgentChatContext) -> bool:
+    def needs_compaction(self, *, context: AgentSessionContext) -> bool:
         if self.max_output_tokens is None:
             return False
         usage = context.metadata.get("last_response_usage")
@@ -538,7 +704,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
     async def compact(
         self,
         *,
-        context: AgentChatContext,
+        context: AgentSessionContext,
         room: RoomClient,
         model: Optional[str] = None,
     ) -> None:
@@ -584,7 +750,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         return usage
 
     def _store_usage(
-        self, *, context: AgentChatContext, usage: object, model: str
+        self, *, context: AgentSessionContext, usage: object, model: str
     ) -> None:
         usage_dict = self._normalize_usage(usage)
         if usage_dict is None:
@@ -593,9 +759,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         context.metadata["last_response_model"] = model
 
     def _should_publish_stream_event(self, *, event: ResponseStreamEvent) -> bool:
-        event_type = getattr(event, "type", None)
-        if not isinstance(event_type, str):
-            return True
+        event_type = event.type
 
         # Prefer response.output_item.added/done for tool items because those carry
         # richer payload details. Suppress duplicate tool lifecycle stream events.
@@ -616,7 +780,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
     async def get_input_tokens(
         self,
         *,
-        context: AgentChatContext,
+        context: AgentSessionContext,
         model: str,
         room: Optional[RoomClient] = None,
         toolkits: Optional[list[Toolkit]] = None,
@@ -657,7 +821,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         return response.input_tokens
 
     async def check_for_termination(
-        self, *, context: AgentChatContext, room: RoomClient
+        self, *, context: AgentSessionContext, room: RoomClient
     ) -> bool:
         for message in context.messages:
             if message.get("type", "message") != "message":
@@ -760,16 +924,161 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                 )
                 await asyncio.sleep(delay_seconds)
 
+    @staticmethod
+    def _http_base_url_to_ws_responses_url(base_url: str) -> str:
+        parsed = urlparse(base_url)
+        if parsed.scheme == "https":
+            ws_scheme = "wss"
+        elif parsed.scheme == "http":
+            ws_scheme = "ws"
+        elif parsed.scheme in ("ws", "wss"):
+            ws_scheme = parsed.scheme
+        else:
+            raise RoomException(
+                f"unsupported OpenAI base URL scheme for websocket mode: {parsed.scheme}"
+            )
+
+        path = parsed.path.rstrip("/") + "/responses"
+        return urlunparse(
+            (
+                ws_scheme,
+                parsed.netloc,
+                path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment,
+            )
+        )
+
+    @staticmethod
+    def _coerce_response_stream_event(payload: dict) -> ResponseStreamEvent:
+        payload_type = payload.get("type")
+        if payload_type == "response.done":
+            payload = {**payload, "type": "response.completed"}
+
+        try:
+            event = construct_type(value=payload, type_=ResponseStreamEvent)
+        except Exception as error:
+            raise RoomException(
+                f"unable to parse websocket response event '{payload_type}': {error}"
+            ) from error
+        if not isinstance(event, BaseModel):
+            raise RoomException(
+                f"unable to parse websocket response event as ResponseStreamEvent: {payload_type}"
+            )
+        return cast(ResponseStreamEvent, event)
+
+    @staticmethod
+    def _build_websocket_request_payload(create_kwargs: dict) -> dict:
+        payload = {
+            "type": "response.create",
+        }
+        for key, value in create_kwargs.items():
+            if key in ("stream", "extra_headers", "background"):
+                continue
+            if value is NOT_GIVEN:
+                continue
+            payload[key] = value
+        return payload
+
+    def _websocket_headers(
+        self, *, openai: AsyncOpenAI, extra_headers: dict[str, str]
+    ) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        for key, value in openai.default_headers.items():
+            if isinstance(value, str):
+                headers[key] = value
+        headers.update(extra_headers)
+        headers.pop("Content-Type", None)
+        headers.pop("Content-Length", None)
+        return headers
+
+    async def _create_response_websocket_stream(
+        self,
+        *,
+        context: AgentSessionContext,
+        room: RoomClient,
+        openai: AsyncOpenAI,
+        create_kwargs: dict,
+        extra_headers: dict[str, str],
+    ) -> AsyncIterable[ResponseStreamEvent]:
+        if not isinstance(context, OpenAIResponsesSessionContext):
+            raise RoomException(
+                "websocket mode requires OpenAIResponsesSessionContext from create_session()"
+            )
+
+        websocket_url = self._http_base_url_to_ws_responses_url(str(openai.base_url))
+        websocket_headers = self._websocket_headers(
+            openai=openai,
+            extra_headers=extra_headers,
+        )
+        websocket = await context.ensure_websocket(
+            url=websocket_url,
+            headers=websocket_headers,
+        )
+
+        request_payload = self._build_websocket_request_payload(create_kwargs)
+        await websocket.send_str(json.dumps(request_payload))
+
+        async def event_stream():
+            while True:
+                msg = await websocket.receive()
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        payload = json.loads(msg.data)
+                    except json.JSONDecodeError as error:
+                        raise RoomException(
+                            f"OpenAI websocket returned invalid JSON: {error}"
+                        ) from error
+                    if not isinstance(payload, dict):
+                        continue
+
+                    payload_type = payload.get("type")
+                    if payload_type == "error":
+                        message = payload.get("message")
+                        if isinstance(message, str):
+                            raise RoomException(
+                                f"Error from OpenAI websocket: {message}"
+                            )
+                        raise RoomException(
+                            f"Error from OpenAI websocket: {json.dumps(payload)}"
+                        )
+
+                    event = self._coerce_response_stream_event(payload)
+                    yield event
+                    if event.type in (
+                        "response.completed",
+                        "response.failed",
+                        "response.incomplete",
+                    ):
+                        return
+
+                elif msg.type == aiohttp.WSMsgType.CLOSED:
+                    raise RoomException("OpenAI websocket closed unexpectedly")
+                elif msg.type == aiohttp.WSMsgType.CLOSE:
+                    raise RoomException("OpenAI websocket closed unexpectedly")
+                elif msg.type == aiohttp.WSMsgType.CLOSING:
+                    raise RoomException("OpenAI websocket is closing unexpectedly")
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    raise RoomException(
+                        f"OpenAI websocket error: {websocket.exception()}"
+                    )
+                elif msg.type == aiohttp.WSMsgType.BINARY:
+                    raise RoomException(
+                        "OpenAI websocket returned unexpected binary message"
+                    )
+
+        return event_stream()
+
     # Takes the current chat context, executes a completion request and processes the response.
     # If a tool calls are requested, invokes the tools, processes the tool calls results, and appends the tool call results to the context
     async def next(
         self,
         *,
         model: Optional[str] = None,
-        context: AgentChatContext,
+        context: AgentSessionContext,
         room: RoomClient,
         toolkits: list[Toolkit],
-        tool_adapter: Optional[ToolResponseAdapter] = None,
         output_schema: Optional[dict] = None,
         event_handler: Optional[Callable[[dict], None]] = None,
         on_behalf_of: Optional[RemoteParticipant] = None,
@@ -788,8 +1097,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         with tracer.start_as_current_span("llm.turn") as span:
             span.set_attributes({"chat_context": context.id, "api": "responses"})
 
-            if tool_adapter is None:
-                tool_adapter = OpenAIResponsesToolResponseAdapter()
+            tool_adapter = OpenAIResponsesToolResponseAdapter()
 
             try:
                 while True:
@@ -797,8 +1105,6 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                         span.set_attributes(
                             {"model": model, "provider": self._provider}
                         )
-
-                        openai: self.get_openai_client(room=room)
 
                         response_name = "response"
 
@@ -841,7 +1147,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                         if context.previous_response_id is not None:
                             previous_response_id = context.previous_response_id
 
-                        stream = event_handler is not None
+                        stream = self._mode == "websocket" or event_handler is not None
                         context_messages_snapshot = copy.deepcopy(context.messages)
                         context_previous_messages_snapshot = copy.deepcopy(
                             context.previous_messages
@@ -888,14 +1194,23 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                 "max_output_tokens": self.max_output_tokens,
                                 **response_options,
                             }
-                            response: Content = (
-                                await self._create_response_with_retries(
+                            if self._mode == "websocket":
+                                response: Content = (
+                                    await self._create_response_websocket_stream(
+                                        context=context,
+                                        room=room,
+                                        openai=openai,
+                                        create_kwargs=create_kwargs,
+                                        extra_headers=extra_headers,
+                                    )
+                                )
+                            else:
+                                response = await self._create_response_with_retries(
                                     openai=openai,
                                     create_kwargs=create_kwargs,
                                 )
-                            )
 
-                            if not stream:
+                            if self._mode == "request" and not stream:
                                 self._store_usage(
                                     context=context,
                                     usage=response.usage,
@@ -1304,8 +1619,11 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                         "event": safe_model_dump(event),
                                                     }
                                                 )
-                                                if self._should_publish_stream_event(
-                                                    event=event
+                                                if (
+                                                    self._should_publish_stream_event(
+                                                        event=event
+                                                    )
+                                                    and event_handler is not None
                                                 ):
                                                     event_handler(
                                                         event.model_dump(mode="json")
@@ -1444,12 +1762,19 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                         )
 
                                         await asyncio.sleep(delay_seconds)
-                                        response = (
-                                            await self._create_response_with_retries(
+                                        if self._mode == "websocket":
+                                            response = await self._create_response_websocket_stream(
+                                                context=context,
+                                                room=room,
+                                                openai=openai,
+                                                create_kwargs=create_kwargs,
+                                                extra_headers=extra_headers,
+                                            )
+                                        else:
+                                            response = await self._create_response_with_retries(
                                                 openai=openai,
                                                 create_kwargs=create_kwargs,
                                             )
-                                        )
 
             except APIError as e:
                 raise RoomException(f"Error from OpenAI: {e}")

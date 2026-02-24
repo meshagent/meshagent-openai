@@ -174,7 +174,7 @@ async def test_next_consumes_streaming_tool_events_and_uses_final_item_result():
             ]
         ),
     )
-    context = adapter.create_chat_context()
+    context = adapter.create_session()
     context.append_user_message("run tool")
     events: list[dict] = []
 

@@ -1,3 +1,4 @@
+import asyncio
 import httpx
 import pytest
 from openai import APIError
@@ -6,6 +7,7 @@ from meshagent.api import RoomException
 from meshagent.api.messaging import JsonContent, TextContent
 from meshagent.openai.tools.responses_adapter import (
     OpenAIResponsesAdapter,
+    OpenAIResponsesSessionContext,
     _consume_streaming_tool_result,
 )
 
@@ -109,6 +111,34 @@ class _FakeOpenAIClient:
         self.responses = _FakeResponsesClient(outcomes=outcomes)
 
 
+class _FakeWebSocket:
+    def __init__(self):
+        self.closed = False
+        self.pings = 0
+
+    async def ping(self):
+        self.pings += 1
+
+    async def close(self):
+        self.closed = True
+
+
+class _FakeClientSession:
+    def __init__(self, websocket: _FakeWebSocket):
+        self._websocket = websocket
+        self.closed = False
+        self.connect_calls = 0
+
+    async def ws_connect(self, *args, **kwargs):
+        del args
+        del kwargs
+        self.connect_calls += 1
+        return self._websocket
+
+    async def close(self):
+        self.closed = True
+
+
 class _ToolItemStream:
     def __init__(self, *, items: list[object]):
         self._items = items
@@ -124,6 +154,87 @@ class _ToolItemStream:
 def _make_api_error(message: str) -> APIError:
     request = httpx.Request("POST", "https://api.openai.com/v1/responses")
     return APIError(message, request=request, body=None)
+
+
+@pytest.mark.asyncio
+async def test_create_session_returns_openai_responses_session_context():
+    adapter = OpenAIResponsesAdapter()
+    context = adapter.create_session()
+    assert isinstance(context, OpenAIResponsesSessionContext)
+
+
+@pytest.mark.asyncio
+async def test_next_uses_websocket_path_when_mode_is_websocket(monkeypatch):
+    adapter = OpenAIResponsesAdapter(
+        mode="websocket",
+        client=_FakeOpenAIClient(outcomes=[]),
+    )
+    context = adapter.create_session()
+    context.append_user_message("hello")
+
+    call_count = {"count": 0}
+
+    async def _fake_create_response_websocket_stream(**kwargs):
+        del kwargs
+        call_count["count"] += 1
+        return _CompletedStream(
+            event=_FakeCompletedEvent(response=_FakeResponse(response_id="resp_ws"))
+        )
+
+    monkeypatch.setattr(
+        adapter,
+        "_create_response_websocket_stream",
+        _fake_create_response_websocket_stream,
+    )
+
+    result = await adapter.next(
+        context=context,
+        room=_FakeRoom(),
+        toolkits=[],
+    )
+
+    assert result == ""
+    assert call_count["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_session_context_reuses_websocket_and_closes_after_timeout(monkeypatch):
+    fake_websocket = _FakeWebSocket()
+    fake_session = _FakeClientSession(fake_websocket)
+
+    def _fake_client_session(*args, **kwargs):
+        del args
+        del kwargs
+        return fake_session
+
+    monkeypatch.setattr(
+        "meshagent.openai.tools.responses_adapter.aiohttp.ClientSession",
+        _fake_client_session,
+    )
+
+    context = OpenAIResponsesSessionContext(
+        system_role=None,
+        websocket_timeout=0.05,
+        websocket_ping_interval_seconds=0.01,
+    )
+
+    ws1 = await context.ensure_websocket(
+        url="ws://localhost:8080/openai/v1/responses",
+        headers={"Authorization": "Bearer test-token"},
+    )
+    ws2 = await context.ensure_websocket(
+        url="ws://localhost:8080/openai/v1/responses",
+        headers={"Authorization": "Bearer test-token"},
+    )
+
+    assert ws1 is ws2
+    assert fake_session.connect_calls == 1
+
+    await asyncio.sleep(0.08)
+
+    assert fake_websocket.closed is True
+    assert fake_session.closed is True
+    assert fake_websocket.pings > 0
 
 
 @pytest.mark.asyncio
@@ -195,7 +306,7 @@ async def test_next_retries_after_openai_api_error(monkeypatch):
     )
 
     adapter = OpenAIResponsesAdapter(client=client, max_retries=3)
-    context = adapter.create_chat_context()
+    context = adapter.create_session()
     context.append_user_message("hello")
 
     result = await adapter.next(
@@ -233,7 +344,7 @@ async def test_next_retries_after_stream_iterator_api_error(monkeypatch):
     )
 
     adapter = OpenAIResponsesAdapter(client=client, max_retries=3)
-    context = adapter.create_chat_context()
+    context = adapter.create_session()
     context.append_user_message("hello")
     stream_events: list[dict] = []
 
@@ -270,7 +381,7 @@ async def test_next_raises_after_retry_budget_is_exhausted(monkeypatch):
     )
 
     adapter = OpenAIResponsesAdapter(client=client, max_retries=1)
-    context = adapter.create_chat_context()
+    context = adapter.create_session()
     context.append_user_message("hello")
 
     with pytest.raises(RoomException, match="Error from OpenAI"):

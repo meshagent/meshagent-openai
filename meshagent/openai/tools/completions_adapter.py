@@ -1,4 +1,4 @@
-from meshagent.agents.agent import AgentChatContext
+from meshagent.agents.agent import AgentSessionContext
 from meshagent.api import RoomClient, RoomException, RemoteParticipant
 from meshagent.tools import Toolkit, ToolContext
 from meshagent.api.messaging import (
@@ -225,7 +225,7 @@ class OpenAICompletionsToolResponseAdapter(ToolResponseAdapter):
     async def create_messages(
         self,
         *,
-        context: AgentChatContext,
+        context: AgentSessionContext,
         tool_call: Any,
         room: RoomClient,
         response: Content,
@@ -260,7 +260,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
         self._parallel_tool_calls = parallel_tool_calls
         self._client = client
 
-    def create_chat_context(self):
+    def create_session(self):
         system_role = "system"
         if self._model.startswith("o1"):
             system_role = "developer"
@@ -269,7 +269,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
         elif self._model.startswith("o4"):
             system_role = "developer"
 
-        context = AgentChatContext(system_role=system_role)
+        context = AgentSessionContext(system_role=system_role)
 
         return context
 
@@ -279,16 +279,14 @@ class OpenAICompletionsAdapter(LLMAdapter):
         self,
         *,
         model: Optional[str] = None,
-        context: AgentChatContext,
+        context: AgentSessionContext,
         room: RoomClient,
         toolkits: Toolkit,
-        tool_adapter: Optional[ToolResponseAdapter] = None,
         output_schema: Optional[dict] = None,
         event_handler: Optional[Callable[[dict], None]] = None,
         on_behalf_of: Optional[RemoteParticipant] = None,
     ):
-        if tool_adapter is None:
-            tool_adapter = OpenAICompletionsToolResponseAdapter()
+        tool_adapter = OpenAICompletionsToolResponseAdapter()
 
         try:
             openai = self._client if self._client is not None else get_client(room=room)
