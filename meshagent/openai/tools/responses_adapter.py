@@ -1082,6 +1082,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         output_schema: Optional[dict] = None,
         event_handler: Optional[Callable[[dict], None]] = None,
         on_behalf_of: Optional[RemoteParticipant] = None,
+        options: Optional[dict] = None,
     ):
         if model is None:
             model = self.default_model()
@@ -1193,6 +1194,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                 "instructions": instructions or NOT_GIVEN,
                                 "max_output_tokens": self.max_output_tokens,
                                 **response_options,
+                                **(options or {}),
                             }
                             if self._mode == "websocket":
                                 response: Content = (

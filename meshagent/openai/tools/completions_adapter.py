@@ -285,6 +285,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
         output_schema: Optional[dict] = None,
         event_handler: Optional[Callable[[dict], None]] = None,
         on_behalf_of: Optional[RemoteParticipant] = None,
+        options: Optional[dict] = None,
     ):
         tool_adapter = OpenAICompletionsToolResponseAdapter()
 
