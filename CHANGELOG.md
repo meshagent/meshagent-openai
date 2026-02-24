@@ -1,3 +1,6 @@
+## [0.28.1]
+- Stability
+
 ## [0.28.0]
 - BREAKING: AgentChatContext was replaced by AgentSessionContext; create_chat_context/init_chat_context moved to create_session/init_session, TaskContext and ChatThreadContext now expose .session, and LLMAdapter.next no longer accepts a tool_adapter argument.
 - BREAKING: The PromptAgent helper was removed from the Python agents package.
