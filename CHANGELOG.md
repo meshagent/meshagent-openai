@@ -1,3 +1,12 @@
+## [0.28.0]
+- BREAKING: AgentChatContext was replaced by AgentSessionContext; create_chat_context/init_chat_context moved to create_session/init_session, TaskContext and ChatThreadContext now expose .session, and LLMAdapter.next no longer accepts a tool_adapter argument.
+- BREAKING: The PromptAgent helper was removed from the Python agents package.
+- Deprecated init_chat_context in favor of init_session, emitting DeprecationWarning for legacy overrides.
+- Added async session lifecycle management (start/close) and async context manager support for sessions, task contexts, and thread adapters for safer cleanup.
+- Added OpenAI Responses websocket mode (default) with persistent sockets, configurable ping/timeout, and a new OpenAIResponsesSessionContext (old class name kept as an alias).
+- Added tool-call stream close status codes and InvalidToolDataException; invalid tool data closes with status 1007 and abnormal closes surface as errors.
+- Added thread status modes and steering: thread status now includes text + mode, "steer" messages are supported via on_thread_steer, and Codex can steer active turns with cancellable tasks.
+
 ## [0.27.2]
 - Stability
 
