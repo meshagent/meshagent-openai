@@ -46,6 +46,34 @@ from urllib.parse import urlparse, urlunparse
 
 logger = logging.getLogger("openai_agent")
 tracer = trace.get_tracer("openai.llm.responses")
+_MAX_LOGGED_WEBSOCKET_PAYLOAD_CHARS = 128000
+
+
+def _redact_log_headers(headers: dict[str, str]) -> dict[str, str]:
+    redacted: dict[str, str] = {}
+    for key, value in headers.items():
+        if key.lower() in {"authorization", "x-api-key"}:
+            redacted[key] = "***REDACTED***"
+        else:
+            redacted[key] = value
+    return redacted
+
+
+def _truncate_log_payload(payload: str) -> str:
+    if len(payload) <= _MAX_LOGGED_WEBSOCKET_PAYLOAD_CHARS:
+        return payload
+    return (
+        payload[:_MAX_LOGGED_WEBSOCKET_PAYLOAD_CHARS]
+        + f"\n... (truncated, {len(payload)} chars total)"
+    )
+
+
+def _safe_json_for_log(payload: Any) -> str:
+    try:
+        serialized = json.dumps(payload, ensure_ascii=False)
+    except Exception:
+        serialized = str(payload)
+    return _truncate_log_payload(serialized)
 
 
 class OpenAIResponsesSessionContext(AgentSessionContext):
@@ -1018,6 +1046,13 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         )
 
         request_payload = self._build_websocket_request_payload(create_kwargs)
+        if self._log_requests:
+            logger.info("==> WS %s", websocket_url)
+            logger.info(
+                "headers=%s",
+                json.dumps(_redact_log_headers(websocket_headers), indent=2),
+            )
+            logger.info("body=%s", _safe_json_for_log(request_payload))
         await websocket.send_str(json.dumps(request_payload))
 
         async def event_stream():
@@ -1034,6 +1069,9 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                         continue
 
                     payload_type = payload.get("type")
+                    if self._log_requests:
+                        logger.info("<== WS event=%s", payload_type)
+                        logger.info("body=%s", _safe_json_for_log(payload))
                     if payload_type == "error":
                         message = payload.get("message")
                         if isinstance(message, str):

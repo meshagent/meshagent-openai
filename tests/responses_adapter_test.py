@@ -1,6 +1,9 @@
 import asyncio
 import httpx
+import logging
+import aiohttp
 import pytest
+from types import SimpleNamespace
 from openai import APIError
 
 from meshagent.api import RoomException
@@ -123,6 +126,33 @@ class _FakeWebSocket:
         self.closed = True
 
 
+class _FakeLoggingWsMessage:
+    def __init__(self, *, type: aiohttp.WSMsgType, data: str):
+        self.type = type
+        self.data = data
+
+
+class _FakeLoggingWebSocket:
+    def __init__(self, *, messages: list[_FakeLoggingWsMessage]):
+        self._messages = messages.copy()
+        self.sent_payloads: list[str] = []
+        self.closed = False
+
+    async def send_str(self, payload: str):
+        self.sent_payloads.append(payload)
+
+    async def receive(self):
+        if len(self._messages) == 0:
+            raise AssertionError("no websocket messages configured")
+        return self._messages.pop(0)
+
+    async def close(self):
+        self.closed = True
+
+    def exception(self):
+        return None
+
+
 class _FakeClientSession:
     def __init__(self, websocket: _FakeWebSocket):
         self._websocket = websocket
@@ -195,6 +225,75 @@ async def test_next_uses_websocket_path_when_mode_is_websocket(monkeypatch):
 
     assert result == ""
     assert call_count["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_websocket_mode_logs_request_and_response_payload_when_enabled(
+    monkeypatch, caplog
+):
+    adapter = OpenAIResponsesAdapter(mode="websocket", log_requests=True)
+    context = adapter.create_session()
+
+    websocket = _FakeLoggingWebSocket(
+        messages=[
+            _FakeLoggingWsMessage(
+                type=aiohttp.WSMsgType.TEXT,
+                data='{"type":"response.completed"}',
+            )
+        ]
+    )
+
+    async def _fake_ensure_websocket(*, url: str, headers: dict[str, str]):
+        del url
+        del headers
+        return websocket
+
+    monkeypatch.setattr(
+        context,
+        "ensure_websocket",
+        _fake_ensure_websocket,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_coerce_response_stream_event",
+        lambda payload: _FakeCompletedEvent(
+            response=_FakeResponse(response_id="resp_ws")
+        ),
+    )
+
+    caplog.set_level(logging.INFO, logger="openai_agent")
+
+    stream = await adapter._create_response_websocket_stream(
+        context=context,
+        room=_FakeRoom(),
+        openai=SimpleNamespace(
+            base_url="https://example.com/openai/v1",
+            default_headers={"Authorization": "Bearer test-token"},
+        ),
+        create_kwargs={
+            "stream": True,
+            "model": "gpt-5.2",
+            "input": [{"role": "user", "content": "hello"}],
+        },
+        extra_headers={},
+    )
+
+    events = [event async for event in stream]
+
+    assert len(events) == 1
+    assert events[0].type == "response.completed"
+    assert len(websocket.sent_payloads) == 1
+
+    logged_messages = [record.message for record in caplog.records]
+    assert any(message.startswith("==> WS ") for message in logged_messages)
+    assert any(
+        "headers=" in message and "***REDACTED***" in message
+        for message in logged_messages
+    )
+    assert any(
+        message.startswith("<== WS event=response.completed")
+        for message in logged_messages
+    )
 
 
 @pytest.mark.asyncio
@@ -305,7 +404,7 @@ async def test_next_retries_after_openai_api_error(monkeypatch):
         ]
     )
 
-    adapter = OpenAIResponsesAdapter(client=client, max_retries=3)
+    adapter = OpenAIResponsesAdapter(client=client, max_retries=3, mode="request")
     context = adapter.create_session()
     context.append_user_message("hello")
 
@@ -343,7 +442,7 @@ async def test_next_retries_after_stream_iterator_api_error(monkeypatch):
         ]
     )
 
-    adapter = OpenAIResponsesAdapter(client=client, max_retries=3)
+    adapter = OpenAIResponsesAdapter(client=client, max_retries=3, mode="request")
     context = adapter.create_session()
     context.append_user_message("hello")
     stream_events: list[dict] = []
@@ -380,7 +479,7 @@ async def test_next_raises_after_retry_budget_is_exhausted(monkeypatch):
         ]
     )
 
-    adapter = OpenAIResponsesAdapter(client=client, max_retries=1)
+    adapter = OpenAIResponsesAdapter(client=client, max_retries=1, mode="request")
     context = adapter.create_session()
     context.append_user_message("hello")
 
