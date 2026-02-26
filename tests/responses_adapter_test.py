@@ -97,9 +97,10 @@ class _FakeResponsesClient:
     def __init__(self, *, outcomes: list[object]):
         self._outcomes = outcomes.copy()
         self.calls = 0
+        self.create_kwargs: list[dict] = []
 
     async def create(self, **kwargs):
-        del kwargs
+        self.create_kwargs.append(kwargs)
         self.calls += 1
         if len(self._outcomes) == 0:
             raise AssertionError("no responses.create outcomes configured")
@@ -193,6 +194,19 @@ async def test_create_session_returns_openai_responses_session_context():
     assert isinstance(context, OpenAIResponsesSessionContext)
 
 
+def test_constructor_rejects_invalid_compaction_threshold():
+    with pytest.raises(ValueError, match="compaction_threshold must be greater than 0"):
+        OpenAIResponsesAdapter(compaction_threshold=0)
+
+
+def test_constructor_rejects_invalid_context_management_mode():
+    with pytest.raises(
+        ValueError,
+        match="context_management must be one of 'auto', 'standalone', or 'none'",
+    ):
+        OpenAIResponsesAdapter(context_management="invalid")
+
+
 @pytest.mark.asyncio
 async def test_next_uses_websocket_path_when_mode_is_websocket(monkeypatch):
     adapter = OpenAIResponsesAdapter(
@@ -225,6 +239,167 @@ async def test_next_uses_websocket_path_when_mode_is_websocket(monkeypatch):
 
     assert result == ""
     assert call_count["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_next_uses_auto_compaction_context_management_when_compact_threshold_set(
+    monkeypatch,
+):
+    client = _FakeOpenAIClient(outcomes=[_FakeResponse(response_id="resp_auto")])
+    adapter = OpenAIResponsesAdapter(
+        client=client,
+        mode="request",
+        compact_threshold=10000,
+        max_output_tokens=500,
+    )
+    context = adapter.create_session()
+    context.append_user_message("hello")
+    context.metadata["last_response_usage"] = {
+        "input_tokens": 200000,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens": 1000,
+    }
+    context.metadata["last_response_model"] = "gpt-5.2"
+
+    async def _fail_compact(**kwargs):
+        del kwargs
+        raise AssertionError(
+            "manual compact should not run when compact_threshold is set"
+        )
+
+    monkeypatch.setattr(adapter, "compact", _fail_compact)
+
+    result = await adapter.next(
+        context=context,
+        room=_FakeRoom(),
+        toolkits=[],
+    )
+
+    assert result == ""
+    assert len(client.responses.create_kwargs) == 1
+    create_kwargs = client.responses.create_kwargs[0]
+    assert create_kwargs["context_management"] == [
+        {"type": "compaction", "compact_threshold": 10000}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_next_uses_auto_compaction_by_default(monkeypatch):
+    client = _FakeOpenAIClient(
+        outcomes=[_FakeResponse(response_id="resp_auto_default")]
+    )
+    adapter = OpenAIResponsesAdapter(
+        client=client,
+        mode="request",
+        max_output_tokens=500,
+    )
+    context = adapter.create_session()
+    context.append_user_message("hello")
+    context.metadata["last_response_usage"] = {
+        "input_tokens": 200000,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens": 1000,
+    }
+    context.metadata["last_response_model"] = "gpt-5.2"
+
+    async def _fail_compact(**kwargs):
+        del kwargs
+        raise AssertionError(
+            "manual compact should not run with default auto compaction"
+        )
+
+    monkeypatch.setattr(adapter, "compact", _fail_compact)
+
+    result = await adapter.next(
+        context=context,
+        room=_FakeRoom(),
+        toolkits=[],
+    )
+
+    assert result == ""
+    assert len(client.responses.create_kwargs) == 1
+    create_kwargs = client.responses.create_kwargs[0]
+    assert create_kwargs["context_management"] == [
+        {"type": "compaction", "compact_threshold": 200000}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_next_uses_manual_compaction_in_standalone_mode(monkeypatch):
+    client = _FakeOpenAIClient(
+        outcomes=[_FakeResponse(response_id="resp_standalone_compaction")]
+    )
+    adapter = OpenAIResponsesAdapter(
+        client=client,
+        mode="request",
+        context_management="standalone",
+    )
+    context = adapter.create_session()
+    context.append_user_message("hello")
+    context.metadata["last_response_usage"] = {
+        "input_tokens": 300000,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens": 1000,
+    }
+    context.metadata["last_response_model"] = "gpt-5.2"
+    compact_call_count = {"count": 0}
+
+    async def _fake_compact(**kwargs):
+        del kwargs
+        compact_call_count["count"] += 1
+
+    monkeypatch.setattr(adapter, "compact", _fake_compact)
+
+    result = await adapter.next(
+        context=context,
+        room=_FakeRoom(),
+        toolkits=[],
+    )
+
+    assert result == ""
+    assert compact_call_count["count"] == 1
+    assert len(client.responses.create_kwargs) == 1
+    create_kwargs = client.responses.create_kwargs[0]
+    assert "context_management" not in create_kwargs
+
+
+@pytest.mark.asyncio
+async def test_next_disables_compaction_when_context_management_none(monkeypatch):
+    client = _FakeOpenAIClient(
+        outcomes=[_FakeResponse(response_id="resp_no_compaction")]
+    )
+    adapter = OpenAIResponsesAdapter(
+        client=client,
+        mode="request",
+        context_management="none",
+    )
+    context = adapter.create_session()
+    context.append_user_message("hello")
+    context.metadata["last_response_usage"] = {
+        "input_tokens": 300000,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens": 1000,
+    }
+    context.metadata["last_response_model"] = "gpt-5.2"
+
+    async def _fail_compact(**kwargs):
+        del kwargs
+        raise AssertionError(
+            "compact should not be called when context_management=none"
+        )
+
+    monkeypatch.setattr(adapter, "compact", _fail_compact)
+
+    result = await adapter.next(
+        context=context,
+        room=_FakeRoom(),
+        toolkits=[],
+    )
+
+    assert result == ""
+    assert len(client.responses.create_kwargs) == 1
+    create_kwargs = client.responses.create_kwargs[0]
+    assert "context_management" not in create_kwargs
 
 
 @pytest.mark.asyncio

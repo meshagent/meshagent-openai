@@ -674,6 +674,9 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         max_retries: int = _default_max_retries,
         mode: Literal["request", "websocket"] = "websocket",
         websocket_timeout: float = _default_websocket_timeout_seconds,
+        context_management: Literal["auto", "standalone", "none"] = "auto",
+        compaction_threshold: int = 200000,
+        compact_threshold: Optional[int] = None,
     ):
         if max_retries < 0:
             raise ValueError("max_retries must be greater than or equal to 0")
@@ -681,6 +684,17 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
             raise ValueError("mode must be either 'request' or 'websocket'")
         if websocket_timeout <= 0:
             raise ValueError("websocket_timeout must be greater than 0")
+        if context_management not in ("auto", "standalone", "none"):
+            raise ValueError(
+                "context_management must be one of 'auto', 'standalone', or 'none'"
+            )
+        if compaction_threshold <= 0:
+            raise ValueError("compaction_threshold must be greater than 0")
+        if compact_threshold is not None and compact_threshold <= 0:
+            raise ValueError("compact_threshold must be greater than 0")
+        resolved_compaction_threshold = (
+            compact_threshold if compact_threshold is not None else compaction_threshold
+        )
         self._model = model
         self._parallel_tool_calls = parallel_tool_calls
         self._client = client
@@ -689,6 +703,8 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         self._reasoning_effort = reasoning_effort
         self._log_requests = log_requests
         self.max_output_tokens = max_output_tokens
+        self._context_management_mode = context_management
+        self._compaction_threshold = resolved_compaction_threshold
         self._max_retries = max_retries
         self._mode = mode
         self._websocket_timeout = websocket_timeout
@@ -711,23 +727,65 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         return float("inf")
 
     def needs_compaction(self, *, context: AgentSessionContext) -> bool:
-        if self.max_output_tokens is None:
+        if self._context_management_mode != "standalone":
             return False
         usage = context.metadata.get("last_response_usage")
         if not usage:
             return False
+
+        threshold = self._compaction_threshold
         model = context.metadata.get("last_response_model", self.default_model())
         context_window = self.context_window_size(model)
-        if context_window == float("inf"):
-            return False
+        if context_window != float("inf") and self.max_output_tokens is not None:
+            usable = int(context_window - self.max_output_tokens)
+            if usable <= 0:
+                return True
+            threshold = min(threshold, usable)
+
         input_tokens = int(usage.get("input_tokens", 0) or 0)
         cached_tokens = int(
             usage.get("input_tokens_details", {}).get("cached_tokens", 0) or 0
         )
         output_tokens = int(usage.get("output_tokens", 0) or 0)
         total = input_tokens + cached_tokens + output_tokens
-        usable = context_window - self.max_output_tokens
-        return total > usable
+        return total > threshold
+
+    def _add_auto_compaction_entry(self, *, create_kwargs: dict[str, Any]) -> None:
+        if self._context_management_mode != "auto":
+            return
+
+        context_management = create_kwargs.get("context_management")
+        compaction_entry: dict[str, Any] = {
+            "type": "compaction",
+            "compact_threshold": self._compaction_threshold,
+        }
+
+        if context_management in (None, NOT_GIVEN):
+            create_kwargs["context_management"] = [compaction_entry]
+            return
+
+        if isinstance(context_management, list):
+            context_management_entries = [*context_management]
+        else:
+            context_management_entries = list(context_management)
+
+        has_compaction_entry = False
+        normalized_entries = list[Any]()
+        for entry in context_management_entries:
+            if isinstance(entry, dict) and entry.get("type") == "compaction":
+                normalized_entry = {
+                    **entry,
+                    "compact_threshold": self._compaction_threshold,
+                }
+                normalized_entries.append(normalized_entry)
+                has_compaction_entry = True
+            else:
+                normalized_entries.append(entry)
+
+        if not has_compaction_entry:
+            normalized_entries.append(compaction_entry)
+
+        create_kwargs["context_management"] = normalized_entries
 
     async def compact(
         self,
@@ -1234,6 +1292,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                 **response_options,
                                 **(options or {}),
                             }
+                            self._add_auto_compaction_entry(create_kwargs=create_kwargs)
                             if self._mode == "websocket":
                                 response: Content = (
                                     await self._create_response_websocket_stream(
