@@ -38,6 +38,7 @@ import logging
 import re
 import asyncio
 import aiohttp
+import math
 from pydantic import BaseModel
 import copy
 from opentelemetry import trace
@@ -675,8 +676,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         mode: Literal["request", "websocket"] = "websocket",
         websocket_timeout: float = _default_websocket_timeout_seconds,
         context_management: Literal["auto", "standalone", "none"] = "auto",
-        compaction_threshold: int = 200000,
-        compact_threshold: Optional[int] = None,
+        compaction_threshold: Optional[int | float] = None,
     ):
         if max_retries < 0:
             raise ValueError("max_retries must be greater than or equal to 0")
@@ -688,13 +688,28 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
             raise ValueError(
                 "context_management must be one of 'auto', 'standalone', or 'none'"
             )
-        if compaction_threshold <= 0:
-            raise ValueError("compaction_threshold must be greater than 0")
-        if compact_threshold is not None and compact_threshold <= 0:
-            raise ValueError("compact_threshold must be greater than 0")
-        resolved_compaction_threshold = (
-            compact_threshold if compact_threshold is not None else compaction_threshold
-        )
+        if compaction_threshold is not None and isinstance(compaction_threshold, bool):
+            raise ValueError("compaction_threshold must be an integer or infinity")
+        resolved_compaction_threshold: Optional[int] = None
+        if compaction_threshold is None:
+            if self.context_window_size(model) != float("inf"):
+                resolved_compaction_threshold = 200000
+        elif isinstance(compaction_threshold, float) and math.isinf(
+            compaction_threshold
+        ):
+            if compaction_threshold < 0:
+                raise ValueError("compaction_threshold must be positive infinity")
+            resolved_compaction_threshold = None
+        else:
+            if isinstance(compaction_threshold, float):
+                if not compaction_threshold.is_integer():
+                    raise ValueError(
+                        "compaction_threshold must be an integer or infinity"
+                    )
+                compaction_threshold = int(compaction_threshold)
+            if compaction_threshold <= 0:
+                raise ValueError("compaction_threshold must be greater than 0")
+            resolved_compaction_threshold = int(compaction_threshold)
         self._model = model
         self._parallel_tool_calls = parallel_tool_calls
         self._client = client
@@ -729,6 +744,8 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
     def needs_compaction(self, *, context: AgentSessionContext) -> bool:
         if self._context_management_mode != "standalone":
             return False
+        if self._compaction_threshold is None:
+            return False
         usage = context.metadata.get("last_response_usage")
         if not usage:
             return False
@@ -750,8 +767,27 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         total = input_tokens + cached_tokens + output_tokens
         return total > threshold
 
+    def _create_kwargs_has_computer_use_preview_tool(
+        self, *, create_kwargs: dict[str, Any]
+    ) -> bool:
+        tools = create_kwargs.get("tools")
+        if tools in (None, NOT_GIVEN):
+            return False
+        if not isinstance(tools, list):
+            return False
+        for tool in tools:
+            if isinstance(tool, dict) and tool.get("type") == "computer_use_preview":
+                return True
+        return False
+
     def _add_auto_compaction_entry(self, *, create_kwargs: dict[str, Any]) -> None:
         if self._context_management_mode != "auto":
+            return
+        if self._compaction_threshold is None:
+            return
+        if self._create_kwargs_has_computer_use_preview_tool(
+            create_kwargs=create_kwargs
+        ):
             return
 
         context_management = create_kwargs.get("context_management")

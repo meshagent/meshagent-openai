@@ -199,6 +199,11 @@ def test_constructor_rejects_invalid_compaction_threshold():
         OpenAIResponsesAdapter(compaction_threshold=0)
 
 
+def test_constructor_disables_compaction_when_threshold_is_infinity():
+    adapter = OpenAIResponsesAdapter(compaction_threshold=float("inf"))
+    assert adapter._compaction_threshold is None
+
+
 def test_constructor_rejects_invalid_context_management_mode():
     with pytest.raises(
         ValueError,
@@ -242,14 +247,14 @@ async def test_next_uses_websocket_path_when_mode_is_websocket(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_next_uses_auto_compaction_context_management_when_compact_threshold_set(
+async def test_next_uses_auto_compaction_context_management_when_compaction_threshold_set(
     monkeypatch,
 ):
     client = _FakeOpenAIClient(outcomes=[_FakeResponse(response_id="resp_auto")])
     adapter = OpenAIResponsesAdapter(
         client=client,
         mode="request",
-        compact_threshold=10000,
+        compaction_threshold=10000,
         max_output_tokens=500,
     )
     context = adapter.create_session()
@@ -264,7 +269,7 @@ async def test_next_uses_auto_compaction_context_management_when_compact_thresho
     async def _fail_compact(**kwargs):
         del kwargs
         raise AssertionError(
-            "manual compact should not run when compact_threshold is set"
+            "manual compact should not run when compaction_threshold is set"
         )
 
     monkeypatch.setattr(adapter, "compact", _fail_compact)
@@ -281,6 +286,98 @@ async def test_next_uses_auto_compaction_context_management_when_compact_thresho
     assert create_kwargs["context_management"] == [
         {"type": "compaction", "compact_threshold": 10000}
     ]
+
+
+@pytest.mark.asyncio
+async def test_next_disables_auto_compaction_by_default_for_unknown_model(monkeypatch):
+    client = _FakeOpenAIClient(
+        outcomes=[_FakeResponse(response_id="resp_unknown_model")]
+    )
+    adapter = OpenAIResponsesAdapter(
+        client=client,
+        mode="request",
+        model="computer-use-preview",
+        max_output_tokens=500,
+    )
+    context = adapter.create_session()
+    context.append_user_message("hello")
+    context.metadata["last_response_usage"] = {
+        "input_tokens": 200000,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens": 1000,
+    }
+    context.metadata["last_response_model"] = "computer-use-preview"
+
+    async def _fail_compact(**kwargs):
+        del kwargs
+        raise AssertionError(
+            "manual compact should not run when auto compaction is disabled"
+        )
+
+    monkeypatch.setattr(adapter, "compact", _fail_compact)
+
+    result = await adapter.next(
+        context=context,
+        room=_FakeRoom(),
+        toolkits=[],
+    )
+
+    assert result == ""
+    assert len(client.responses.create_kwargs) == 1
+    create_kwargs = client.responses.create_kwargs[0]
+    assert "context_management" not in create_kwargs
+
+
+@pytest.mark.asyncio
+async def test_next_disables_auto_compaction_when_computer_use_tool_present(
+    monkeypatch,
+):
+    client = _FakeOpenAIClient(
+        outcomes=[_FakeResponse(response_id="resp_computer_use_tool")]
+    )
+    adapter = OpenAIResponsesAdapter(
+        client=client,
+        mode="request",
+        model="gpt-5.2",
+        compaction_threshold=10000,
+        max_output_tokens=500,
+    )
+    context = adapter.create_session()
+    context.append_user_message("hello")
+
+    async def _fail_compact(**kwargs):
+        del kwargs
+        raise AssertionError(
+            "manual compact should not run when auto compaction is disabled"
+        )
+
+    monkeypatch.setattr(adapter, "compact", _fail_compact)
+
+    from meshagent.openai.tools import responses_adapter as responses_adapter_module
+
+    monkeypatch.setattr(
+        responses_adapter_module.ResponsesToolBundle,
+        "to_json",
+        lambda self: [  # noqa: ARG005
+            {
+                "type": "computer_use_preview",
+                "display_width": 1024,
+                "display_height": 768,
+                "environment": "browser",
+            }
+        ],
+    )
+
+    result = await adapter.next(
+        context=context,
+        room=_FakeRoom(),
+        toolkits=[],
+    )
+
+    assert result == ""
+    assert len(client.responses.create_kwargs) == 1
+    create_kwargs = client.responses.create_kwargs[0]
+    assert "context_management" not in create_kwargs
 
 
 @pytest.mark.asyncio
