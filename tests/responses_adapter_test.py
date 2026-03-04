@@ -3,8 +3,11 @@ import httpx
 import logging
 import aiohttp
 import pytest
+from aiohttp.client_reqrep import RequestInfo
+from multidict import CIMultiDict, CIMultiDictProxy
 from types import SimpleNamespace
 from openai import APIError
+from yarl import URL
 
 from meshagent.api import RoomException
 from meshagent.api.messaging import JsonContent, TextContent
@@ -38,10 +41,10 @@ class _FakeRoom:
 
 
 class _FakeResponse:
-    def __init__(self, *, response_id: str):
+    def __init__(self, *, response_id: str, usage: dict | None = None):
         self.id = response_id
         self.output = []
-        self.usage = None
+        self.usage = usage
 
     def to_dict(self) -> dict:
         return {"id": self.id, "output": []}
@@ -170,6 +173,51 @@ class _FakeClientSession:
         self.closed = True
 
 
+class _FailingHandshakeClientSession:
+    def __init__(self, *, error: aiohttp.WSServerHandshakeError):
+        self._error = error
+        self.closed = False
+
+    async def ws_connect(self, *args, **kwargs):
+        del args, kwargs
+        raise self._error
+
+    async def close(self):
+        self.closed = True
+
+
+class _FailingConnectClientSession:
+    def __init__(self):
+        self.closed = False
+
+    async def ws_connect(self, *args, **kwargs):
+        del args
+        del kwargs
+        raise RuntimeError("ws connect failed")
+
+    async def close(self):
+        self.closed = True
+
+
+def _make_ws_handshake_error(
+    *, status: int, headers: dict[str, str] | None = None
+) -> aiohttp.WSServerHandshakeError:
+    request_headers = CIMultiDictProxy(CIMultiDict())
+    url = URL("ws://localhost:8080/openai/v1/responses")
+    return aiohttp.WSServerHandshakeError(
+        request_info=RequestInfo(
+            url=url,
+            method="GET",
+            headers=request_headers,
+            real_url=url,
+        ),
+        history=(),
+        status=status,
+        message="Invalid response status",
+        headers=CIMultiDictProxy(CIMultiDict(headers or {})),
+    )
+
+
 class _ToolItemStream:
     def __init__(self, *, items: list[object]):
         self._items = items
@@ -192,6 +240,36 @@ async def test_create_session_returns_openai_responses_session_context():
     adapter = OpenAIResponsesAdapter()
     context = adapter.create_session()
     assert isinstance(context, OpenAIResponsesSessionContext)
+
+
+@pytest.mark.asyncio
+async def test_get_openai_client_passes_optional_session(monkeypatch):
+    adapter = OpenAIResponsesAdapter()
+    room = _FakeRoom()
+    client_session = httpx.AsyncClient()
+    fake_client = object()
+    call_args: dict[str, object] = {}
+
+    def _fake_get_client(*, room, http_client=None, session=None):
+        call_args["room"] = room
+        call_args["http_client"] = http_client
+        call_args["session"] = session
+        return fake_client
+
+    monkeypatch.setattr(
+        "meshagent.openai.tools.responses_adapter.get_client",
+        _fake_get_client,
+    )
+
+    try:
+        client = adapter.get_openai_client(room=room, session=client_session)
+    finally:
+        await client_session.aclose()
+
+    assert client is fake_client
+    assert call_args["room"] is room
+    assert call_args["http_client"] is call_args["session"]
+    assert call_args["session"] is client_session
 
 
 def test_constructor_rejects_invalid_compaction_threshold():
@@ -227,7 +305,16 @@ async def test_next_uses_websocket_path_when_mode_is_websocket(monkeypatch):
         del kwargs
         call_count["count"] += 1
         return _CompletedStream(
-            event=_FakeCompletedEvent(response=_FakeResponse(response_id="resp_ws"))
+            event=_FakeCompletedEvent(
+                response=_FakeResponse(
+                    response_id="resp_ws",
+                    usage={
+                        "input_tokens": 12,
+                        "output_tokens": 4,
+                        "input_tokens_details": {"cached_tokens": 3},
+                    },
+                )
+            )
         )
 
     monkeypatch.setattr(
@@ -244,6 +331,92 @@ async def test_next_uses_websocket_path_when_mode_is_websocket(monkeypatch):
 
     assert result == ""
     assert call_count["count"] == 1
+    assert context.turn_count == 1
+    assert context.metadata["last_response_usage"]["input_tokens"] == 12
+    assert context.usage == {
+        "input_tokens": 12.0,
+        "output_tokens": 4.0,
+        "cached_tokens": 3.0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_next_tracks_usage_for_non_streaming_request_mode():
+    adapter = OpenAIResponsesAdapter(
+        mode="request",
+        client=_FakeOpenAIClient(
+            outcomes=[
+                _FakeResponse(
+                    response_id="resp_request",
+                    usage={
+                        "input_tokens": 9,
+                        "output_tokens": 2,
+                        "input_tokens_details": {"cached_tokens": 5},
+                    },
+                )
+            ]
+        ),
+    )
+    context = adapter.create_session()
+    context.append_user_message("hello")
+
+    result = await adapter.next(
+        context=context,
+        room=_FakeRoom(),
+        toolkits=[],
+    )
+
+    assert result == ""
+    assert context.turn_count == 1
+    assert context.metadata["last_response_usage"]["input_tokens"] == 9
+    assert context.usage == {
+        "input_tokens": 9.0,
+        "output_tokens": 2.0,
+        "cached_tokens": 5.0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_next_tracks_usage_for_streaming_request_mode():
+    adapter = OpenAIResponsesAdapter(
+        mode="request",
+        client=_FakeOpenAIClient(
+            outcomes=[
+                _CompletedStream(
+                    event=_FakeCompletedEvent(
+                        response=_FakeResponse(
+                            response_id="resp_stream",
+                            usage={
+                                "input_tokens": 11,
+                                "output_tokens": 7,
+                                "input_tokens_details": {"cached_tokens": 4},
+                            },
+                        )
+                    )
+                )
+            ]
+        ),
+    )
+    context = adapter.create_session()
+    context.append_user_message("hello")
+    events: list[dict] = []
+
+    result = await adapter.next(
+        context=context,
+        room=_FakeRoom(),
+        toolkits=[],
+        event_handler=events.append,
+    )
+
+    assert result == ""
+    assert context.turn_count == 1
+    assert events[0]["type"] == "response.completed"
+    assert context.metadata["last_response_usage"]["output_tokens"] == 7
+    assert context.usage == {
+        "input_tokens": 11.0,
+        "output_tokens": 7.0,
+        "cached_tokens": 4.0,
+    }
 
 
 @pytest.mark.asyncio
@@ -569,6 +742,46 @@ async def test_websocket_mode_logs_request_and_response_payload_when_enabled(
 
 
 @pytest.mark.asyncio
+async def test_create_response_websocket_stream_converts_raw_handshake_errors(
+    monkeypatch,
+):
+    adapter = OpenAIResponsesAdapter(mode="websocket")
+    context = adapter.create_session()
+    handshake_error = _make_ws_handshake_error(
+        status=402,
+        headers={
+            "X-Meshagent-Error-Message": "Your account is out of credits. Add credits to continue.",
+        },
+    )
+
+    async def _failing_ensure_websocket(*, url: str, headers: dict[str, str]):
+        del url, headers
+        raise handshake_error
+
+    monkeypatch.setattr(context, "ensure_websocket", _failing_ensure_websocket)
+
+    with pytest.raises(
+        RoomException, match="Your account is out of credits. Add credits to continue."
+    ) as exc_info:
+        await adapter._create_response_websocket_stream(
+            context=context,
+            room=_FakeRoom(),
+            openai=SimpleNamespace(
+                base_url="https://example.com/openai/v1",
+                default_headers={"Authorization": "Bearer test-token"},
+            ),
+            create_kwargs={
+                "stream": True,
+                "model": "gpt-5.2",
+                "input": [{"role": "user", "content": "hello"}],
+            },
+            extra_headers={},
+        )
+
+    assert exc_info.value.status_code == 402
+
+
+@pytest.mark.asyncio
 async def test_session_context_reuses_websocket_and_closes_after_timeout(monkeypatch):
     fake_websocket = _FakeWebSocket()
     fake_session = _FakeClientSession(fake_websocket)
@@ -606,6 +819,114 @@ async def test_session_context_reuses_websocket_and_closes_after_timeout(monkeyp
     assert fake_websocket.closed is True
     assert fake_session.closed is True
     assert fake_websocket.pings > 0
+
+
+@pytest.mark.asyncio
+async def test_session_context_uses_injected_session_without_closing_by_default():
+    fake_websocket = _FakeWebSocket()
+    shared_session = _FakeClientSession(fake_websocket)
+
+    context = OpenAIResponsesSessionContext(
+        system_role=None,
+        session=shared_session,
+    )
+
+    await context.ensure_websocket(
+        url="ws://localhost:8080/openai/v1/responses",
+        headers={"Authorization": "Bearer test-token"},
+    )
+    await context.close()
+
+    assert shared_session.connect_calls == 1
+    assert fake_websocket.closed is True
+    assert shared_session.closed is False
+
+
+@pytest.mark.asyncio
+async def test_session_context_closes_created_session_on_close(monkeypatch):
+    fake_websocket = _FakeWebSocket()
+    fake_session = _FakeClientSession(fake_websocket)
+
+    def _fake_client_session(*args, **kwargs):
+        del args, kwargs
+        return fake_session
+
+    monkeypatch.setattr(
+        "meshagent.openai.tools.responses_adapter.aiohttp.ClientSession",
+        _fake_client_session,
+    )
+
+    context = OpenAIResponsesSessionContext(system_role=None)
+
+    await context.ensure_websocket(
+        url="ws://localhost:8080/openai/v1/responses",
+        headers={"Authorization": "Bearer test-token"},
+    )
+    await context.close()
+
+    assert fake_session.connect_calls == 1
+    assert fake_websocket.closed is True
+    assert fake_session.closed is True
+
+
+@pytest.mark.asyncio
+async def test_session_context_converts_websocket_handshake_errors_to_room_exception(
+    monkeypatch,
+):
+    handshake_error = _make_ws_handshake_error(
+        status=402,
+        headers={
+            "X-Meshagent-Error-Message": "Your account is out of credits. Add credits to continue.",
+        },
+    )
+    fake_session = _FailingHandshakeClientSession(error=handshake_error)
+
+    def _fake_client_session(*args, **kwargs):
+        del args, kwargs
+        return fake_session
+
+    monkeypatch.setattr(
+        "meshagent.openai.tools.responses_adapter.aiohttp.ClientSession",
+        _fake_client_session,
+    )
+
+    context = OpenAIResponsesSessionContext(system_role=None)
+
+    with pytest.raises(
+        RoomException, match="Your account is out of credits. Add credits to continue."
+    ) as exc_info:
+        await context.ensure_websocket(
+            url="ws://localhost:8080/openai/v1/responses",
+            headers={"Authorization": "Bearer test-token"},
+        )
+
+    assert exc_info.value.status_code == 402
+    assert fake_session.closed is True
+
+
+@pytest.mark.asyncio
+async def test_session_context_closes_session_when_ws_connect_fails(monkeypatch):
+    fake_session = _FailingConnectClientSession()
+
+    def _fake_client_session(*args, **kwargs):
+        del args
+        del kwargs
+        return fake_session
+
+    monkeypatch.setattr(
+        "meshagent.openai.tools.responses_adapter.aiohttp.ClientSession",
+        _fake_client_session,
+    )
+
+    context = OpenAIResponsesSessionContext(system_role=None)
+
+    with pytest.raises(RuntimeError, match="ws connect failed"):
+        await context.ensure_websocket(
+            url="ws://localhost:8080/openai/v1/responses",
+            headers={"Authorization": "Bearer test-token"},
+        )
+
+    assert fake_session.closed is True
 
 
 @pytest.mark.asyncio

@@ -51,8 +51,12 @@ def get_logging_httpx_client() -> httpx.AsyncClient:
 
 
 def get_client(
-    *, room: RoomClient, http_client: Optional[httpx.AsyncClient] = None
+    *,
+    room: RoomClient,
+    http_client: Optional[httpx.AsyncClient] = None,
+    session: Optional[httpx.AsyncClient] = None,
 ) -> AsyncOpenAI:
+    resolved_http_client = http_client if http_client is not None else session
     token: str = room.protocol.token
 
     # when running inside the room pod, the room.room_url currently points to the external url
@@ -73,7 +77,7 @@ def get_client(
         room_proxy_url = room_proxy_url.replace("ws", "http", 1)
 
     openai = AsyncOpenAI(
-        http_client=http_client,
+        http_client=resolved_http_client,
         api_key=token,
         base_url=room_proxy_url,
         default_headers={"Meshagent-Session": room.session_id},

@@ -27,6 +27,11 @@ import re
 import asyncio
 
 from meshagent.openai.proxy import get_client
+from meshagent.openai.tools.usage import (
+    add_usage_metrics,
+    normalize_openai_usage,
+    preprocess_openai_usage,
+)
 
 logger = logging.getLogger("openai_agent")
 
@@ -273,6 +278,21 @@ class OpenAICompletionsAdapter(LLMAdapter):
 
         return context
 
+    def _store_usage(
+        self, *, context: AgentSessionContext, usage: object, model: str
+    ) -> None:
+        usage_dict = normalize_openai_usage(usage)
+        if usage_dict is None:
+            return
+
+        context.metadata["last_response_usage"] = usage_dict
+        context.metadata["last_response_model"] = model
+
+        flattened_usage = preprocess_openai_usage(model=model, usage=usage_dict)
+        if flattened_usage is None:
+            return
+        add_usage_metrics(totals=context.usage, usage=flattened_usage)
+
     # Takes the current chat context, executes a completion request and processes the response.
     # If a tool calls are requested, invokes the tools, processes the tool calls results, and appends the tool call results to the context
     async def next(
@@ -287,6 +307,11 @@ class OpenAICompletionsAdapter(LLMAdapter):
         on_behalf_of: Optional[RemoteParticipant] = None,
         options: Optional[dict] = None,
     ):
+        del model
+        del on_behalf_of
+        del options
+
+        context.turn_count += 1
         tool_adapter = OpenAICompletionsToolResponseAdapter()
 
         try:
@@ -335,6 +360,11 @@ class OpenAICompletionsAdapter(LLMAdapter):
                     messages=context.messages,
                     tools=open_ai_tools,
                     **extra,
+                )
+                self._store_usage(
+                    context=context,
+                    usage=response.usage,
+                    model=self._model,
                 )
                 message = response.choices[0].message
                 room.developer.log_nowait(

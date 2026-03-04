@@ -77,8 +77,9 @@ class _FakeChoice:
 
 
 class _FakeChatCompletion:
-    def __init__(self, *, message: _FakeMessage):
+    def __init__(self, *, message: _FakeMessage, usage: dict | None = None):
         self.choices = [_FakeChoice(message=message)]
+        self.usage = usage
 
 
 class _FakeChatCompletionsClient:
@@ -166,10 +167,12 @@ async def test_next_consumes_streaming_tool_events_and_uses_final_item_result():
                             )
                         ],
                         content=None,
-                    )
+                    ),
+                    usage={"prompt_tokens": 5, "completion_tokens": 1},
                 ),
                 _FakeChatCompletion(
-                    message=_FakeMessage(tool_calls=None, content="done")
+                    message=_FakeMessage(tool_calls=None, content="done"),
+                    usage={"prompt_tokens": 2, "completion_tokens": 3},
                 ),
             ]
         ),
@@ -186,4 +189,42 @@ async def test_next_consumes_streaming_tool_events_and_uses_final_item_result():
     )
 
     assert result == "done"
+    assert context.turn_count == 1
+    assert context.usage == {"input_tokens": 7.0, "output_tokens": 4.0}
     assert events == [{"type": "agent.event", "headline": "working"}]
+
+
+@pytest.mark.asyncio
+async def test_next_tracks_usage_for_single_completion_response():
+    adapter = OpenAICompletionsAdapter(
+        model="gpt-4o-mini",
+        client=_FakeOpenAIClient(
+            responses=[
+                _FakeChatCompletion(
+                    message=_FakeMessage(tool_calls=None, content="done"),
+                    usage={
+                        "prompt_tokens": 6,
+                        "completion_tokens": 2,
+                        "reasoning_tokens": 1,
+                    },
+                )
+            ]
+        ),
+    )
+    context = adapter.create_session()
+    context.append_user_message("hello")
+
+    result = await adapter.next(
+        context=context,
+        room=_FakeRoom(),
+        toolkits=[],
+    )
+
+    assert result == "done"
+    assert context.turn_count == 1
+    assert context.metadata["last_response_usage"]["prompt_tokens"] == 6
+    assert context.usage == {
+        "input_tokens": 6.0,
+        "output_tokens": 2.0,
+        "reasoning_tokens": 1.0,
+    }

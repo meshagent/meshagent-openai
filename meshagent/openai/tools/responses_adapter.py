@@ -24,7 +24,7 @@ from meshagent.tools.script import DEFAULT_CONTAINER_MOUNT_SPEC
 
 from meshagent.api.specs.service import ContainerMountSpec
 import json
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Mapping
 from typing import Any, List, Literal, cast
 from meshagent.openai.proxy import get_client, get_logging_httpx_client
 from openai import AsyncOpenAI, NOT_GIVEN, APIError, APIStatusError
@@ -39,15 +39,22 @@ import re
 import asyncio
 import aiohttp
 import math
+import httpx
 from pydantic import BaseModel
 import copy
 from opentelemetry import trace
 from html_to_markdown import convert
 from urllib.parse import urlparse, urlunparse
+from meshagent.openai.tools.usage import (
+    add_usage_metrics,
+    normalize_openai_usage,
+    preprocess_openai_usage,
+)
 
 logger = logging.getLogger("openai_agent")
 tracer = trace.get_tracer("openai.llm.responses")
 _MAX_LOGGED_WEBSOCKET_PAYLOAD_CHARS = 128000
+_MESHAGENT_ERROR_MESSAGE_HEADER = "x-meshagent-error-message"
 
 
 def _redact_log_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -86,6 +93,7 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
         *,
         websocket_timeout: float = _default_websocket_timeout_seconds,
         websocket_ping_interval_seconds: float = _default_websocket_ping_interval_seconds,
+        session: aiohttp.ClientSession | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -96,7 +104,8 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
         self._websocket_timeout = websocket_timeout
         self._websocket_ping_interval_seconds = websocket_ping_interval_seconds
         self._websocket: aiohttp.ClientWebSocketResponse | None = None
-        self._websocket_session: aiohttp.ClientSession | None = None
+        self._session: aiohttp.ClientSession | None = session
+        self._owns_session = session is None
         self._websocket_url: str | None = None
         self._websocket_headers_signature: tuple[tuple[str, str], ...] | None = None
         self._websocket_ping_task: asyncio.Task[None] | None = None
@@ -110,6 +119,67 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
     @property
     def has_valid_websocket(self) -> bool:
         return self._websocket is not None and not self._websocket.closed
+
+    @staticmethod
+    def _header_value(
+        headers: aiohttp.typedefs.LooseHeaders | None, key: str
+    ) -> str | None:
+        if headers is None:
+            return None
+        if isinstance(headers, dict):
+            value = headers.get(key)
+            if isinstance(value, str):
+                trimmed = value.strip()
+                return trimmed if trimmed != "" else None
+            return None
+
+        try:
+            value = headers.get(key)
+        except Exception:
+            return None
+        if isinstance(value, str):
+            trimmed = value.strip()
+            return trimmed if trimmed != "" else None
+        return None
+
+    @staticmethod
+    def _fallback_handshake_error_message(status: int) -> str:
+        if status == 402:
+            return "Your account is out of credits. Add credits to continue."
+        if status in {401, 403}:
+            return "You are not authorized to use this OpenAI endpoint."
+        if status == 429:
+            return "OpenAI request was rate limited. Please retry in a moment."
+        if status >= 500:
+            return "OpenAI service is currently unavailable. Please try again later."
+        return f"OpenAI websocket request failed with status {status}."
+
+    @classmethod
+    def _status_error_message(
+        cls,
+        *,
+        status: int,
+        headers: Mapping[str, str] | None,
+        message: str | None,
+    ) -> str:
+        header_message = cls._header_value(headers, _MESHAGENT_ERROR_MESSAGE_HEADER)
+        if header_message is not None:
+            return header_message
+
+        if message is not None and message.strip() != "":
+            stripped_message = message.strip()
+            if stripped_message.lower() != "invalid response status":
+                return stripped_message
+
+        return cls._fallback_handshake_error_message(status)
+
+    @classmethod
+    def _handshake_error_message(cls, error: aiohttp.WSServerHandshakeError) -> str:
+        return cls._status_error_message(
+            status=error.status,
+            headers=error.headers,
+            message=error.message,
+        )
 
     async def _run_websocket_ping(self) -> None:
         try:
@@ -134,7 +204,7 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
             "responses websocket session timed out after %.1f seconds",
             self._websocket_timeout,
         )
-        await self.close_websocket()
+        await self.close()
 
     async def _close_websocket_locked(self) -> None:
         current_task = asyncio.current_task()
@@ -171,10 +241,15 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
         if websocket is not None and not websocket.closed:
             await websocket.close()
 
-        session = self._websocket_session
-        self._websocket_session = None
-        if session is not None and not session.closed:
-            await session.close()
+    @staticmethod
+    async def _close_client_session(
+        *,
+        session: aiohttp.ClientSession | None,
+        close_session: bool,
+    ) -> None:
+        if session is None or session.closed or not close_session:
+            return
+        await asyncio.shield(session.close())
 
     async def close_websocket(self) -> None:
         async with self._websocket_lock:
@@ -195,15 +270,53 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
 
             await self._close_websocket_locked()
 
-            session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
-            websocket = await session.ws_connect(
-                url,
-                headers=headers,
-                heartbeat=None,
-                autoping=True,
-            )
+            session = self._session
+            close_session_on_failure = False
+            if session is None:
+                session = aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=None)
+                )
+                if self._owns_session:
+                    self._session = session
+                else:
+                    close_session_on_failure = True
+            try:
+                websocket = await session.ws_connect(
+                    url,
+                    headers=headers,
+                    heartbeat=None,
+                    autoping=True,
+                )
+            except aiohttp.WSServerHandshakeError as error:
+                if close_session_on_failure:
+                    await self._close_client_session(
+                        session=session,
+                        close_session=True,
+                    )
+                elif self._owns_session and session is self._session:
+                    self._session = None
+                    await self._close_client_session(
+                        session=session,
+                        close_session=True,
+                    )
+                raise RoomException(
+                    self._handshake_error_message(error),
+                    status_code=error.status,
+                ) from error
+            except Exception:
+                if close_session_on_failure:
+                    await self._close_client_session(
+                        session=session,
+                        close_session=True,
+                    )
+                elif self._owns_session and session is self._session:
+                    self._session = None
+                    await self._close_client_session(
+                        session=session,
+                        close_session=True,
+                    )
+                raise
 
-            self._websocket_session = session
             self._websocket = websocket
             self._websocket_url = url
             self._websocket_headers_signature = headers_signature
@@ -211,18 +324,33 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
             self._websocket_timeout_task = asyncio.create_task(
                 self._run_websocket_timeout()
             )
-
             return websocket
 
     async def close(self) -> None:
         await self.close_websocket()
+        if self._owns_session:
+            session = self._session
+            self._session = None
+            await self._close_client_session(
+                session=session,
+                close_session=True,
+            )
+
+    async def start(self) -> None:
+        await super().start()
+        if self._session is None and self._owns_session:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=None)
+            )
 
     def copy(self) -> "OpenAIResponsesSessionContext":
+        shared_session = self._session if not self._owns_session else None
         return self.__class__(
             messages=copy.deepcopy(self.messages),
             system_role=self.system_role,
             websocket_timeout=self._websocket_timeout,
             websocket_ping_interval_seconds=self._websocket_ping_interval_seconds,
+            session=shared_session,
         )
 
     @property
@@ -840,7 +968,9 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
             if context.previous_response_id is not None
             else NOT_GIVEN
         )
-        openai = self.get_openai_client(room=room)
+        openai = self.get_openai_client(
+            room=room,
+        )
         response = await openai.responses.compact(
             model=model,
             input=[*context.messages],
@@ -853,32 +983,26 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         )
         context.previous_messages.clear()
         context.previous_response_id = None
-        usage = self._normalize_usage(response.usage)
+        usage = normalize_openai_usage(response.usage)
         if usage is not None:
             context.metadata["last_compaction_usage"] = usage
         context.metadata.pop("last_response_usage", None)
         context.metadata.pop("last_response_model", None)
 
-    def _normalize_usage(self, usage: object) -> dict | None:
-        if usage is None:
-            return None
-        if isinstance(usage, BaseModel):
-            try:
-                return usage.model_dump(mode="json")
-            except Exception:
-                return None
-        if not isinstance(usage, dict):
-            return None
-        return usage
-
     def _store_usage(
         self, *, context: AgentSessionContext, usage: object, model: str
     ) -> None:
-        usage_dict = self._normalize_usage(usage)
+        usage_dict = normalize_openai_usage(usage)
         if usage_dict is None:
             return
+
         context.metadata["last_response_usage"] = usage_dict
         context.metadata["last_response_model"] = model
+
+        flattened_usage = preprocess_openai_usage(model=model, usage=usage_dict)
+        if flattened_usage is None:
+            return
+        add_usage_metrics(totals=context.usage, usage=flattened_usage)
 
     def _should_publish_stream_event(self, *, event: ResponseStreamEvent) -> bool:
         event_type = event.type
@@ -918,7 +1042,9 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         if open_ai_tools is None:
             open_ai_tools = NOT_GIVEN
 
-        openai = self.get_openai_client(room=room)
+        openai = self.get_openai_client(
+            room=room,
+        )
 
         response_name = "response"
         text = NOT_GIVEN
@@ -951,12 +1077,22 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
 
         return True
 
-    def get_openai_client(self, *, room: RoomClient) -> AsyncOpenAI:
+    def get_openai_client(
+        self,
+        *,
+        room: RoomClient,
+        session: httpx.AsyncClient | None = None,
+    ) -> AsyncOpenAI:
         if self._client is not None:
             return self._client
-        else:
-            http_client = get_logging_httpx_client() if self._log_requests else None
-            return get_client(room=room, http_client=http_client)
+        http_client = session
+        if http_client is None and self._log_requests:
+            http_client = get_logging_httpx_client()
+        return get_client(
+            room=room,
+            http_client=http_client,
+            session=session,
+        )
 
     def _is_retryable_openai_error(self, *, error: APIError) -> bool:
         if isinstance(error, APIStatusError):
@@ -1134,10 +1270,27 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
             openai=openai,
             extra_headers=extra_headers,
         )
-        websocket = await context.ensure_websocket(
-            url=websocket_url,
-            headers=websocket_headers,
-        )
+        try:
+            websocket = await context.ensure_websocket(
+                url=websocket_url,
+                headers=websocket_headers,
+            )
+        except RoomException:
+            raise
+        except aiohttp.WSServerHandshakeError as error:
+            raise RoomException(
+                OpenAIResponsesSessionContext._handshake_error_message(error),
+                status_code=error.status,
+            ) from error
+        except aiohttp.ClientResponseError as error:
+            raise RoomException(
+                OpenAIResponsesSessionContext._status_error_message(
+                    status=error.status,
+                    headers=error.headers,
+                    message=error.message,
+                ),
+                status_code=error.status,
+            ) from error
 
         request_payload = self._build_websocket_request_payload(create_kwargs)
         if self._log_requests:
@@ -1218,6 +1371,8 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
     ):
         if model is None:
             model = self.default_model()
+
+        context.turn_count += 1
 
         if self.needs_compaction(context=context):
             logger.error("llm request needs compaction, compacting request")
@@ -1314,7 +1469,9 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                 f"requesting response from openai with model: {model}"
                             )
 
-                            openai = self.get_openai_client(room=room)
+                            openai = self.get_openai_client(
+                                room=room,
+                            )
                             create_kwargs = {
                                 "extra_headers": extra_headers,
                                 "stream": stream,
