@@ -895,7 +895,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         total = input_tokens + cached_tokens + output_tokens
         return total > threshold
 
-    def _create_kwargs_has_computer_use_preview_tool(
+    def _create_kwargs_has_computer_tool(
         self, *, create_kwargs: dict[str, Any]
     ) -> bool:
         tools = create_kwargs.get("tools")
@@ -904,7 +904,10 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         if not isinstance(tools, list):
             return False
         for tool in tools:
-            if isinstance(tool, dict) and tool.get("type") == "computer_use_preview":
+            if isinstance(tool, dict) and tool.get("type") in {
+                "computer_use_preview",
+                "computer",
+            }:
                 return True
         return False
 
@@ -913,9 +916,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
             return
         if self._compaction_threshold is None:
             return
-        if self._create_kwargs_has_computer_use_preview_tool(
-            create_kwargs=create_kwargs
-        ):
+        if self._create_kwargs_has_computer_tool(create_kwargs=create_kwargs):
             return
 
         context_management = create_kwargs.get("context_management")

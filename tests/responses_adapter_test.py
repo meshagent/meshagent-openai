@@ -502,8 +502,9 @@ async def test_next_disables_auto_compaction_by_default_for_unknown_model(monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool_type", ["computer_use_preview", "computer"])
 async def test_next_disables_auto_compaction_when_computer_use_tool_present(
-    monkeypatch,
+    monkeypatch, tool_type: str
 ):
     client = _FakeOpenAIClient(
         outcomes=[_FakeResponse(response_id="resp_computer_use_tool")]
@@ -533,7 +534,7 @@ async def test_next_disables_auto_compaction_when_computer_use_tool_present(
         "to_json",
         lambda self: [  # noqa: ARG005
             {
-                "type": "computer_use_preview",
+                "type": tool_type,
                 "display_width": 1024,
                 "display_height": 768,
                 "environment": "browser",
