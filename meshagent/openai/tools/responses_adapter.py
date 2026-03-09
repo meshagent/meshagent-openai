@@ -1072,11 +1072,33 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
     async def check_for_termination(
         self, *, context: AgentSessionContext, room: RoomClient
     ) -> bool:
+        del room
         for message in context.messages:
             if message.get("type", "message") != "message":
                 return False
 
+        latest_phase = self._get_latest_response_phase_from_messages(context=context)
+        if latest_phase is not None:
+            return latest_phase == "final_answer"
+
         return True
+
+    @staticmethod
+    def _get_latest_response_phase_from_messages(
+        *, context: AgentSessionContext
+    ) -> str | None:
+        for message in reversed(context.previous_messages):
+            if message.get("type") != "message":
+                break
+
+            phase = message.get("phase")
+            if phase is None:
+                continue
+
+            if isinstance(phase, str):
+                return phase
+
+        return None
 
     def get_openai_client(
         self,
@@ -1926,6 +1948,12 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                     context.track_response(
                                                         event.response.id
                                                     )
+                                                    context.previous_messages.extend(
+                                                        [
+                                                            output.to_dict()
+                                                            for output in event.response.output
+                                                        ]
+                                                    )
                                                     self._store_usage(
                                                         context=context,
                                                         usage=event.response.usage,
@@ -1973,10 +2001,6 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                     event.type
                                                     == "response.output_item.done"
                                                 ):
-                                                    context.previous_messages.append(
-                                                        event.item.to_dict()
-                                                    )
-
                                                     (
                                                         outputs,
                                                         done,

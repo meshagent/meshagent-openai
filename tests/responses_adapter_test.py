@@ -5,8 +5,11 @@ import aiohttp
 import pytest
 from aiohttp.client_reqrep import RequestInfo
 from multidict import CIMultiDict, CIMultiDictProxy
+from openai._models import BaseModel as OpenAIBaseModel
 from types import SimpleNamespace
 from openai import APIError
+from openai.types.responses.response_output_message import ResponseOutputMessage
+from openai.types.responses.response_output_text import ResponseOutputText
 from yarl import URL
 
 from meshagent.api import RoomException
@@ -41,13 +44,22 @@ class _FakeRoom:
 
 
 class _FakeResponse:
-    def __init__(self, *, response_id: str, usage: dict | None = None):
+    def __init__(
+        self,
+        *,
+        response_id: str,
+        output: list[OpenAIBaseModel] | None = None,
+        usage: dict | None = None,
+    ):
         self.id = response_id
-        self.output = []
+        self.output = output or []
         self.usage = usage
 
     def to_dict(self) -> dict:
-        return {"id": self.id, "output": []}
+        return {
+            "id": self.id,
+            "output": [output.to_dict(mode="json") for output in self.output],
+        }
 
 
 class _FakeCompletedEvent:
@@ -59,7 +71,7 @@ class _FakeCompletedEvent:
         del mode
         return {
             "type": self.type,
-            "response": {"id": self.response.id, "output": []},
+            "response": self.response.to_dict(),
         }
 
     def to_dict(self) -> dict:
@@ -235,6 +247,22 @@ def _make_api_error(message: str) -> APIError:
     return APIError(message, request=request, body=None)
 
 
+def _make_output_message(
+    *, message_id: str, text: str, phase: str | None = None
+) -> ResponseOutputMessage:
+    message_kwargs: dict[str, object] = {
+        "id": message_id,
+        "content": [ResponseOutputText(annotations=[], text=text, type="output_text")],
+        "role": "assistant",
+        "status": "completed",
+        "type": "message",
+    }
+    if phase is not None:
+        message_kwargs["phase"] = phase
+
+    return ResponseOutputMessage(**message_kwargs)
+
+
 @pytest.mark.asyncio
 async def test_create_session_returns_openai_responses_session_context():
     adapter = OpenAIResponsesAdapter()
@@ -377,6 +405,53 @@ async def test_next_tracks_usage_for_non_streaming_request_mode():
 
 
 @pytest.mark.asyncio
+async def test_next_continues_until_final_answer_when_phase_is_present():
+    client = _FakeOpenAIClient(
+        outcomes=[
+            _FakeResponse(
+                response_id="resp_commentary",
+                output=[
+                    _make_output_message(
+                        message_id="msg_commentary",
+                        text="Working on it.",
+                        phase="commentary",
+                    )
+                ],
+            ),
+            _FakeResponse(
+                response_id="resp_final",
+                output=[
+                    _make_output_message(
+                        message_id="msg_final",
+                        text="Done.",
+                        phase="final_answer",
+                    )
+                ],
+            ),
+        ]
+    )
+    adapter = OpenAIResponsesAdapter(
+        mode="request",
+        client=client,
+    )
+    context = adapter.create_session()
+    context.append_user_message("hello")
+
+    result = await adapter.next(
+        context=context,
+        room=_FakeRoom(),
+        toolkits=[],
+    )
+
+    assert result == "Done."
+    assert client.responses.calls == 2
+    assert (
+        client.responses.create_kwargs[1]["previous_response_id"] == "resp_commentary"
+    )
+    assert client.responses.create_kwargs[1]["input"] == []
+
+
+@pytest.mark.asyncio
 async def test_next_tracks_usage_for_streaming_request_mode():
     adapter = OpenAIResponsesAdapter(
         mode="request",
@@ -417,6 +492,67 @@ async def test_next_tracks_usage_for_streaming_request_mode():
         "output_tokens": 7.0,
         "cached_tokens": 4.0,
     }
+
+
+@pytest.mark.asyncio
+async def test_next_stream_continues_until_final_answer_when_phase_is_present():
+    client = _FakeOpenAIClient(
+        outcomes=[
+            _CompletedStream(
+                event=_FakeCompletedEvent(
+                    response=_FakeResponse(
+                        response_id="resp_stream_commentary",
+                        output=[
+                            _make_output_message(
+                                message_id="msg_stream_commentary",
+                                text="Still working.",
+                                phase="commentary",
+                            )
+                        ],
+                    )
+                )
+            ),
+            _CompletedStream(
+                event=_FakeCompletedEvent(
+                    response=_FakeResponse(
+                        response_id="resp_stream_final",
+                        output=[
+                            _make_output_message(
+                                message_id="msg_stream_final",
+                                text="Finished.",
+                                phase="final_answer",
+                            )
+                        ],
+                    )
+                )
+            ),
+        ]
+    )
+    adapter = OpenAIResponsesAdapter(
+        mode="request",
+        client=client,
+    )
+    context = adapter.create_session()
+    context.append_user_message("hello")
+    events: list[dict] = []
+
+    result = await adapter.next(
+        context=context,
+        room=_FakeRoom(),
+        toolkits=[],
+        event_handler=events.append,
+    )
+
+    assert result == "Finished."
+    assert client.responses.calls == 2
+    assert [event["type"] for event in events] == [
+        "response.completed",
+        "response.completed",
+    ]
+    assert (
+        client.responses.create_kwargs[1]["previous_response_id"]
+        == "resp_stream_commentary"
+    )
 
 
 @pytest.mark.asyncio
