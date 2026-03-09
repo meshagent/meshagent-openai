@@ -3457,13 +3457,15 @@ class ApplyPatchTool(OpenAIResponsesTool):
             diff = operation["diff"]
             path = operation["path"]
             logger.info(f"applying patch: creating file {path} with {diff}")
-            handle = await context.room.storage.open(path=path, overwrite=False)
             try:
                 patched = apply_diff("", diff, "create")
             except Exception as ex:
                 return {"status": "failed", "output": f"{ex}"}
-            await context.room.storage.write(handle=handle, data=patched.encode())
-            await context.room.storage.close(handle=handle)
+            await context.room.storage.upload(
+                path=path,
+                data=patched.encode(),
+                overwrite=False,
+            )
 
             log = f"Created file: {path} ({len(patched)} bytes)"
             logger.info(log)
@@ -3482,9 +3484,11 @@ class ApplyPatchTool(OpenAIResponsesTool):
             except Exception as ex:
                 return {"status": "failed", "output": f"{ex}"}
 
-            handle = await context.room.storage.open(path=path, overwrite=True)
-            await context.room.storage.write(handle=handle, data=patched.encode())
-            await context.room.storage.close(handle=handle)
+            await context.room.storage.upload(
+                path=path,
+                data=patched.encode(),
+                overwrite=True,
+            )
 
             log = f"Updated file: {path} ({len(text)} -> {len(patched)} bytes)"
             logger.info(log)
