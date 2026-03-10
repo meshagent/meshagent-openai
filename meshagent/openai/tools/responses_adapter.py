@@ -1718,26 +1718,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                                 continue
 
                                                 return [full_response], True
-                                    # elif message.type == "computer_call" and tool_bundle.get_tool("computer_call"):
-                                    #    with tracer.start_as_current_span("llm.handle_computer_call") as span:
-                                    #
-                                    #        computer_call :ResponseComputerToolCall = message
-                                    #        span.set_attributes({
-                                    #            "id": computer_call.id,
-                                    #            "action": computer_call.action,
-                                    #            "call_id": computer_call.call_id,
-                                    #            "type": json.dumps(computer_call.type)
-                                    #        })
-
-                                    #        tool_context = ToolContext(
-                                    #            room=room,
-                                    #            caller=room.local_participant,
-                                    #            caller_context={ "chat" : context.to_json }
-                                    #        )
-                                    #        outputs = (await tool_bundle.get_tool("computer_call").execute(context=tool_context, arguments=message.model_dump(mode="json"))).outputs
-
-                                    #    return outputs, False
-
+                                 
                                     else:
                                         with tracer.start_as_current_span(
                                             "llm.handle_tool_call"

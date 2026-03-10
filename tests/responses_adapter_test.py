@@ -8,12 +8,15 @@ from multidict import CIMultiDict, CIMultiDictProxy
 from openai._models import BaseModel as OpenAIBaseModel
 from types import SimpleNamespace
 from openai import APIError
+from openai.types.responses.response_computer_tool_call import ResponseComputerToolCall
 from openai.types.responses.response_output_message import ResponseOutputMessage
 from openai.types.responses.response_output_text import ResponseOutputText
 from yarl import URL
 
 from meshagent.api import RoomException
 from meshagent.api.messaging import JsonContent, TextContent
+from meshagent.computers.agent import ComputerToolkit
+from meshagent.computers.operator import Operator
 from meshagent.openai.tools.responses_adapter import (
     OpenAIResponsesAdapter,
     OpenAIResponsesSessionContext,
@@ -41,6 +44,35 @@ class _FakeRoom:
     def __init__(self):
         self.local_participant = _FakeParticipant()
         self.developer = _FakeDeveloper()
+
+
+class _FakeBrowserComputer:
+    environment = "browser"
+    dimensions = (1024, 768)
+
+    def __init__(self):
+        self.calls: list[tuple[str, dict[str, object]]] = []
+        self.enter_count = 0
+        self.exit_count = 0
+
+    async def __aenter__(self):
+        self.enter_count += 1
+        return self
+
+    async def __aexit__(self, exc_type, exc, exc_tb):
+        del exc_type
+        del exc
+        del exc_tb
+        self.exit_count += 1
+
+    async def click(self, x: int, y: int, button: str = "left") -> None:
+        self.calls.append(("click", {"x": x, "y": y, "button": button}))
+
+    async def screenshot(self) -> str:
+        return "ZmFrZS1zY3JlZW5zaG90"
+
+    async def get_current_url(self) -> str:
+        return "https://example.com"
 
 
 class _FakeResponse:
@@ -449,6 +481,75 @@ async def test_next_continues_until_final_answer_when_phase_is_present():
         client.responses.create_kwargs[1]["previous_response_id"] == "resp_commentary"
     )
     assert client.responses.create_kwargs[1]["input"] == []
+
+
+@pytest.mark.asyncio
+async def test_next_handles_openai_54_computer_output_items():
+    room = _FakeRoom()
+    computer = _FakeBrowserComputer()
+    toolkit = ComputerToolkit(
+        computer=computer,
+        operator=Operator(),
+        room=room,
+        render_screen=None,
+    )
+    computer_item = ResponseComputerToolCall(
+        id="item_computer",
+        type="computer_call",
+        status="completed",
+        call_id="call_computer",
+        action={
+            "type": "click",
+            "x": 140,
+            "y": 320,
+            "button": "left",
+        },
+        pending_safety_checks=[],
+    )
+    client = _FakeOpenAIClient(
+        outcomes=[
+            _FakeResponse(
+                response_id="resp_computer",
+                output=[computer_item],
+            ),
+            _FakeResponse(
+                response_id="resp_computer_final",
+                output=[
+                    _make_output_message(
+                        message_id="msg_computer_final",
+                        text="Done.",
+                        phase="final_answer",
+                    )
+                ],
+            ),
+        ]
+    )
+    adapter = OpenAIResponsesAdapter(
+        mode="request",
+        client=client,
+    )
+    context = adapter.create_session()
+    context.append_user_message("click the page")
+
+    result = await adapter.next(
+        context=context,
+        room=room,
+        toolkits=[toolkit],
+    )
+
+    assert result == "Done."
+    assert computer.calls == [
+        ("click", {"x": 140, "y": 320, "button": "left"}),
+    ]
+    assert any(
+        isinstance(tool, dict) and tool.get("type") == "computer"
+        for tool in client.responses.create_kwargs[0]["tools"]
+    )
+    assert client.responses.create_kwargs[1]["previous_response_id"] == "resp_computer"
+    assert any(
+        isinstance(item, dict) and item.get("type") == "computer_call_output"
+        for item in context.previous_messages
+    )
 
 
 @pytest.mark.asyncio
