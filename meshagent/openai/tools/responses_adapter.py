@@ -1718,7 +1718,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                                 continue
 
                                                 return [full_response], True
-                                 
+
                                     else:
                                         with tracer.start_as_current_span(
                                             "llm.handle_tool_call"
