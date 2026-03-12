@@ -895,7 +895,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         total = input_tokens + cached_tokens + output_tokens
         return total > threshold
 
-    def _create_kwargs_has_computer_use_preview_tool(
+    def _create_kwargs_has_computer_tool(
         self, *, create_kwargs: dict[str, Any]
     ) -> bool:
         tools = create_kwargs.get("tools")
@@ -904,7 +904,10 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         if not isinstance(tools, list):
             return False
         for tool in tools:
-            if isinstance(tool, dict) and tool.get("type") == "computer_use_preview":
+            if isinstance(tool, dict) and tool.get("type") in {
+                "computer_use_preview",
+                "computer",
+            }:
                 return True
         return False
 
@@ -913,9 +916,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
             return
         if self._compaction_threshold is None:
             return
-        if self._create_kwargs_has_computer_use_preview_tool(
-            create_kwargs=create_kwargs
-        ):
+        if self._create_kwargs_has_computer_tool(create_kwargs=create_kwargs):
             return
 
         context_management = create_kwargs.get("context_management")
@@ -1071,11 +1072,33 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
     async def check_for_termination(
         self, *, context: AgentSessionContext, room: RoomClient
     ) -> bool:
+        del room
         for message in context.messages:
             if message.get("type", "message") != "message":
                 return False
 
+        latest_phase = self._get_latest_response_phase_from_messages(context=context)
+        if latest_phase is not None:
+            return latest_phase == "final_answer"
+
         return True
+
+    @staticmethod
+    def _get_latest_response_phase_from_messages(
+        *, context: AgentSessionContext
+    ) -> str | None:
+        for message in reversed(context.previous_messages):
+            if message.get("type") != "message":
+                break
+
+            phase = message.get("phase")
+            if phase is None:
+                continue
+
+            if isinstance(phase, str):
+                return phase
+
+        return None
 
     def get_openai_client(
         self,
@@ -1695,25 +1718,6 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                                 continue
 
                                                 return [full_response], True
-                                    # elif message.type == "computer_call" and tool_bundle.get_tool("computer_call"):
-                                    #    with tracer.start_as_current_span("llm.handle_computer_call") as span:
-                                    #
-                                    #        computer_call :ResponseComputerToolCall = message
-                                    #        span.set_attributes({
-                                    #            "id": computer_call.id,
-                                    #            "action": computer_call.action,
-                                    #            "call_id": computer_call.call_id,
-                                    #            "type": json.dumps(computer_call.type)
-                                    #        })
-
-                                    #        tool_context = ToolContext(
-                                    #            room=room,
-                                    #            caller=room.local_participant,
-                                    #            caller_context={ "chat" : context.to_json }
-                                    #        )
-                                    #        outputs = (await tool_bundle.get_tool("computer_call").execute(context=tool_context, arguments=message.model_dump(mode="json"))).outputs
-
-                                    #    return outputs, False
 
                                     else:
                                         with tracer.start_as_current_span(
@@ -1925,6 +1929,12 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                     context.track_response(
                                                         event.response.id
                                                     )
+                                                    context.previous_messages.extend(
+                                                        [
+                                                            output.to_dict()
+                                                            for output in event.response.output
+                                                        ]
+                                                    )
                                                     self._store_usage(
                                                         context=context,
                                                         usage=event.response.usage,
@@ -1972,10 +1982,6 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                     event.type
                                                     == "response.output_item.done"
                                                 ):
-                                                    context.previous_messages.append(
-                                                        event.item.to_dict()
-                                                    )
-
                                                     (
                                                         outputs,
                                                         done,
@@ -3456,13 +3462,15 @@ class ApplyPatchTool(OpenAIResponsesTool):
             diff = operation["diff"]
             path = operation["path"]
             logger.info(f"applying patch: creating file {path} with {diff}")
-            handle = await context.room.storage.open(path=path, overwrite=False)
             try:
                 patched = apply_diff("", diff, "create")
             except Exception as ex:
                 return {"status": "failed", "output": f"{ex}"}
-            await context.room.storage.write(handle=handle, data=patched.encode())
-            await context.room.storage.close(handle=handle)
+            await context.room.storage.upload(
+                path=path,
+                data=patched.encode(),
+                overwrite=False,
+            )
 
             log = f"Created file: {path} ({len(patched)} bytes)"
             logger.info(log)
@@ -3481,9 +3489,11 @@ class ApplyPatchTool(OpenAIResponsesTool):
             except Exception as ex:
                 return {"status": "failed", "output": f"{ex}"}
 
-            handle = await context.room.storage.open(path=path, overwrite=True)
-            await context.room.storage.write(handle=handle, data=patched.encode())
-            await context.room.storage.close(handle=handle)
+            await context.room.storage.upload(
+                path=path,
+                data=patched.encode(),
+                overwrite=True,
+            )
 
             log = f"Updated file: {path} ({len(text)} -> {len(patched)} bytes)"
             logger.info(log)

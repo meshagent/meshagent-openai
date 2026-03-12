@@ -1,3 +1,12 @@
+## [0.30.0]
+- Breaking: tool invocation migrated to toolkit-based `room.invoke_tool` with streaming tool-call inputs/outputs, and storage writes now use upload/download streams instead of handle-based APIs.
+- Added RoomClient clients for containers, services, and memory plus expanded storage (stat, download URLs, streaming uploads/downloads) and database/search streaming with index management.
+- Sync client now streams document state/updates; database and storage APIs accept streaming inputs for large payloads.
+- Agents and workers gained threaded task runner indexing, configurable threading/initial-message summarization, and updated responses/completions thread adapters with usage tracking.
+- Computer toolkit now uses the `computer` tool type with configurable dimensions/starting URL, optional goto tool, and storage-backed screenshots.
+- CLI improvements for storage/containers/database/memory commands (folder-aware `ls`/`cp`/`show`, streaming upload/download, new TUI setup).
+- Dependency update: `openai` to `~2.25.0`.
+
 ## [0.29.4]
 - Stability
 
