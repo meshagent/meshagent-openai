@@ -1,3 +1,6 @@
+## [0.30.1]
+- Stability
+
 ## [0.30.0]
 - Breaking: tool invocation migrated to toolkit-based `room.invoke_tool` with streaming tool-call inputs/outputs, and storage writes now use upload/download streams instead of handle-based APIs.
 - Added RoomClient clients for containers, services, and memory plus expanded storage (stat, download URLs, streaming uploads/downloads) and database/search streaming with index management.
