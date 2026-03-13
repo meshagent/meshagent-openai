@@ -1,9 +1,11 @@
 import asyncio
 import base64
+import json
 import os
 import struct
 import zlib
 
+import aiohttp
 import pytest
 from openai import AsyncOpenAI
 from openai.types.responses.response_computer_tool_call import ResponseComputerToolCall
@@ -130,6 +132,131 @@ class _LiveBrowserComputer:
         return "https://example.com"
 
 
+async def _read_websocket_payload(
+    websocket: aiohttp.ClientWebSocketResponse,
+) -> dict[str, object]:
+    message = await websocket.receive()
+    if message.type != aiohttp.WSMsgType.TEXT:
+        raise AssertionError(f"unexpected websocket message type: {message.type}")
+
+    payload = json.loads(message.data)
+    if not isinstance(payload, dict):
+        raise AssertionError(f"unexpected websocket payload: {payload!r}")
+
+    return payload
+
+
+async def _collect_concurrent_response_summary(
+    *,
+    adapter: OpenAIResponsesAdapter,
+    openai: AsyncOpenAI,
+    model: str,
+    conversation: str | None,
+) -> dict[str, object]:
+    context = adapter.create_session()
+    websocket = await context.ensure_websocket(
+        url=adapter._http_base_url_to_ws_responses_url(str(openai.base_url)),
+        headers=adapter._websocket_headers(openai=openai, extra_headers={}),
+    )
+
+    prompts = [
+        "Output ALPHA-001 through ALPHA-120, separated by spaces, with no intro or outro.",
+        "Output BETA-001 through BETA-120, separated by spaces, with no intro or outro.",
+    ]
+
+    try:
+        for index, prompt in enumerate(prompts, start=1):
+            create_kwargs: dict[str, object] = {
+                "stream": True,
+                "model": model,
+                "input": [{"role": "user", "content": prompt}],
+                "max_output_tokens": 256,
+                "metadata": {"probe": f"request-{index}"},
+            }
+            if conversation is not None:
+                create_kwargs["conversation"] = conversation
+
+            payload = adapter._build_websocket_request_payload(create_kwargs)
+            await websocket.send_str(json.dumps(payload))
+
+        event_sequence: list[dict[str, object | None]] = []
+        response_ids: list[str] = []
+        terminal_response_ids: list[str] = []
+        errors: list[dict[str, object]] = []
+
+        while True:
+            try:
+                payload = await asyncio.wait_for(
+                    _read_websocket_payload(websocket),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                break
+
+            payload_type = payload.get("type")
+            response_id = adapter._response_id_from_payload(payload)
+            event_sequence.append(
+                {
+                    "type": payload_type if isinstance(payload_type, str) else None,
+                    "response_id": response_id,
+                }
+            )
+
+            if payload_type == "error":
+                errors.append(payload)
+                break
+
+            if payload_type == "response.created" and response_id is not None:
+                if response_id not in response_ids:
+                    response_ids.append(response_id)
+
+            if (
+                adapter._is_terminal_response_payload(payload)
+                and response_id is not None
+            ):
+                if response_id not in terminal_response_ids:
+                    terminal_response_ids.append(response_id)
+                if len(terminal_response_ids) >= 2:
+                    break
+
+        first_terminal_index = next(
+            (
+                index
+                for index, event in enumerate(event_sequence)
+                if event["type"]
+                in {
+                    "response.completed",
+                    "response.done",
+                    "response.failed",
+                    "response.incomplete",
+                }
+            ),
+            None,
+        )
+        if first_terminal_index is None:
+            interleaved_before_first_terminal = False
+        else:
+            seen_before_first_terminal = {
+                event["response_id"]
+                for event in event_sequence[: first_terminal_index + 1]
+                if isinstance(event["response_id"], str)
+            }
+            interleaved_before_first_terminal = len(seen_before_first_terminal) > 1
+
+        return {
+            "conversation": conversation or "default",
+            "response_ids": response_ids,
+            "terminal_response_ids": terminal_response_ids,
+            "error_count": len(errors),
+            "errors": errors,
+            "interleaved_before_first_terminal": interleaved_before_first_terminal,
+            "event_sequence_head": event_sequence[:20],
+            "event_count": len(event_sequence),
+        }
+    finally:
+        await context.close()
+
+
 @pytest.mark.asyncio
 async def test_openai_gpt_54_returns_live_computer_call():
     client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -202,3 +329,41 @@ async def test_openai_gpt_54_adapter_uses_native_computer_tool():
         isinstance(item, dict) and item.get("type") == "function_call"
         for item in context.previous_messages
     )
+
+
+@pytest.mark.asyncio
+async def test_explore_openai_responses_websocket_concurrent_requests():
+    model = os.getenv("OPENAI_CONCURRENCY_MODEL", "gpt-5.2")
+    openai = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    adapter = OpenAIResponsesAdapter(
+        model=model,
+        mode="websocket",
+        client=openai,
+        max_output_tokens=256,
+    )
+
+    default_summary = await _collect_concurrent_response_summary(
+        adapter=adapter,
+        openai=openai,
+        model=model,
+        conversation=None,
+    )
+    out_of_band_summary = await _collect_concurrent_response_summary(
+        adapter=adapter,
+        openai=openai,
+        model=model,
+        conversation="none",
+    )
+
+    print(
+        json.dumps(
+            {
+                "default": default_summary,
+                "conversation_none": out_of_band_summary,
+            },
+            indent=2,
+        )
+    )
+
+    assert default_summary["event_count"] > 0
+    assert out_of_band_summary["event_count"] > 0

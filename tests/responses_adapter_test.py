@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import json
 import httpx
 import logging
 import aiohttp
@@ -13,6 +15,19 @@ from openai.types.responses.response_output_message import ResponseOutputMessage
 from openai.types.responses.response_output_text import ResponseOutputText
 from yarl import URL
 
+from meshagent.agents.messages import (
+    AgentFileContentDelta,
+    AgentFileContentEnded,
+    AgentFileContentStarted,
+    AgentReasoningContentDelta,
+    AgentReasoningContentEnded,
+    AgentReasoningContentStarted,
+    AgentTextContentDelta,
+    AgentTextContentEnded,
+    AgentTextContentStarted,
+    AgentToolCallEnded,
+    AgentToolCallStarted,
+)
 from meshagent.api import RoomException
 from meshagent.api.messaging import JsonContent, TextContent
 from meshagent.computers.agent import ComputerToolkit
@@ -20,8 +35,12 @@ from meshagent.computers.operator import Operator
 from meshagent.openai.tools.responses_adapter import (
     OpenAIResponsesAdapter,
     OpenAIResponsesSessionContext,
+    ResponsesToolBundle,
+    WebSearchTool,
     _consume_streaming_tool_result,
+    safe_tool_name,
 )
+from meshagent.tools import FunctionTool, Toolkit
 
 
 class _FakeDeveloper:
@@ -44,6 +63,19 @@ class _FakeRoom:
     def __init__(self):
         self.local_participant = _FakeParticipant()
         self.developer = _FakeDeveloper()
+
+
+class _AnyArgsTool(FunctionTool):
+    def __init__(self, name: str):
+        super().__init__(
+            name=name,
+            input_schema={"type": "object", "additionalProperties": True},
+            description="test tool",
+        )
+
+    async def execute(self, context, **kwargs):
+        del context
+        return {"ok": True, "args": kwargs}
 
 
 class _FakeBrowserComputer:
@@ -201,6 +233,51 @@ class _FakeLoggingWebSocket:
         return None
 
 
+class _QueuedLoggingWebSocket:
+    def __init__(self) -> None:
+        self._messages: asyncio.Queue[_FakeLoggingWsMessage] = asyncio.Queue()
+        self.sent_payloads: list[str] = []
+        self.closed = False
+
+    def queue_json(self, payload: dict[str, object]) -> None:
+        self._messages.put_nowait(
+            _FakeLoggingWsMessage(
+                type=aiohttp.WSMsgType.TEXT,
+                data=json.dumps(payload),
+            )
+        )
+
+    async def send_str(self, payload: str):
+        self.sent_payloads.append(payload)
+
+    async def receive(self):
+        return await self._messages.get()
+
+    async def close(self):
+        self.closed = True
+
+    def exception(self):
+        return None
+
+
+class _SequentialClientSession:
+    def __init__(self, websockets: list[_QueuedLoggingWebSocket]):
+        self._websockets = websockets.copy()
+        self.closed = False
+        self.connect_calls = 0
+
+    async def ws_connect(self, *args, **kwargs):
+        del args
+        del kwargs
+        self.connect_calls += 1
+        if len(self._websockets) == 0:
+            raise AssertionError("no websocket configured")
+        return self._websockets.pop(0)
+
+    async def close(self):
+        self.closed = True
+
+
 class _FakeClientSession:
     def __init__(self, websocket: _FakeWebSocket):
         self._websocket = websocket
@@ -228,6 +305,14 @@ class _FailingHandshakeClientSession:
 
     async def close(self):
         self.closed = True
+
+
+async def _wait_for(predicate, *, timeout: float = 1.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise asyncio.TimeoutError()
+        await asyncio.sleep(0.01)
 
 
 class _FailingConnectClientSession:
@@ -1081,6 +1166,157 @@ async def test_session_context_uses_injected_session_without_closing_by_default(
 
 
 @pytest.mark.asyncio
+async def test_next_serializes_websocket_requests_per_session(monkeypatch):
+    adapter = OpenAIResponsesAdapter(mode="websocket")
+    context = adapter.create_session()
+    websocket = _QueuedLoggingWebSocket()
+
+    async def _fake_ensure_websocket(*, url: str, headers: dict[str, str]):
+        del url
+        del headers
+        return websocket
+
+    monkeypatch.setattr(context, "ensure_websocket", _fake_ensure_websocket)
+    monkeypatch.setattr(
+        adapter,
+        "get_openai_client",
+        lambda *, room: SimpleNamespace(
+            base_url="https://example.com/openai/v1",
+            default_headers={"Authorization": "Bearer test-token"},
+        ),
+    )
+
+    def _fake_coerce_response_stream_event(payload: dict):
+        payload_type = payload["type"]
+        if payload_type in {"response.completed", "response.done"}:
+            response = payload.get("response", {})
+            response_id = response.get("id", "resp_ws")
+            return _FakeCompletedEvent(response=_FakeResponse(response_id=response_id))
+        return SimpleNamespace(type=payload_type)
+
+    monkeypatch.setattr(
+        adapter,
+        "_coerce_response_stream_event",
+        _fake_coerce_response_stream_event,
+    )
+
+    first_task = asyncio.create_task(
+        adapter.next(
+            context=context,
+            room=_FakeRoom(),
+            toolkits=[],
+        )
+    )
+    await _wait_for(lambda: len(websocket.sent_payloads) == 1)
+
+    second_task = asyncio.create_task(
+        adapter.next(
+            context=context,
+            room=_FakeRoom(),
+            toolkits=[],
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert len(websocket.sent_payloads) == 1
+
+    websocket.queue_json(
+        {
+            "type": "response.completed",
+            "response": {"id": "resp_first", "output": [], "usage": None},
+        }
+    )
+    await first_task
+
+    await _wait_for(lambda: len(websocket.sent_payloads) == 2)
+    websocket.queue_json(
+        {
+            "type": "response.completed",
+            "response": {"id": "resp_second", "output": [], "usage": None},
+        }
+    )
+    await second_task
+
+
+@pytest.mark.asyncio
+async def test_cancelled_request_closes_websocket_and_next_request_reconnects(
+    monkeypatch,
+):
+    adapter = OpenAIResponsesAdapter(mode="websocket")
+    first_websocket = _QueuedLoggingWebSocket()
+    second_websocket = _QueuedLoggingWebSocket()
+    client_session = _SequentialClientSession([first_websocket, second_websocket])
+    context = OpenAIResponsesSessionContext(session=client_session)
+    monkeypatch.setattr(
+        adapter,
+        "get_openai_client",
+        lambda *, room: SimpleNamespace(
+            base_url="https://example.com/openai/v1",
+            default_headers={"Authorization": "Bearer test-token"},
+        ),
+    )
+
+    def _fake_coerce_response_stream_event(payload: dict):
+        payload_type = payload["type"]
+        if payload_type in {"response.completed", "response.done"}:
+            response = payload.get("response", {})
+            response_id = response.get("id", "resp_ws")
+            return _FakeCompletedEvent(response=_FakeResponse(response_id=response_id))
+        return SimpleNamespace(type=payload_type)
+
+    monkeypatch.setattr(
+        adapter,
+        "_coerce_response_stream_event",
+        _fake_coerce_response_stream_event,
+    )
+
+    first_task = asyncio.create_task(
+        adapter.next(
+            context=context,
+            room=_FakeRoom(),
+            toolkits=[],
+        )
+    )
+    second_task: asyncio.Task | None = None
+    try:
+        await _wait_for(lambda: len(first_websocket.sent_payloads) == 1)
+
+        first_task.cancel()
+        second_task = asyncio.create_task(
+            adapter.next(
+                context=context,
+                room=_FakeRoom(),
+                toolkits=[],
+            )
+        )
+        await _wait_for(lambda: first_websocket.closed)
+
+        with pytest.raises(asyncio.CancelledError):
+            await first_task
+
+        await _wait_for(lambda: len(second_websocket.sent_payloads) == 1)
+        assert client_session.connect_calls == 2
+        assert len(first_websocket.sent_payloads) == 1
+
+        second_websocket.queue_json(
+            {
+                "type": "response.completed",
+                "response": {"id": "resp_second", "output": [], "usage": None},
+            }
+        )
+        await second_task
+    finally:
+        if not first_task.done():
+            first_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await first_task
+        if second_task is not None and not second_task.done():
+            second_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await second_task
+        await context.close()
+
+
+@pytest.mark.asyncio
 async def test_session_context_closes_created_session_on_close(monkeypatch):
     fake_websocket = _FakeWebSocket()
     fake_session = _FakeClientSession(fake_websocket)
@@ -1165,6 +1401,22 @@ async def test_session_context_closes_session_when_ws_connect_fails(monkeypatch)
         )
 
     assert fake_session.closed is True
+
+
+def test_session_context_appends_remote_image_and_file_urls() -> None:
+    context = OpenAIResponsesSessionContext(system_role=None)
+
+    image_message = context.append_image_url(url="https://example.com/image.png")
+    file_message = context.append_file_url(url="https://example.com/report.pdf")
+
+    assert image_message["content"][0] == {
+        "type": "input_image",
+        "image_url": "https://example.com/image.png",
+    }
+    assert file_message["content"][0] == {
+        "type": "input_file",
+        "file_url": "https://example.com/report.pdf",
+    }
 
 
 @pytest.mark.asyncio
@@ -1323,3 +1575,540 @@ async def test_next_raises_after_retry_budget_is_exhausted(monkeypatch):
 
     assert client.responses.calls == 2
     assert sleep_calls == [1.0]
+
+
+def test_make_agent_event_publisher_emits_content_and_tool_messages() -> None:
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    published = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    publisher(
+        {
+            "type": "response.content_part.added",
+            "item_id": "msg_1",
+            "part": {"type": "output_text", "text": ""},
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": "Hello",
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_text.done",
+            "item_id": "msg_1",
+            "text": "Hello",
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "type": "reasoning",
+                "id": "rs_1",
+                "status": "in_progress",
+                "summary": [],
+                "content": [],
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 1,
+            "delta": "Thinking",
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "type": "reasoning",
+                "id": "rs_1",
+                "status": "completed",
+                "summary": [],
+                "content": [],
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "response.content_part.added",
+            "item_id": "file_1",
+            "part": {
+                "type": "output_file",
+                "url": "https://example.com/report.pdf",
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "response.content_part.done",
+            "item_id": "file_1",
+            "part": {
+                "type": "output_file",
+                "url": "https://example.com/report.pdf",
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_item.added",
+            "output_index": 2,
+            "item": {
+                "type": "function_call",
+                "id": "call_1",
+                "name": "lookup",
+                "arguments": '{"q":"meshagent"}',
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_item.done",
+            "output_index": 2,
+            "item": {
+                "type": "function_call",
+                "id": "call_1",
+                "name": "lookup",
+                "arguments": '{"q":"meshagent"}',
+            },
+        }
+    )
+    publisher({"type": "meshagent.handler.done", "item_id": "call_1"})
+    publisher(
+        {
+            "type": "response.output_item.added",
+            "output_index": 3,
+            "item": {
+                "type": "web_search_call",
+                "id": "search_1",
+                "status": "in_progress",
+                "queries": ["meshagent"],
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_item.done",
+            "output_index": 3,
+            "item": {
+                "type": "web_search_call",
+                "id": "search_1",
+                "status": "completed",
+                "queries": ["meshagent"],
+                "results": [{"title": "MeshAgent"}],
+            },
+        }
+    )
+
+    assert [type(event) for event in published] == [
+        AgentTextContentStarted,
+        AgentTextContentDelta,
+        AgentTextContentEnded,
+        AgentReasoningContentStarted,
+        AgentReasoningContentDelta,
+        AgentReasoningContentEnded,
+        AgentFileContentStarted,
+        AgentFileContentDelta,
+        AgentFileContentEnded,
+        AgentToolCallStarted,
+        AgentToolCallEnded,
+        AgentToolCallStarted,
+        AgentToolCallEnded,
+    ]
+    for event in published:
+        assert event.thread_id == "thread-1"
+
+    text_delta = published[1]
+    assert isinstance(text_delta, AgentTextContentDelta)
+    assert text_delta.turn_id == "turn-1"
+    assert text_delta.item_id == "msg_1"
+    assert text_delta.text == "Hello"
+
+    file_started = published[6]
+    assert isinstance(file_started, AgentFileContentStarted)
+    assert file_started.item_id == "file_1"
+
+    file_delta = published[7]
+    assert isinstance(file_delta, AgentFileContentDelta)
+    assert file_delta.url == "https://example.com/report.pdf"
+
+    function_started = published[9]
+    assert isinstance(function_started, AgentToolCallStarted)
+    assert function_started.toolkit == "function"
+    assert function_started.tool == "lookup"
+    assert function_started.arguments == {"q": "meshagent"}
+
+    web_search_ended = published[12]
+    assert isinstance(web_search_ended, AgentToolCallEnded)
+    assert isinstance(web_search_ended.result, JsonContent)
+    assert web_search_ended.result.json == {"results": [{"title": "MeshAgent"}]}
+
+
+def test_make_agent_event_publisher_preserves_text_delta_whitespace() -> None:
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    publisher(
+        {
+            "type": "response.content_part.added",
+            "item_id": "msg_1",
+            "part": {"type": "output_text", "text": ""},
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": "Hello",
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": " world",
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_text.done",
+            "item_id": "msg_1",
+            "text": "Hello world",
+        }
+    )
+
+    deltas = [
+        event.text for event in published if isinstance(event, AgentTextContentDelta)
+    ]
+
+    assert deltas == ["Hello", " world"]
+    assert "".join(deltas) == "Hello world"
+
+
+def test_make_agent_event_publisher_unmangles_function_tool_names_from_tool_bundle():
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+    toolkit = Toolkit(
+        name="search",
+        tools=[_AnyArgsTool("lookup/web")],
+    )
+    tool_bundle = ResponsesToolBundle(toolkits=[toolkit])
+    adapter._set_function_tool_name_resolver(
+        event_handler=publisher,
+        resolver=tool_bundle.resolve_function_tool_name,
+    )
+
+    safe_name = safe_tool_name("lookup/web")
+    publisher(
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "id": "call_1",
+                "name": safe_name,
+                "arguments": '{"q":"meshagent"}',
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "id": "call_1",
+                "name": safe_name,
+                "arguments": '{"q":"meshagent"}',
+            },
+        }
+    )
+    publisher({"type": "meshagent.handler.done", "item_id": "call_1"})
+
+    assert [type(event) for event in published] == [
+        AgentToolCallStarted,
+        AgentToolCallEnded,
+    ]
+    started = published[0]
+    assert isinstance(started, AgentToolCallStarted)
+    assert started.toolkit == "search"
+    assert started.tool == "lookup/web"
+    assert started.arguments == {"q": "meshagent"}
+
+
+def test_make_agent_event_publisher_updates_function_tool_failure_from_handler_done():
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    publisher(
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "id": "call_1",
+                "name": "write_file",
+                "arguments": "",
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "id": "call_1",
+                "name": "write_file",
+                "arguments": '{"path":"src/app.py"}',
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "meshagent.handler.done",
+            "item_id": "call_1",
+            "error": "'text' is a required property",
+        }
+    )
+
+    assert [type(event) for event in published] == [
+        AgentToolCallStarted,
+        AgentToolCallStarted,
+        AgentToolCallEnded,
+    ]
+    updated_started = published[1]
+    assert isinstance(updated_started, AgentToolCallStarted)
+    assert updated_started.arguments == {"path": "src/app.py"}
+
+    ended = published[2]
+    assert isinstance(ended, AgentToolCallEnded)
+    assert ended.error is not None
+    assert ended.error.message == "'text' is a required property"
+
+
+def test_make_agent_event_publisher_emits_web_search_tool_events() -> None:
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    publisher(
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "web_search_call",
+                "id": "search_1",
+                "status": "in_progress",
+                "queries": ["meshagent"],
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "web_search_call",
+                "id": "search_1",
+                "status": "completed",
+                "queries": ["meshagent"],
+                "results": [{"title": "MeshAgent"}],
+            },
+        }
+    )
+
+    assert [type(event) for event in published] == [
+        AgentToolCallStarted,
+        AgentToolCallEnded,
+    ]
+    started = published[0]
+    assert isinstance(started, AgentToolCallStarted)
+    assert started.toolkit == "openai"
+    assert started.tool == "web_search"
+    assert started.arguments == {"queries": ["meshagent"]}
+
+    ended = published[1]
+    assert isinstance(ended, AgentToolCallEnded)
+    assert isinstance(ended.result, JsonContent)
+    assert ended.result.json == {"results": [{"title": "MeshAgent"}]}
+
+
+def test_web_search_tool_uses_current_responses_tool_definition() -> None:
+    tool = WebSearchTool()
+
+    assert tool.get_open_ai_tool_definitions() == [{"type": "web_search"}]
+
+
+def test_make_agent_event_publisher_emits_shell_tool_events() -> None:
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    publisher(
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "shell_call",
+                "id": "shell_1",
+                "call_id": "call_1",
+                "status": "in_progress",
+                "action": {"command": ["echo", "hi"]},
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "shell_call",
+                "id": "shell_1",
+                "call_id": "call_1",
+                "status": "completed",
+                "action": {"command": ["echo", "hi"]},
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "meshagent.handler.done",
+            "item": {
+                "type": "shell_call_output",
+                "call_id": "call_1",
+                "output": [
+                    {
+                        "outcome": {"type": "exit", "exit_code": 0},
+                        "stdout": "hi\n",
+                        "stderr": "",
+                    }
+                ],
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "type": "local_shell_call",
+                "id": "local_shell_1",
+                "call_id": "call_2",
+                "status": "in_progress",
+                "action": {"command": "echo hi"},
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "type": "local_shell_call",
+                "id": "local_shell_1",
+                "call_id": "call_2",
+                "status": "completed",
+                "action": {"command": "echo hi"},
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "meshagent.handler.done",
+            "item": {
+                "type": "local_shell_call_output",
+                "call_id": "call_2",
+                "output": "hi\n",
+            },
+        }
+    )
+
+    assert [type(event) for event in published] == [
+        AgentToolCallStarted,
+        AgentToolCallEnded,
+        AgentToolCallStarted,
+        AgentToolCallEnded,
+    ]
+
+    shell_started = published[0]
+    assert isinstance(shell_started, AgentToolCallStarted)
+    assert shell_started.toolkit == "openai"
+    assert shell_started.tool == "shell"
+    assert shell_started.arguments == {"action": {"command": ["echo", "hi"]}}
+
+    shell_ended = published[1]
+    assert isinstance(shell_ended, AgentToolCallEnded)
+    assert isinstance(shell_ended.result, JsonContent)
+    assert shell_ended.result.json == {
+        "output": [
+            {
+                "outcome": {"type": "exit", "exit_code": 0},
+                "stdout": "hi\n",
+                "stderr": "",
+            }
+        ]
+    }
+
+    local_shell_started = published[2]
+    assert isinstance(local_shell_started, AgentToolCallStarted)
+    assert local_shell_started.toolkit == "openai"
+    assert local_shell_started.tool == "local_shell"
+    assert local_shell_started.arguments == {"action": {"command": "echo hi"}}
+
+    local_shell_ended = published[3]
+    assert isinstance(local_shell_ended, AgentToolCallEnded)
+    assert isinstance(local_shell_ended.result, TextContent)
+    assert local_shell_ended.result.text == "hi\n"

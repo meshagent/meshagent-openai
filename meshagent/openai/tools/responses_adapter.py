@@ -1,5 +1,10 @@
 from meshagent.agents.agent import AgentSessionContext
 from meshagent.api import RoomClient, RoomException, RemoteParticipant
+from meshagent.agents.event_publisher import (
+    _OpenAIAgentEventPublisher,
+    make_openai_agent_event_publisher,
+)
+from meshagent.agents.messages import AgentMessage
 from meshagent.tools import Toolkit, ToolContext, FunctionTool, BaseTool
 from meshagent.api.messaging import (
     Content,
@@ -18,13 +23,15 @@ from meshagent.agents.adapter import (
     LLMAdapter,
     ToolkitBuilder,
     ToolkitConfig,
+    ToolCallApprovalHandler,
+    ToolCallApprovalRequest,
 )
 
 from meshagent.tools.script import DEFAULT_CONTAINER_MOUNT_SPEC
 
 from meshagent.api.specs.service import ContainerMountSpec
 import json
-from collections.abc import AsyncIterable, Mapping
+from collections.abc import AsyncIterable, Awaitable, Mapping
 from typing import Any, List, Literal, cast
 from meshagent.openai.proxy import get_client, get_logging_httpx_client
 from openai import AsyncOpenAI, NOT_GIVEN, APIError, APIStatusError
@@ -50,6 +57,7 @@ from meshagent.openai.tools.usage import (
     normalize_openai_usage,
     preprocess_openai_usage,
 )
+import contextlib
 
 logger = logging.getLogger("openai_agent")
 tracer = trace.get_tracer("openai.llm.responses")
@@ -111,6 +119,7 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
         self._websocket_ping_task: asyncio.Task[None] | None = None
         self._websocket_timeout_task: asyncio.Task[None] | None = None
         self._websocket_lock = asyncio.Lock()
+        self._request_lock = asyncio.Lock()
 
     @staticmethod
     def _headers_signature(headers: dict[str, str]) -> tuple[tuple[str, str], ...]:
@@ -374,6 +383,19 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
         self.messages.append(message)
         return message
 
+    def append_image_url(self, *, url: str) -> dict:
+        message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_image",
+                    "image_url": url,
+                },
+            ],
+        }
+        self.messages.append(message)
+        return message
+
     def append_file_message(
         self, *, filename: str, mime_type: str, data: bytes
     ) -> dict:
@@ -384,6 +406,19 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
                     "type": "input_file",
                     "filename": filename,
                     "file_data": f"data:{mime_type or 'text/plain'};base64,{base64.b64encode(data).decode()}",
+                }
+            ],
+        }
+        self.messages.append(message)
+        return message
+
+    def append_file_url(self, *, url: str) -> dict:
+        message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_file",
+                    "file_url": url,
                 }
             ],
         }
@@ -537,10 +572,6 @@ class ResponsesToolBundle:
                         open_ai_tools.append(fn)
 
                 elif isinstance(v, FunctionTool):
-                    strict = True
-                    if hasattr(v, "strict"):
-                        strict = getattr(v, "strict")
-
                     fn = {
                         "type": "function",
                         "name": name,
@@ -548,7 +579,7 @@ class ResponsesToolBundle:
                         "parameters": {
                             **v.input_schema,
                         },
-                        "strict": strict,
+                        "strict": v.strict,
                     }
 
                     if v.defs is not None:
@@ -590,6 +621,17 @@ class ResponsesToolBundle:
 
     def get_tool(self, name: str) -> BaseTool | None:
         return self._tools_by_name.get(name, None)
+
+    def resolve_function_tool_name(self, safe_name: str) -> tuple[str, str] | None:
+        original_name = self._safe_names.get(safe_name)
+        if original_name is None:
+            return None
+
+        toolkit = self._executors.get(original_name)
+        if toolkit is None:
+            return None
+
+        return toolkit.name, original_name
 
     def contains(self, name: str) -> bool:
         return name in self._open_ai_tools
@@ -776,7 +818,7 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
                     return [message]
 
 
-class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
+class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
     _context_window_sizes = {
         "gpt-4.1": 128000,
         "gpt-4o": 128000,
@@ -851,9 +893,36 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         self._max_retries = max_retries
         self._mode = mode
         self._websocket_timeout = websocket_timeout
+        self._tool_call_approval_handler: ToolCallApprovalHandler | None = None
 
     def default_model(self) -> str:
         return self._model
+
+    def set_tool_call_approval_handler(
+        self, handler: ToolCallApprovalHandler | None
+    ) -> None:
+        self._tool_call_approval_handler = handler
+
+    def make_agent_event_publisher(
+        self,
+        turn_id: str,
+        thread_id: str,
+        callback: Callable[[AgentMessage], None],
+    ) -> Callable[[dict[str, Any]], None]:
+        return make_openai_agent_event_publisher(
+            turn_id=turn_id,
+            thread_id=thread_id,
+            callback=callback,
+        )
+
+    def _set_function_tool_name_resolver(
+        self,
+        *,
+        event_handler: Callable[[dict[str, Any]], None] | None,
+        resolver: Callable[[str], tuple[str, str] | None] | None,
+    ) -> None:
+        if isinstance(event_handler, _OpenAIAgentEventPublisher):
+            event_handler.set_function_tool_name_resolver(resolver)
 
     def create_session(self):
         context = OpenAIResponsesSessionContext(
@@ -1250,6 +1319,122 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         return cast(ResponseStreamEvent, event)
 
     @staticmethod
+    def _response_id_from_payload(payload: dict[str, Any]) -> str | None:
+        raw_response_id = payload.get("response_id")
+        if isinstance(raw_response_id, str):
+            response_id = raw_response_id.strip()
+            if response_id != "":
+                return response_id
+
+        response = payload.get("response")
+        if not isinstance(response, dict):
+            return None
+
+        raw_response_object_id = response.get("id")
+        if not isinstance(raw_response_object_id, str):
+            return None
+
+        response_object_id = raw_response_object_id.strip()
+        return response_object_id if response_object_id != "" else None
+
+    @classmethod
+    def _payload_matches_response(
+        cls,
+        *,
+        payload: dict[str, Any],
+        response_id: str | None,
+    ) -> bool:
+        if response_id is None:
+            return True
+
+        payload_response_id = cls._response_id_from_payload(payload)
+        return payload_response_id is None or payload_response_id == response_id
+
+    @staticmethod
+    def _is_terminal_response_payload(payload: dict[str, Any]) -> bool:
+        payload_type = payload.get("type")
+        return payload_type in {
+            "response.completed",
+            "response.done",
+            "response.failed",
+            "response.incomplete",
+        }
+
+    async def _receive_websocket_payload(
+        self,
+        *,
+        websocket: aiohttp.ClientWebSocketResponse,
+    ) -> dict[str, Any]:
+        while True:
+            msg = await websocket.receive()
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                try:
+                    payload = json.loads(msg.data)
+                except json.JSONDecodeError as error:
+                    raise RoomException(
+                        f"OpenAI websocket returned invalid JSON: {error}"
+                    ) from error
+                if not isinstance(payload, dict):
+                    continue
+
+                payload_type = payload.get("type")
+                if self._log_requests:
+                    logger.info("<== WS event=%s", payload_type)
+                    logger.info("body=%s", _safe_json_for_log(payload))
+
+                if payload_type == "error":
+                    message = payload.get("message")
+                    if isinstance(message, str):
+                        raise RoomException(f"Error from OpenAI websocket: {message}")
+                    raise RoomException(
+                        f"Error from OpenAI websocket: {json.dumps(payload)}"
+                    )
+
+                return payload
+
+            if msg.type == aiohttp.WSMsgType.CLOSED:
+                raise RoomException("OpenAI websocket closed unexpectedly")
+            if msg.type == aiohttp.WSMsgType.CLOSE:
+                raise RoomException("OpenAI websocket closed unexpectedly")
+            if msg.type == aiohttp.WSMsgType.CLOSING:
+                raise RoomException("OpenAI websocket is closing unexpectedly")
+            if msg.type == aiohttp.WSMsgType.ERROR:
+                raise RoomException(f"OpenAI websocket error: {websocket.exception()}")
+            if msg.type == aiohttp.WSMsgType.BINARY:
+                raise RoomException(
+                    "OpenAI websocket returned unexpected binary message"
+                )
+
+    @staticmethod
+    async def _run_cancelled_cleanup(
+        *,
+        cleanup: Callable[[], Awaitable[None]],
+    ) -> None:
+        current_task = asyncio.current_task()
+        suppressed_cancellations = 0
+
+        if current_task is not None:
+            while current_task.cancelling():
+                current_task.uncancel()
+                suppressed_cancellations += 1
+
+        try:
+            while True:
+                try:
+                    await cleanup()
+                    return
+                except asyncio.CancelledError:
+                    if current_task is None:
+                        raise
+                    while current_task.cancelling():
+                        current_task.uncancel()
+                        suppressed_cancellations += 1
+        finally:
+            if current_task is not None:
+                for _ in range(suppressed_cancellations):
+                    current_task.cancel()
+
+    @staticmethod
     def _build_websocket_request_payload(create_kwargs: dict) -> dict:
         payload = {
             "type": "response.create",
@@ -1326,55 +1511,30 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         await websocket.send_str(json.dumps(request_payload))
 
         async def event_stream():
+            response_id: str | None = None
             while True:
-                msg = await websocket.receive()
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    try:
-                        payload = json.loads(msg.data)
-                    except json.JSONDecodeError as error:
-                        raise RoomException(
-                            f"OpenAI websocket returned invalid JSON: {error}"
-                        ) from error
-                    if not isinstance(payload, dict):
-                        continue
+                payload = await self._receive_websocket_payload(
+                    websocket=websocket,
+                )
 
-                    payload_type = payload.get("type")
-                    if self._log_requests:
-                        logger.info("<== WS event=%s", payload_type)
-                        logger.info("body=%s", _safe_json_for_log(payload))
-                    if payload_type == "error":
-                        message = payload.get("message")
-                        if isinstance(message, str):
-                            raise RoomException(
-                                f"Error from OpenAI websocket: {message}"
-                            )
-                        raise RoomException(
-                            f"Error from OpenAI websocket: {json.dumps(payload)}"
-                        )
-
-                    event = self._coerce_response_stream_event(payload)
-                    yield event
-                    if event.type in (
-                        "response.completed",
-                        "response.failed",
-                        "response.incomplete",
-                    ):
-                        return
-
-                elif msg.type == aiohttp.WSMsgType.CLOSED:
-                    raise RoomException("OpenAI websocket closed unexpectedly")
-                elif msg.type == aiohttp.WSMsgType.CLOSE:
-                    raise RoomException("OpenAI websocket closed unexpectedly")
-                elif msg.type == aiohttp.WSMsgType.CLOSING:
-                    raise RoomException("OpenAI websocket is closing unexpectedly")
-                elif msg.type == aiohttp.WSMsgType.ERROR:
-                    raise RoomException(
-                        f"OpenAI websocket error: {websocket.exception()}"
+                payload_response_id = self._response_id_from_payload(payload)
+                if response_id is None and payload_response_id is not None:
+                    response_id = payload_response_id
+                elif not self._payload_matches_response(
+                    payload=payload,
+                    response_id=response_id,
+                ):
+                    logger.warning(
+                        "ignoring websocket event for response %s while waiting for response %s",
+                        payload_response_id,
+                        response_id,
                     )
-                elif msg.type == aiohttp.WSMsgType.BINARY:
-                    raise RoomException(
-                        "OpenAI websocket returned unexpected binary message"
-                    )
+                    continue
+
+                event = self._coerce_response_stream_event(payload)
+                yield event
+                if self._is_terminal_response_payload(payload):
+                    return
 
         return event_stream()
 
@@ -1388,7 +1548,7 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
         room: RoomClient,
         toolkits: list[Toolkit],
         output_schema: Optional[dict] = None,
-        event_handler: Optional[Callable[[dict], None]] = None,
+        event_handler: Optional[Callable[[dict[str, Any]], None]] = None,
         on_behalf_of: Optional[RemoteParticipant] = None,
         options: Optional[dict] = None,
     ):
@@ -1407,65 +1567,74 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
 
         with tracer.start_as_current_span("llm.turn") as span:
             span.set_attributes({"chat_context": context.id, "api": "responses"})
+            async with contextlib.AsyncExitStack() as exit_stack:
+                if isinstance(context, OpenAIResponsesSessionContext):
+                    await exit_stack.enter_async_context(context._request_lock)
 
-            tool_adapter = OpenAIResponsesToolResponseAdapter()
+                tool_adapter = OpenAIResponsesToolResponseAdapter()
 
-            try:
-                while True:
-                    with tracer.start_as_current_span("llm.turn.iteration") as span:
-                        span.set_attributes(
-                            {"model": model, "provider": self._provider}
-                        )
+                try:
+                    while True:
+                        with tracer.start_as_current_span("llm.turn.iteration") as span:
+                            span.set_attributes(
+                                {"model": model, "provider": self._provider}
+                            )
 
-                        response_name = "response"
+                            response_name = "response"
 
-                        # We need to do this inside the loop because tools can change mid loop
-                        # for example computer use adds goto tools after the first interaction
-                        tool_bundle = ResponsesToolBundle(
-                            toolkits=[
-                                *toolkits,
-                            ]
-                        )
-                        open_ai_tools = tool_bundle.to_json()
+                            # We need to do this inside the loop because tools can change mid loop
+                            # for example computer use adds goto tools after the first interaction
+                            tool_bundle = ResponsesToolBundle(
+                                toolkits=[
+                                    *toolkits,
+                                ]
+                            )
+                            self._set_function_tool_name_resolver(
+                                event_handler=event_handler,
+                                resolver=tool_bundle.resolve_function_tool_name,
+                            )
+                            open_ai_tools = tool_bundle.to_json()
 
-                        if open_ai_tools is None:
-                            open_ai_tools = NOT_GIVEN
+                            if open_ai_tools is None:
+                                open_ai_tools = NOT_GIVEN
 
-                        ptc = self._parallel_tool_calls
-                        extra = {}
-                        if ptc is not None and not model.startswith("o"):
-                            extra["parallel_tool_calls"] = ptc
-                            span.set_attribute("parallel_tool_calls", ptc)
-                        else:
-                            span.set_attribute("parallel_tool_calls", False)
+                            ptc = self._parallel_tool_calls
+                            extra = {}
+                            if ptc is not None and not model.startswith("o"):
+                                extra["parallel_tool_calls"] = ptc
+                                span.set_attribute("parallel_tool_calls", ptc)
+                            else:
+                                span.set_attribute("parallel_tool_calls", False)
 
-                        text = NOT_GIVEN
-                        if output_schema is not None:
-                            span.set_attribute("response_format", "json_schema")
-                            text = {
-                                "format": {
-                                    "type": "json_schema",
-                                    "name": response_name,
-                                    "schema": output_schema,
-                                    "strict": True,
+                            text = NOT_GIVEN
+                            if output_schema is not None:
+                                span.set_attribute("response_format", "json_schema")
+                                text = {
+                                    "format": {
+                                        "type": "json_schema",
+                                        "name": response_name,
+                                        "schema": output_schema,
+                                        "strict": True,
+                                    }
                                 }
-                            }
-                        else:
-                            span.set_attribute("response_format", "text")
+                            else:
+                                span.set_attribute("response_format", "text")
 
-                        previous_response_id = NOT_GIVEN
-                        instructions = context.get_system_instructions()
-                        if context.previous_response_id is not None:
-                            previous_response_id = context.previous_response_id
+                            previous_response_id = NOT_GIVEN
+                            instructions = context.get_system_instructions()
+                            if context.previous_response_id is not None:
+                                previous_response_id = context.previous_response_id
 
-                        stream = self._mode == "websocket" or event_handler is not None
-                        context_messages_snapshot = copy.deepcopy(context.messages)
-                        context_previous_messages_snapshot = copy.deepcopy(
-                            context.previous_messages
-                        )
-                        context_previous_response_id_snapshot = (
-                            context.previous_response_id
-                        )
+                            stream = (
+                                self._mode == "websocket" or event_handler is not None
+                            )
+                            context_messages_snapshot = copy.deepcopy(context.messages)
+                            context_previous_messages_snapshot = copy.deepcopy(
+                                context.previous_messages
+                            )
+                            context_previous_response_id_snapshot = (
+                                context.previous_response_id
+                            )
 
                         with tracer.start_as_current_span("llm.invoke") as span:
                             response_options = copy.deepcopy(self._response_options)
@@ -1584,6 +1753,15 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                             "chat": context.to_json()
                                                         },
                                                     )
+                                                    if event_handler is not None:
+                                                        event_handler(
+                                                            {
+                                                                "type": "meshagent.handler.added",
+                                                                "item": tool_call.model_dump(
+                                                                    mode="json"
+                                                                ),
+                                                            }
+                                                        )
                                                     tool_result = (
                                                         await tool_bundle.execute(
                                                             context=tool_context,
@@ -1602,6 +1780,34 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                         )
                                                     else:
                                                         tool_response = tool_result
+                                                    if event_handler is not None:
+                                                        handler_result = None
+                                                        if isinstance(
+                                                            tool_response, JsonContent
+                                                        ):
+                                                            handler_result = (
+                                                                tool_response.json
+                                                            )
+                                                        elif isinstance(
+                                                            tool_response, TextContent
+                                                        ):
+                                                            handler_result = (
+                                                                tool_response.text
+                                                            )
+                                                        elif isinstance(
+                                                            tool_response,
+                                                            (dict, list, str),
+                                                        ):
+                                                            handler_result = (
+                                                                tool_response
+                                                            )
+                                                        event_handler(
+                                                            {
+                                                                "type": "meshagent.handler.done",
+                                                                "item_id": tool_call.id,
+                                                                "result": handler_result,
+                                                            }
+                                                        )
                                                     logger.info(
                                                         f"tool response {tool_response}"
                                                     )
@@ -1627,6 +1833,15 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                         "error": f"{e}",
                                                     },
                                                 )
+
+                                                if event_handler is not None:
+                                                    event_handler(
+                                                        {
+                                                            "type": "meshagent.handler.done",
+                                                            "item_id": tool_call.id,
+                                                            "error": f"{e}",
+                                                        }
+                                                    )
 
                                                 return [
                                                     {
@@ -2074,8 +2289,22 @@ class OpenAIResponsesAdapter(LLMAdapter[ResponseStreamEvent]):
                                                 create_kwargs=create_kwargs,
                                             )
 
-            except APIError as e:
-                raise RoomException(f"Error from OpenAI: {e}")
+                except asyncio.CancelledError:
+                    if self._mode == "websocket" and isinstance(
+                        context, OpenAIResponsesSessionContext
+                    ):
+                        with contextlib.suppress(Exception):
+                            await self._run_cancelled_cleanup(
+                                cleanup=context.close_websocket,
+                            )
+                    raise
+                except APIError as e:
+                    raise RoomException(f"Error from OpenAI: {e}")
+                finally:
+                    self._set_function_tool_name_resolver(
+                        event_handler=event_handler,
+                        resolver=None,
+                    )
 
 
 class OpenAIResponsesTool(BaseTool):
@@ -2994,12 +3223,36 @@ class MCPTool(OpenAIResponsesTool):
         self,
         context: ToolContext,
         *,
+        id: str,
         name: str,
         arguments: str,
         server_label: str,
         **extra,
     ) -> bool:
-        return True
+        del extra
+
+        handler = self._tool_call_approval_handler
+        if handler is None:
+            return True
+
+        parsed_arguments: dict[str, Any] | None = None
+        try:
+            raw_arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            raw_arguments = None
+
+        if isinstance(raw_arguments, dict):
+            parsed_arguments = raw_arguments
+
+        return await handler(
+            context,
+            ToolCallApprovalRequest(
+                item_id=id,
+                toolkit=server_label,
+                tool=name,
+                arguments=parsed_arguments,
+            ),
+        )
 
     async def handle_mcp_approval_request(
         self,
@@ -3014,7 +3267,11 @@ class MCPTool(OpenAIResponsesTool):
     ):
         logger.info(f"approval requested for MCP tool {server_label}.{name}")
         should_approve = await self.on_mcp_approval_request(
-            context, arguments=arguments, name=name, server_label=server_label
+            context,
+            id=id,
+            arguments=arguments,
+            name=name,
+            server_label=server_label,
         )
         if should_approve:
             logger.info(f"approval granted for MCP tool {server_label}.{name}")
@@ -3157,7 +3414,7 @@ class WebSearchTool(OpenAIResponsesTool):
         super().__init__(name="web_search")
 
     def get_open_ai_tool_definitions(self) -> list[dict]:
-        return [{"type": "web_search_preview"}]
+        return [{"type": "web_search"}]
 
     def get_open_ai_stream_callbacks(self):
         return {
