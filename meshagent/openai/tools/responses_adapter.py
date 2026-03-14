@@ -21,6 +21,7 @@ from meshagent.api.messaging import ensure_content
 from meshagent.agents.adapter import (
     ToolResponseAdapter,
     LLMAdapter,
+    SteeringCallback,
     ToolkitBuilder,
     ToolkitConfig,
     ToolCallApprovalHandler,
@@ -47,7 +48,7 @@ import asyncio
 import aiohttp
 import math
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 import copy
 from opentelemetry import trace
 from html_to_markdown import convert
@@ -1549,6 +1550,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         toolkits: list[Toolkit],
         output_schema: Optional[dict] = None,
         event_handler: Optional[Callable[[dict[str, Any]], None]] = None,
+        steering_callback: SteeringCallback | None = None,
         on_behalf_of: Optional[RemoteParticipant] = None,
         options: Optional[dict] = None,
     ):
@@ -1572,6 +1574,32 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                     await exit_stack.enter_async_context(context._request_lock)
 
                 tool_adapter = OpenAIResponsesToolResponseAdapter()
+                context_messages_snapshot = copy.deepcopy(context.messages)
+                context_previous_messages_snapshot = copy.deepcopy(
+                    context.previous_messages
+                )
+                context_previous_response_id_snapshot = context.previous_response_id
+                iteration_committed = False
+
+                def restore_context_snapshot() -> None:
+                    context.messages.clear()
+                    context.messages.extend(copy.deepcopy(context_messages_snapshot))
+                    context.previous_messages.clear()
+                    context.previous_messages.extend(
+                        copy.deepcopy(context_previous_messages_snapshot)
+                    )
+                    context.previous_response_id = context_previous_response_id_snapshot
+
+                def commit_local_tool_boundary(
+                    *,
+                    response_output_messages: list[dict[str, Any]],
+                    next_messages: list[Any],
+                ) -> None:
+                    nonlocal iteration_committed
+                    restore_context_snapshot()
+                    context.messages.extend(copy.deepcopy(response_output_messages))
+                    context.messages.extend(copy.deepcopy(next_messages))
+                    iteration_committed = True
 
                 try:
                     while True:
@@ -1635,6 +1663,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                             context_previous_response_id_snapshot = (
                                 context.previous_response_id
                             )
+                            iteration_committed = False
 
                         with tracer.start_as_current_span("llm.invoke") as span:
                             response_options = copy.deepcopy(self._response_options)
@@ -1818,6 +1847,16 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                         response=tool_response,
                                                     )
 
+                                            except asyncio.CancelledError:
+                                                if event_handler is not None:
+                                                    event_handler(
+                                                        {
+                                                            "type": "meshagent.handler.done",
+                                                            "item_id": tool_call.id,
+                                                            "error": "cancelled",
+                                                        }
+                                                    )
+                                                raise
                                             except Exception as e:
                                                 logger.error(
                                                     f"unable to complete tool call {tool_call}",
@@ -1927,10 +1966,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                                         "message": error,
                                                                     },
                                                                 )
-                                                                context.messages.append(
-                                                                    error
-                                                                )
-                                                                continue
+                                                                return [error], False
 
                                                 return [full_response], True
 
@@ -2077,20 +2113,51 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                     },
                                 )
 
-                                context.track_response(response.id)
-
                                 final_outputs = []
+                                next_messages: list[Any] = []
+                                response_output_messages: list[dict[str, Any]] = []
+                                restart_after_tool_boundary = False
 
-                                for message in response.output:
-                                    context.previous_messages.append(message.to_dict())
+                                for output_index, message in enumerate(response.output):
+                                    response_output_messages.append(message.to_dict())
                                     outputs, done = await handle_message(
                                         message=message
                                     )
                                     if done:
                                         final_outputs.extend(outputs)
                                     else:
-                                        for output in outputs:
-                                            context.messages.append(output)
+                                        next_messages.extend(outputs)
+                                        if (
+                                            steering_callback is not None
+                                            and len(outputs) > 0
+                                            and output_index < len(response.output) - 1
+                                        ):
+                                            commit_local_tool_boundary(
+                                                response_output_messages=response_output_messages,
+                                                next_messages=next_messages,
+                                            )
+                                            if await steering_callback():
+                                                restart_after_tool_boundary = True
+                                                break
+                                            restore_context_snapshot()
+                                            iteration_committed = False
+
+                                if restart_after_tool_boundary:
+                                    continue
+
+                                context.track_response(response.id)
+                                context.previous_messages.extend(
+                                    response_output_messages
+                                )
+                                context.messages.extend(next_messages)
+                                iteration_committed = True
+
+                                if (
+                                    steering_callback is not None
+                                    and len(next_messages) > 0
+                                ):
+                                    if await steering_callback():
+                                        continue
 
                                 if len(final_outputs) > 0:
                                     return final_outputs[0]
@@ -2118,6 +2185,8 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                 while True:
                                     final_outputs = []
                                     all_outputs = []
+                                    response_output_messages: list[dict[str, Any]] = []
+                                    restart_after_tool_boundary = False
                                     try:
                                         async for e in response:
                                             with tracer.start_as_current_span(
@@ -2131,6 +2200,12 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                     }
                                                 )
                                                 if (
+                                                    restart_after_tool_boundary
+                                                    and event.type
+                                                    != "response.completed"
+                                                ):
+                                                    continue
+                                                if (
                                                     self._should_publish_stream_event(
                                                         event=event
                                                     )
@@ -2141,6 +2216,13 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                     )
 
                                                 if event.type == "response.completed":
+                                                    if restart_after_tool_boundary:
+                                                        self._store_usage(
+                                                            context=context,
+                                                            usage=event.response.usage,
+                                                            model=model,
+                                                        )
+                                                        break
                                                     context.track_response(
                                                         event.response.id
                                                     )
@@ -2157,6 +2239,15 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                     )
 
                                                     context.messages.extend(all_outputs)
+                                                    iteration_committed = True
+
+                                                    if (
+                                                        steering_callback is not None
+                                                        and len(all_outputs) > 0
+                                                    ):
+                                                        if await steering_callback():
+                                                            all_outputs = []
+                                                            continue
 
                                                     with tracer.start_as_current_span(
                                                         "llm.turn.check_for_termination"
@@ -2197,6 +2288,9 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                     event.type
                                                     == "response.output_item.done"
                                                 ):
+                                                    response_output_messages.append(
+                                                        event.item.to_dict()
+                                                    )
                                                     (
                                                         outputs,
                                                         done,
@@ -2208,6 +2302,24 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                     else:
                                                         for output in outputs:
                                                             all_outputs.append(output)
+                                                        if (
+                                                            steering_callback
+                                                            is not None
+                                                            and len(outputs) > 0
+                                                        ):
+                                                            commit_local_tool_boundary(
+                                                                response_output_messages=response_output_messages,
+                                                                next_messages=all_outputs,
+                                                            )
+                                                            if await steering_callback():
+                                                                final_outputs = []
+                                                                all_outputs = []
+                                                                restart_after_tool_boundary = True
+                                                            else:
+                                                                restore_context_snapshot()
+                                                                iteration_committed = (
+                                                                    False
+                                                                )
 
                                                 else:
                                                     for toolkit in toolkits:
@@ -2239,6 +2351,8 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
 
                                                 if len(final_outputs) > 0:
                                                     return final_outputs[0]
+                                        if restart_after_tool_boundary:
+                                            continue
                                         break
 
                                     except APIError as error:
@@ -2260,19 +2374,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                             delay_seconds=delay_seconds,
                                         )
 
-                                        context.messages.clear()
-                                        context.messages.extend(
-                                            copy.deepcopy(context_messages_snapshot)
-                                        )
-                                        context.previous_messages.clear()
-                                        context.previous_messages.extend(
-                                            copy.deepcopy(
-                                                context_previous_messages_snapshot
-                                            )
-                                        )
-                                        context.previous_response_id = (
-                                            context_previous_response_id_snapshot
-                                        )
+                                        restore_context_snapshot()
 
                                         await asyncio.sleep(delay_seconds)
                                         if self._mode == "websocket":
@@ -2290,6 +2392,8 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                             )
 
                 except asyncio.CancelledError:
+                    if not iteration_committed:
+                        restore_context_snapshot()
                     if self._mode == "websocket" and isinstance(
                         context, OpenAIResponsesSessionContext
                     ):
@@ -2985,11 +3089,15 @@ class MCPToolDefinition:
 
 
 class MCPServer(BaseModel):
+    class Header(BaseModel):
+        name: str
+        value: str
+
     server_label: str
     server_url: Optional[str] = None
     allowed_tools: Optional[list[str]] = None
     authorization: Optional[str] = None
-    headers: Optional[dict] = None
+    headers: Optional[list[Header]] = None
 
     # require approval for all tools
     require_approval: Optional[Literal["always", "never"]] = None
@@ -2999,6 +3107,23 @@ class MCPServer(BaseModel):
     never_require_approval: Optional[list[str]] = None
 
     openai_connector_id: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_headers(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+
+        headers = value.get("headers")
+        if not isinstance(headers, dict):
+            return value
+
+        normalized = dict(value)
+        normalized["headers"] = [
+            {"name": str(key), "value": str(header_value)}
+            for key, header_value in headers.items()
+        ]
+        return normalized
 
 
 class MCPConfig(ToolkitConfig):
@@ -3040,7 +3165,9 @@ class MCPTool(OpenAIResponsesTool):
                 opts["authorization"] = server.authorization
 
             if server.headers is not None:
-                opts["headers"] = server.headers
+                opts["headers"] = {
+                    header.name: header.value for header in server.headers
+                }
 
             if (
                 server.always_require_approval is not None

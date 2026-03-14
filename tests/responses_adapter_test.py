@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import copy
 import json
 import httpx
 import logging
@@ -11,6 +12,7 @@ from openai._models import BaseModel as OpenAIBaseModel
 from types import SimpleNamespace
 from openai import APIError
 from openai.types.responses.response_computer_tool_call import ResponseComputerToolCall
+from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai.types.responses.response_output_message import ResponseOutputMessage
 from openai.types.responses.response_output_text import ResponseOutputText
 from yarl import URL
@@ -33,6 +35,8 @@ from meshagent.api.messaging import JsonContent, TextContent
 from meshagent.computers.agent import ComputerToolkit
 from meshagent.computers.operator import Operator
 from meshagent.openai.tools.responses_adapter import (
+    MCPConfig,
+    MCPTool,
     OpenAIResponsesAdapter,
     OpenAIResponsesSessionContext,
     ResponsesToolBundle,
@@ -76,6 +80,22 @@ class _AnyArgsTool(FunctionTool):
     async def execute(self, context, **kwargs):
         del context
         return {"ok": True, "args": kwargs}
+
+
+class _BlockingTool(FunctionTool):
+    def __init__(self, name: str):
+        super().__init__(
+            name=name,
+            input_schema={"type": "object", "additionalProperties": True},
+            description="blocking test tool",
+        )
+        self.started = asyncio.Event()
+
+    async def execute(self, context, **kwargs):
+        del context
+        del kwargs
+        self.started.set()
+        await asyncio.Future()
 
 
 class _FakeBrowserComputer:
@@ -126,6 +146,30 @@ class _FakeResponse:
         }
 
 
+def test_openai_mcp_tool_coerces_headers_dict_to_strict_header_entries() -> None:
+    config = MCPConfig.model_validate(
+        {
+            "name": "mcp",
+            "servers": [
+                {
+                    "server_label": "docs",
+                    "server_url": "https://example.com/mcp",
+                    "headers": {"Authorization": "Bearer token"},
+                }
+            ],
+        }
+    )
+
+    assert config.servers[0].headers is not None
+    assert [header.model_dump(mode="json") for header in config.servers[0].headers] == [
+        {"name": "Authorization", "value": "Bearer token"}
+    ]
+
+    tool = MCPTool(config=config)
+    definitions = tool.get_open_ai_tool_definitions()
+    assert definitions[0]["headers"] == {"Authorization": "Bearer token"}
+
+
 class _FakeCompletedEvent:
     def __init__(self, *, response: _FakeResponse):
         self.type = "response.completed"
@@ -172,6 +216,35 @@ class _CompletedStream:
         return self._event
 
 
+class _FakeOutputItemDoneEvent:
+    def __init__(self, *, item: OpenAIBaseModel):
+        self.type = "response.output_item.done"
+        self.item = item
+
+    def model_dump(self, *, mode: str = "json") -> dict:
+        del mode
+        return {
+            "type": self.type,
+            "item": self.item.to_dict(mode="json"),
+        }
+
+
+class _EventStream:
+    def __init__(self, *, events: list[object]):
+        self._events = events
+        self._index = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._index >= len(self._events):
+            raise StopAsyncIteration
+        event = self._events[self._index]
+        self._index += 1
+        return event
+
+
 class _FakeResponsesClient:
     def __init__(self, *, outcomes: list[object]):
         self._outcomes = outcomes.copy()
@@ -179,7 +252,7 @@ class _FakeResponsesClient:
         self.create_kwargs: list[dict] = []
 
     async def create(self, **kwargs):
-        self.create_kwargs.append(kwargs)
+        self.create_kwargs.append(copy.deepcopy(kwargs))
         self.calls += 1
         if len(self._outcomes) == 0:
             raise AssertionError("no responses.create outcomes configured")
@@ -378,6 +451,23 @@ def _make_output_message(
         message_kwargs["phase"] = phase
 
     return ResponseOutputMessage(**message_kwargs)
+
+
+def _make_function_tool_call(
+    *,
+    item_id: str,
+    tool_name: str,
+    call_id: str,
+    arguments: dict[str, object],
+) -> ResponseFunctionToolCall:
+    return ResponseFunctionToolCall(
+        id=item_id,
+        name=tool_name,
+        call_id=call_id,
+        arguments=json.dumps(arguments),
+        type="function_call",
+        status="completed",
+    )
 
 
 @pytest.mark.asyncio
@@ -1417,6 +1507,293 @@ def test_session_context_appends_remote_image_and_file_urls() -> None:
         "type": "input_file",
         "file_url": "https://example.com/report.pdf",
     }
+
+
+@pytest.mark.asyncio
+async def test_next_inserts_steering_messages_after_tool_results() -> None:
+    client = _FakeOpenAIClient(
+        outcomes=[
+            _FakeResponse(
+                response_id="resp_tool",
+                output=[
+                    _make_function_tool_call(
+                        item_id="tool-1",
+                        tool_name="write_file",
+                        call_id="call_1",
+                        arguments={"path": "/tmp/example.txt"},
+                    )
+                ],
+            ),
+            _FakeResponse(
+                response_id="resp_done",
+                output=[_make_output_message(message_id="msg_1", text="done")],
+            ),
+        ]
+    )
+    adapter = OpenAIResponsesAdapter(
+        mode="request",
+        client=client,
+        model="gpt-4.1-mini",
+    )
+    context = adapter.create_session()
+    context.append_user_message("run tool")
+    steering_calls = 0
+
+    async def _steer() -> bool:
+        nonlocal steering_calls
+        steering_calls += 1
+        context.append_user_message("steer now")
+        return True
+
+    result = await adapter.next(
+        context=context,
+        room=_FakeRoom(),
+        toolkits=[Toolkit(name="storage", tools=[_AnyArgsTool("write_file")])],
+        steering_callback=_steer,
+    )
+
+    assert result == "done"
+    assert steering_calls == 1
+    assert len(client.responses.create_kwargs) == 2
+    second_input = client.responses.create_kwargs[1]["input"]
+    assert second_input == [
+        {
+            "output": json.dumps(
+                {
+                    "ok": True,
+                    "args": {"path": "/tmp/example.txt"},
+                }
+            ),
+            "call_id": "call_1",
+            "type": "function_call_output",
+        },
+        {
+            "role": "user",
+            "content": "steer now",
+        },
+    ]
+    assert client.responses.create_kwargs[1]["previous_response_id"] == "resp_tool"
+    assert second_input[-1] == {
+        "role": "user",
+        "content": "steer now",
+    }
+
+
+@pytest.mark.asyncio
+async def test_next_drops_post_tool_response_items_before_steering_in_request_mode() -> (
+    None
+):
+    client = _FakeOpenAIClient(
+        outcomes=[
+            _FakeResponse(
+                response_id="resp_tool",
+                output=[
+                    _make_function_tool_call(
+                        item_id="tool-1",
+                        tool_name="write_file",
+                        call_id="call_1",
+                        arguments={"path": "/tmp/example.txt"},
+                    ),
+                    _make_output_message(
+                        message_id="msg_after_tool",
+                        text="this should not land before steering",
+                    ),
+                ],
+            ),
+            _FakeResponse(
+                response_id="resp_done",
+                output=[_make_output_message(message_id="msg_1", text="done")],
+            ),
+        ]
+    )
+    adapter = OpenAIResponsesAdapter(
+        mode="request",
+        client=client,
+        model="gpt-4.1-mini",
+    )
+    context = adapter.create_session()
+    context.append_user_message("run tool")
+
+    async def _steer() -> bool:
+        context.append_user_message("steer now")
+        return True
+
+    result = await adapter.next(
+        context=context,
+        room=_FakeRoom(),
+        toolkits=[Toolkit(name="storage", tools=[_AnyArgsTool("write_file")])],
+        steering_callback=_steer,
+    )
+
+    assert result == "done"
+    second_create_kwargs = client.responses.create_kwargs[1]
+    assert second_create_kwargs["input"] == [
+        {
+            "role": "user",
+            "content": "run tool",
+        },
+        {
+            "arguments": json.dumps({"path": "/tmp/example.txt"}),
+            "call_id": "call_1",
+            "id": "tool-1",
+            "name": "write_file",
+            "status": "completed",
+            "type": "function_call",
+        },
+        {
+            "output": json.dumps(
+                {
+                    "ok": True,
+                    "args": {"path": "/tmp/example.txt"},
+                }
+            ),
+            "call_id": "call_1",
+            "type": "function_call_output",
+        },
+        {
+            "role": "user",
+            "content": "steer now",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_next_drops_post_tool_stream_items_before_steering() -> None:
+    tool_call = _make_function_tool_call(
+        item_id="tool-1",
+        tool_name="write_file",
+        call_id="call_1",
+        arguments={"path": "/tmp/example.txt"},
+    )
+    trailing_message = _make_output_message(
+        message_id="msg_after_tool",
+        text="this should not land before steering",
+    )
+    completed_response = _FakeResponse(
+        response_id="resp_tool",
+        output=[tool_call, trailing_message],
+    )
+    client = _FakeOpenAIClient(
+        outcomes=[
+            _EventStream(
+                events=[
+                    _FakeOutputItemDoneEvent(item=tool_call),
+                    _FakeOutputItemDoneEvent(item=trailing_message),
+                    _FakeCompletedEvent(response=completed_response),
+                ]
+            ),
+            _CompletedStream(
+                event=_FakeCompletedEvent(
+                    response=_FakeResponse(
+                        response_id="resp_done",
+                        output=[
+                            _make_output_message(message_id="msg_done", text="done")
+                        ],
+                    )
+                )
+            ),
+        ]
+    )
+    adapter = OpenAIResponsesAdapter(
+        mode="request",
+        client=client,
+        model="gpt-4.1-mini",
+    )
+    context = adapter.create_session()
+    context.append_user_message("run tool")
+    published_events: list[dict] = []
+
+    async def _steer() -> bool:
+        context.append_user_message("steer now")
+        return True
+
+    result = await adapter.next(
+        context=context,
+        room=_FakeRoom(),
+        toolkits=[Toolkit(name="storage", tools=[_AnyArgsTool("write_file")])],
+        event_handler=published_events.append,
+        steering_callback=_steer,
+    )
+
+    assert result == "done"
+    second_create_kwargs = client.responses.create_kwargs[1]
+    assert second_create_kwargs["input"] == [
+        {
+            "role": "user",
+            "content": "run tool",
+        },
+        {
+            "arguments": json.dumps({"path": "/tmp/example.txt"}),
+            "call_id": "call_1",
+            "id": "tool-1",
+            "name": "write_file",
+            "status": "completed",
+            "type": "function_call",
+        },
+        {
+            "output": json.dumps(
+                {
+                    "ok": True,
+                    "args": {"path": "/tmp/example.txt"},
+                }
+            ),
+            "call_id": "call_1",
+            "type": "function_call_output",
+        },
+        {
+            "role": "user",
+            "content": "steer now",
+        },
+    ]
+    assert not any(
+        event.get("type") == "response.output_item.done"
+        and event.get("item", {}).get("id") == "msg_after_tool"
+        for event in published_events
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_mode_cancellation_restores_context_during_tool_call() -> None:
+    blocking_tool = _BlockingTool("write_file")
+    adapter = OpenAIResponsesAdapter(
+        mode="request",
+        client=_FakeOpenAIClient(
+            outcomes=[
+                _FakeResponse(
+                    response_id="resp_tool",
+                    output=[
+                        _make_function_tool_call(
+                            item_id="tool-1",
+                            tool_name="write_file",
+                            call_id="call_1",
+                            arguments={"path": "/tmp/example.txt"},
+                        )
+                    ],
+                )
+            ]
+        ),
+        model="gpt-4.1-mini",
+    )
+    context = adapter.create_session()
+    context.append_user_message("run tool")
+
+    task = asyncio.create_task(
+        adapter.next(
+            context=context,
+            room=_FakeRoom(),
+            toolkits=[Toolkit(name="storage", tools=[blocking_tool])],
+        )
+    )
+
+    await asyncio.wait_for(blocking_tool.started.wait(), timeout=1)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert context.messages == [{"role": "user", "content": "run tool"}]
+    assert context.previous_messages == []
+    assert context.previous_response_id is None
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,8 @@
+import asyncio
 import json
+import copy
+from typing import Any
+
 import pytest
 
 from meshagent.api.messaging import JsonContent, TextContent
@@ -50,6 +54,22 @@ class _StreamingTool(FunctionTool):
         return _run()
 
 
+class _BlockingTool(FunctionTool):
+    def __init__(self, name: str):
+        super().__init__(
+            name=name,
+            input_schema={"type": "object", "additionalProperties": True},
+            description="blocking test tool",
+        )
+        self.started = asyncio.Event()
+
+    async def execute(self, context, **kwargs):
+        del context
+        del kwargs
+        self.started.set()
+        await asyncio.Future()
+
+
 class _FakeToolFunction:
     def __init__(self, *, name: str, arguments: dict):
         self.name = name
@@ -85,9 +105,10 @@ class _FakeChatCompletion:
 class _FakeChatCompletionsClient:
     def __init__(self, *, responses: list[_FakeChatCompletion]):
         self._responses = responses.copy()
+        self.create_kwargs: list[dict[str, Any]] = []
 
     async def create(self, **kwargs):
-        del kwargs
+        self.create_kwargs.append(copy.deepcopy(kwargs))
         if len(self._responses) == 0:
             raise AssertionError("unexpected extra chat completion request")
         return self._responses.pop(0)
@@ -228,3 +249,104 @@ async def test_next_tracks_usage_for_single_completion_response():
         "output_tokens": 2.0,
         "reasoning_tokens": 1.0,
     }
+
+
+@pytest.mark.asyncio
+async def test_next_inserts_steering_messages_after_tool_results() -> None:
+    client = _FakeOpenAIClient(
+        responses=[
+            _FakeChatCompletion(
+                message=_FakeMessage(
+                    tool_calls=[
+                        _FakeToolCall(
+                            tool_call_id="call_1",
+                            name="stream_tool",
+                            arguments={"path": "/tmp/example.txt"},
+                        )
+                    ],
+                    content=None,
+                )
+            ),
+            _FakeChatCompletion(
+                message=_FakeMessage(tool_calls=None, content="done"),
+            ),
+        ]
+    )
+    adapter = OpenAICompletionsAdapter(
+        model="gpt-4o-mini",
+        client=client,
+    )
+    context = adapter.create_session()
+    context.append_user_message("run tool")
+    steering_calls = 0
+
+    async def _steer() -> bool:
+        nonlocal steering_calls
+        steering_calls += 1
+        context.append_user_message("steer now")
+        return True
+
+    result = await adapter.next(
+        context=context,
+        room=_FakeRoom(),
+        toolkits=[Toolkit(name="tools", tools=[_StreamingTool()])],
+        steering_callback=_steer,
+    )
+
+    assert result == "done"
+    assert steering_calls == 1
+    assert len(client.chat.completions.create_kwargs) == 2
+    second_messages = client.chat.completions.create_kwargs[1]["messages"]
+    tool_messages = [
+        message
+        for message in second_messages
+        if isinstance(message, dict) and message.get("role") == "tool"
+    ]
+    assert len(tool_messages) == 1
+    assert tool_messages[0]["tool_call_id"] == "call_1"
+    assert second_messages[-1] == {
+        "role": "user",
+        "content": "steer now",
+    }
+
+
+@pytest.mark.asyncio
+async def test_cancellation_restores_context_during_tool_call() -> None:
+    blocking_tool = _BlockingTool("write_file")
+    adapter = OpenAICompletionsAdapter(
+        model="gpt-4o-mini",
+        client=_FakeOpenAIClient(
+            responses=[
+                _FakeChatCompletion(
+                    message=_FakeMessage(
+                        tool_calls=[
+                            _FakeToolCall(
+                                tool_call_id="call_1",
+                                name="write_file",
+                                arguments={"path": "/tmp/example.txt"},
+                            )
+                        ],
+                        content=None,
+                    )
+                )
+            ]
+        ),
+    )
+    context = adapter.create_session()
+    context.append_user_message("run tool")
+
+    task = asyncio.create_task(
+        adapter.next(
+            context=context,
+            room=_FakeRoom(),
+            toolkits=[Toolkit(name="storage", tools=[blocking_tool])],
+        )
+    )
+
+    await asyncio.wait_for(blocking_tool.started.wait(), timeout=1)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert context.messages == [{"role": "user", "content": "run tool"}]

@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import json
 import os
 import struct
@@ -13,6 +14,7 @@ from openai.types.responses.response_computer_tool_call import ResponseComputerT
 from meshagent.computers.agent import ComputerToolkit
 from meshagent.computers.operator import Operator
 from meshagent.openai.tools.responses_adapter import OpenAIResponsesAdapter
+from meshagent.tools import FunctionTool, Toolkit
 
 
 def _should_run_live_openai_tests() -> bool:
@@ -68,6 +70,63 @@ class _FakeParticipant:
 class _FakeRoom:
     local_participant = _FakeParticipant()
     developer = _FakeDeveloper()
+
+
+class _SteeringProbeTool(FunctionTool):
+    def __init__(self):
+        super().__init__(
+            name="steering_probe",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "note": {"type": "string"},
+                },
+                "required": ["note"],
+                "additionalProperties": False,
+            },
+            description="A probe tool used to verify steering order across tool calls.",
+        )
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls: list[str] = []
+
+    async def execute(self, context, note: str) -> dict[str, object]:
+        del context
+        self.calls.append(note)
+        self.started.set()
+        await self.release.wait()
+        return {"ok": True, "note": note}
+
+
+class _RecordingOpenAIResponsesAdapter(OpenAIResponsesAdapter):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.recorded_create_kwargs: list[dict[str, object]] = []
+
+    async def _create_response_with_retries(self, *, openai, create_kwargs: dict):
+        self.recorded_create_kwargs.append(copy.deepcopy(create_kwargs))
+        return await super()._create_response_with_retries(
+            openai=openai,
+            create_kwargs=create_kwargs,
+        )
+
+    async def _create_response_websocket_stream(
+        self,
+        *,
+        context,
+        room,
+        openai,
+        create_kwargs: dict,
+        extra_headers: dict[str, str],
+    ):
+        self.recorded_create_kwargs.append(copy.deepcopy(create_kwargs))
+        return await super()._create_response_websocket_stream(
+            context=context,
+            room=room,
+            openai=openai,
+            create_kwargs=create_kwargs,
+            extra_headers=extra_headers,
+        )
 
 
 class _LiveBrowserComputer:
@@ -367,3 +426,146 @@ async def test_explore_openai_responses_websocket_concurrent_requests():
 
     assert default_summary["event_count"] > 0
     assert out_of_band_summary["event_count"] > 0
+
+
+@pytest.mark.asyncio
+async def test_live_openai_responses_inserts_steer_immediately_after_tool_boundary():
+    room = _FakeRoom()
+    tool = _SteeringProbeTool()
+    adapter = _RecordingOpenAIResponsesAdapter(
+        model=os.getenv("OPENAI_STEERING_TEST_MODEL", "gpt-5.4"),
+        mode="request",
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        max_output_tokens=512,
+        context_management="none",
+    )
+    context = adapter.create_session()
+    context.append_user_message(
+        "You must call the steering_probe tool exactly once with any note string. "
+        "After the tool result is available, reply with exactly ORIGINAL and nothing else."
+    )
+
+    pending_steer = False
+
+    async def _steer() -> bool:
+        nonlocal pending_steer
+        if not pending_steer:
+            return False
+        pending_steer = False
+        context.append_user_message(
+            "New instruction: after the tool result, reply with exactly STEERED and nothing else."
+        )
+        return True
+
+    task = asyncio.create_task(
+        adapter.next(
+            context=context,
+            room=room,
+            toolkits=[Toolkit(name="test", tools=[tool])],
+            event_handler=lambda event: None,
+            steering_callback=_steer,
+        )
+    )
+
+    await asyncio.wait_for(tool.started.wait(), timeout=30.0)
+    pending_steer = True
+    tool.release.set()
+    result = await asyncio.wait_for(task, timeout=90.0)
+
+    assert tool.calls
+    assert "STEERED" in result
+    assert "ORIGINAL" not in result
+    assert len(adapter.recorded_create_kwargs) >= 2
+
+    second_request = adapter.recorded_create_kwargs[1]
+    second_input = second_request["input"]
+    assert isinstance(second_input, list)
+    assert len(second_input) >= 2
+    assert second_input[-2]["type"] == "function_call_output"
+    assert second_input[-1] == {
+        "role": "user",
+        "content": (
+            "New instruction: after the tool result, reply with exactly STEERED "
+            "and nothing else."
+        ),
+    }
+    assert not any(
+        isinstance(item, dict)
+        and item.get("role") == "assistant"
+        and isinstance(item.get("content"), str)
+        and "ORIGINAL" in item["content"]
+        for item in second_input
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_openai_websocket_inserts_steer_immediately_after_tool_boundary():
+    room = _FakeRoom()
+    tool = _SteeringProbeTool()
+    adapter = _RecordingOpenAIResponsesAdapter(
+        model=os.getenv("OPENAI_STEERING_TEST_MODEL", "gpt-5.4"),
+        mode="websocket",
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        max_output_tokens=512,
+        context_management="none",
+    )
+    context = adapter.create_session()
+    context.append_user_message(
+        "You must call the steering_probe tool exactly once with any note string. "
+        "After the tool result is available, reply with exactly ORIGINAL and nothing else."
+    )
+
+    pending_steer = False
+
+    async def _steer() -> bool:
+        nonlocal pending_steer
+        if not pending_steer:
+            return False
+        pending_steer = False
+        context.append_user_message(
+            "New instruction: after the tool result, reply with exactly STEERED and nothing else."
+        )
+        return True
+
+    task = asyncio.create_task(
+        adapter.next(
+            context=context,
+            room=room,
+            toolkits=[Toolkit(name="test", tools=[tool])],
+            event_handler=lambda event: None,
+            steering_callback=_steer,
+        )
+    )
+
+    try:
+        await asyncio.wait_for(tool.started.wait(), timeout=30.0)
+        pending_steer = True
+        tool.release.set()
+        result = await asyncio.wait_for(task, timeout=90.0)
+    finally:
+        await context.close()
+
+    assert tool.calls
+    assert "STEERED" in result
+    assert "ORIGINAL" not in result
+    assert len(adapter.recorded_create_kwargs) >= 2
+
+    second_request = adapter.recorded_create_kwargs[1]
+    second_input = second_request["input"]
+    assert isinstance(second_input, list)
+    assert len(second_input) >= 2
+    assert second_input[-2]["type"] == "function_call_output"
+    assert second_input[-1] == {
+        "role": "user",
+        "content": (
+            "New instruction: after the tool result, reply with exactly STEERED "
+            "and nothing else."
+        ),
+    }
+    assert not any(
+        isinstance(item, dict)
+        and item.get("role") == "assistant"
+        and isinstance(item.get("content"), str)
+        and "ORIGINAL" in item["content"]
+        for item in second_input
+    )

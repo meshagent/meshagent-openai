@@ -11,7 +11,7 @@ from meshagent.api.messaging import (
     _ControlContent,
 )
 from meshagent.api.messaging import ensure_content
-from meshagent.agents.adapter import ToolResponseAdapter, LLMAdapter
+from meshagent.agents.adapter import ToolResponseAdapter, LLMAdapter, SteeringCallback
 import json
 from typing import List
 
@@ -21,6 +21,7 @@ from openai.types.chat import ChatCompletion, ChatCompletionMessageToolCall
 import os
 from typing import Optional, Any, Callable
 from collections.abc import AsyncIterable
+import copy
 
 import logging
 import re
@@ -301,9 +302,10 @@ class OpenAICompletionsAdapter(LLMAdapter):
         model: Optional[str] = None,
         context: AgentSessionContext,
         room: RoomClient,
-        toolkits: Toolkit,
+        toolkits: list[Toolkit],
         output_schema: Optional[dict] = None,
         event_handler: Optional[Callable[[dict], None]] = None,
+        steering_callback: SteeringCallback | None = None,
         on_behalf_of: Optional[RemoteParticipant] = None,
         options: Optional[dict] = None,
     ):
@@ -331,8 +333,12 @@ class OpenAICompletionsAdapter(LLMAdapter):
 
             response_schema = output_schema
             response_name = "response"
+            context_messages_snapshot = copy.deepcopy(context.messages)
+            iteration_committed = False
 
             while True:
+                context_messages_snapshot = copy.deepcopy(context.messages)
+                iteration_committed = False
                 logger.info(
                     "model: %s, context: %s, output_schema: %s",
                     self._model,
@@ -378,7 +384,6 @@ class OpenAICompletionsAdapter(LLMAdapter):
                         "message": message.to_dict(),
                     },
                 )
-                context.messages.append(message)
 
                 if message.tool_calls is not None:
                     tasks = []
@@ -438,22 +443,36 @@ class OpenAICompletionsAdapter(LLMAdapter):
 
                     results = await asyncio.gather(*tasks)
 
+                    appended_outputs = False
+                    next_messages: list[Any] = [message]
                     for result in results:
                         if result is not None:
-                            room.developer.log_nowait(
-                                type="llm.message",
-                                data={
-                                    "context": context.id,
-                                    "participant_id": room.local_participant.id,
-                                    "participant_name": room.local_participant.get_attribute(
-                                        "name"
-                                    ),
-                                    "message": result,
-                                },
-                            )
-                            context.messages.append(result)
+                            outputs = result if isinstance(result, list) else [result]
+                            for output in outputs:
+                                room.developer.log_nowait(
+                                    type="llm.message",
+                                    data={
+                                        "context": context.id,
+                                        "participant_id": room.local_participant.id,
+                                        "participant_name": room.local_participant.get_attribute(
+                                            "name"
+                                        ),
+                                        "message": output,
+                                    },
+                                )
+                                next_messages.append(output)
+                                appended_outputs = True
+
+                    context.messages.extend(next_messages)
+                    iteration_committed = True
+
+                    if steering_callback is not None and appended_outputs:
+                        if await steering_callback():
+                            continue
 
                 elif message.content is not None:
+                    context.messages.append(message)
+                    iteration_committed = True
                     content = message.content
 
                     logger.info("RESPONSE FROM OPENAI %s", content)
@@ -506,5 +525,10 @@ class OpenAICompletionsAdapter(LLMAdapter):
                             response=message
                         )
                     )
+        except asyncio.CancelledError:
+            if not iteration_committed:
+                context.messages.clear()
+                context.messages.extend(copy.deepcopy(context_messages_snapshot))
+            raise
         except APIStatusError as e:
             raise RoomException(f"Error from OpenAI: {e}")
