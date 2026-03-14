@@ -2609,3 +2609,168 @@ def test_make_agent_event_publisher_emits_shell_tool_events() -> None:
     assert isinstance(local_shell_ended, AgentToolCallEnded)
     assert isinstance(local_shell_ended.result, TextContent)
     assert local_shell_ended.result.text == "hi\n"
+
+
+def test_make_agent_event_publisher_updates_shell_tool_arguments_before_handler_completion() -> (
+    None
+):
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    publisher(
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "shell_call",
+                "id": "shell_1",
+                "call_id": "call_1",
+                "status": "in_progress",
+                "action": {},
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "shell_call",
+                "id": "shell_1",
+                "call_id": "call_1",
+                "status": "completed",
+                "action": {
+                    "command": [
+                        "mkdir",
+                        "-p",
+                        "/data/docs2",
+                        "&&",
+                        "cat",
+                        ">",
+                        "/data/docs2/index.html",
+                    ]
+                },
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "meshagent.handler.done",
+            "item": {
+                "type": "shell_call_output",
+                "call_id": "call_1",
+                "output": [
+                    {
+                        "outcome": {"type": "exit", "exit_code": 0},
+                        "stdout": "",
+                        "stderr": "",
+                    }
+                ],
+            },
+        }
+    )
+
+    assert [type(event) for event in published] == [
+        AgentToolCallStarted,
+        AgentToolCallStarted,
+        AgentToolCallEnded,
+    ]
+
+    initial_started = published[0]
+    assert isinstance(initial_started, AgentToolCallStarted)
+    assert initial_started.arguments == {"action": {}}
+
+    updated_started = published[1]
+    assert isinstance(updated_started, AgentToolCallStarted)
+    assert updated_started.arguments == {
+        "action": {
+            "command": [
+                "mkdir",
+                "-p",
+                "/data/docs2",
+                "&&",
+                "cat",
+                ">",
+                "/data/docs2/index.html",
+            ]
+        }
+    }
+
+    ended = published[2]
+    assert isinstance(ended, AgentToolCallEnded)
+    assert ended.item_id == "shell_1"
+
+
+def test_make_agent_event_publisher_ends_shell_tool_when_handler_done_arrives_without_output_item_done() -> (
+    None
+):
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    publisher(
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "shell_call",
+                "id": "shell_1",
+                "call_id": "call_1",
+                "status": "in_progress",
+                "action": {"command": ["sleep", "5"]},
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "meshagent.handler.done",
+            "item": {
+                "type": "shell_call_output",
+                "call_id": "call_1",
+                "output": [
+                    {
+                        "outcome": {"type": "timeout"},
+                        "stdout": "",
+                        "stderr": "",
+                    }
+                ],
+            },
+        }
+    )
+
+    assert [type(event) for event in published] == [
+        AgentToolCallStarted,
+        AgentToolCallEnded,
+    ]
+    started = published[0]
+    assert isinstance(started, AgentToolCallStarted)
+    assert started.item_id == "shell_1"
+
+    ended = published[1]
+    assert isinstance(ended, AgentToolCallEnded)
+    assert ended.item_id == "shell_1"
+    assert isinstance(ended.result, JsonContent)
+    assert ended.result.json == {
+        "output": [
+            {
+                "outcome": {"type": "timeout"},
+                "stdout": "",
+                "stderr": "",
+            }
+        ]
+    }
