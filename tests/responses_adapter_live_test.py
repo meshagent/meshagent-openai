@@ -73,9 +73,9 @@ class _FakeRoom:
 
 
 class _SteeringProbeTool(FunctionTool):
-    def __init__(self):
+    def __init__(self, *, name: str = "steering_probe", wait_for_release: bool = True):
         super().__init__(
-            name="steering_probe",
+            name=name,
             input_schema={
                 "type": "object",
                 "properties": {
@@ -89,12 +89,14 @@ class _SteeringProbeTool(FunctionTool):
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.calls: list[str] = []
+        self._wait_for_release = wait_for_release
 
     async def execute(self, context, note: str) -> dict[str, object]:
         del context
         self.calls.append(note)
         self.started.set()
-        await self.release.wait()
+        if self._wait_for_release:
+            await self.release.wait()
         return {"ok": True, "note": note}
 
 
@@ -102,13 +104,18 @@ class _RecordingOpenAIResponsesAdapter(OpenAIResponsesAdapter):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.recorded_create_kwargs: list[dict[str, object]] = []
+        self.recorded_response_outputs: list[list[dict[str, object]]] = []
 
     async def _create_response_with_retries(self, *, openai, create_kwargs: dict):
         self.recorded_create_kwargs.append(copy.deepcopy(create_kwargs))
-        return await super()._create_response_with_retries(
+        response = await super()._create_response_with_retries(
             openai=openai,
             create_kwargs=create_kwargs,
         )
+        self.recorded_response_outputs.append(
+            [item.to_dict() for item in response.output]
+        )
+        return response
 
     async def _create_response_websocket_stream(
         self,
@@ -437,7 +444,6 @@ async def test_live_openai_responses_inserts_steer_immediately_after_tool_bounda
         mode="request",
         client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
         max_output_tokens=512,
-        context_management="none",
     )
     context = adapter.create_session()
     context.append_user_message(
@@ -507,7 +513,6 @@ async def test_live_openai_websocket_inserts_steer_immediately_after_tool_bounda
         mode="websocket",
         client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
         max_output_tokens=512,
-        context_management="none",
     )
     context = adapter.create_session()
     context.append_user_message(
@@ -569,3 +574,62 @@ async def test_live_openai_websocket_inserts_steer_immediately_after_tool_bounda
         and "ORIGINAL" in item["content"]
         for item in second_input
     )
+
+
+@pytest.mark.asyncio
+async def test_live_openai_request_inserts_steer_after_first_completed_tool_when_two_tools_are_scheduled():
+    room = _FakeRoom()
+    alpha_tool = _SteeringProbeTool(name="alpha_probe", wait_for_release=True)
+    beta_tool = _SteeringProbeTool(name="beta_probe", wait_for_release=False)
+    adapter = _RecordingOpenAIResponsesAdapter(
+        model=os.getenv("OPENAI_STEERING_TEST_MODEL", "gpt-5.4"),
+        mode="request",
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        max_output_tokens=512,
+    )
+    context = adapter.create_session()
+    context.append_user_message(
+        "You must call alpha_probe and beta_probe exactly once each before any natural language. "
+        "After the tool results are available, reply with exactly ORIGINAL and nothing else."
+    )
+
+    pending_steer = False
+
+    async def _steer() -> bool:
+        nonlocal pending_steer
+        if not pending_steer:
+            return False
+        pending_steer = False
+        context.append_user_message(
+            "New instruction: after the tool result, reply with exactly STEERED and nothing else."
+        )
+        return True
+
+    task = asyncio.create_task(
+        adapter.next(
+            context=context,
+            room=room,
+            toolkits=[Toolkit(name="test", tools=[alpha_tool, beta_tool])],
+            event_handler=lambda event: None,
+            steering_callback=_steer,
+        )
+    )
+
+    await asyncio.wait_for(alpha_tool.started.wait(), timeout=30.0)
+    pending_steer = True
+    alpha_tool.release.set()
+    result = await asyncio.wait_for(task, timeout=90.0)
+
+    assert "STEERED" in result
+    assert "ORIGINAL" not in result
+    assert len(adapter.recorded_response_outputs) >= 1
+    first_response_output = adapter.recorded_response_outputs[0]
+    assert any(
+        item.get("type") == "function_call" and item.get("name") == "alpha_probe"
+        for item in first_response_output
+    )
+    assert any(
+        item.get("type") == "function_call" and item.get("name") == "beta_probe"
+        for item in first_response_output
+    )
+    assert beta_tool.calls == []

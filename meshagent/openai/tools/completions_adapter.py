@@ -468,6 +468,10 @@ class OpenAICompletionsAdapter(LLMAdapter):
 
                     if steering_callback is not None and appended_outputs:
                         if await steering_callback():
+                            self.on_turn_steer(
+                                context=context,
+                                interrupted=False,
+                            )
                             continue
 
                 elif message.content is not None:

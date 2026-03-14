@@ -2137,6 +2137,10 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                 next_messages=next_messages,
                                             )
                                             if await steering_callback():
+                                                self.on_turn_steer(
+                                                    context=context,
+                                                    interrupted=False,
+                                                )
                                                 restart_after_tool_boundary = True
                                                 break
                                             restore_context_snapshot()
@@ -2157,6 +2161,10 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                     and len(next_messages) > 0
                                 ):
                                     if await steering_callback():
+                                        self.on_turn_steer(
+                                            context=context,
+                                            interrupted=False,
+                                        )
                                         continue
 
                                 if len(final_outputs) > 0:
@@ -2246,6 +2254,10 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                         and len(all_outputs) > 0
                                                     ):
                                                         if await steering_callback():
+                                                            self.on_turn_steer(
+                                                                context=context,
+                                                                interrupted=False,
+                                                            )
                                                             all_outputs = []
                                                             continue
 
@@ -2312,6 +2324,10 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                                 next_messages=all_outputs,
                                                             )
                                                             if await steering_callback():
+                                                                self.on_turn_steer(
+                                                                    context=context,
+                                                                    interrupted=False,
+                                                                )
                                                                 final_outputs = []
                                                                 all_outputs = []
                                                                 restart_after_tool_boundary = True

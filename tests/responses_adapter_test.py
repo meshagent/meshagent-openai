@@ -98,6 +98,24 @@ class _BlockingTool(FunctionTool):
         await asyncio.Future()
 
 
+class _GateTool(FunctionTool):
+    def __init__(self, name: str):
+        super().__init__(
+            name=name,
+            input_schema={"type": "object", "additionalProperties": True},
+            description="gated test tool",
+        )
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def execute(self, context, **kwargs):
+        del context
+        del kwargs
+        self.started.set()
+        await self.release.wait()
+        return {"ok": True, "tool": self.name}
+
+
 class _FakeBrowserComputer:
     environment = "browser"
     dimensions = (1024, 768)
@@ -1749,6 +1767,108 @@ async def test_next_drops_post_tool_stream_items_before_steering() -> None:
         event.get("type") == "response.output_item.done"
         and event.get("item", {}).get("id") == "msg_after_tool"
         for event in published_events
+    )
+
+
+@pytest.mark.asyncio
+async def test_next_restarts_after_first_completed_tool_call_before_later_tool_calls() -> (
+    None
+):
+    tool_call_a = _make_function_tool_call(
+        item_id="tool-1",
+        tool_name="tool_a",
+        call_id="call_1",
+        arguments={},
+    )
+    tool_call_b = _make_function_tool_call(
+        item_id="tool-2",
+        tool_name="tool_b",
+        call_id="call_2",
+        arguments={},
+    )
+    completed_response = _FakeResponse(
+        response_id="resp_tool",
+        output=[tool_call_a, tool_call_b],
+    )
+    client = _FakeOpenAIClient(
+        outcomes=[
+            _EventStream(
+                events=[
+                    _FakeOutputItemDoneEvent(item=tool_call_a),
+                    _FakeOutputItemDoneEvent(item=tool_call_b),
+                    _FakeCompletedEvent(response=completed_response),
+                ]
+            ),
+            _CompletedStream(
+                event=_FakeCompletedEvent(
+                    response=_FakeResponse(
+                        response_id="resp_done",
+                        output=[
+                            _make_output_message(message_id="msg_done", text="done")
+                        ],
+                    )
+                )
+            ),
+        ]
+    )
+    adapter = OpenAIResponsesAdapter(
+        mode="request",
+        client=client,
+        model="gpt-4.1-mini",
+    )
+    context = adapter.create_session()
+    context.append_user_message("run tools")
+    tool_a = _GateTool("tool_a")
+    tool_b = _AnyArgsTool("tool_b")
+    pending_steer = False
+
+    async def _steer() -> bool:
+        nonlocal pending_steer
+        if not pending_steer:
+            return False
+        pending_steer = False
+        context.append_user_message("steer now")
+        return True
+
+    task = asyncio.create_task(
+        adapter.next(
+            context=context,
+            room=_FakeRoom(),
+            toolkits=[Toolkit(name="test", tools=[tool_a, tool_b])],
+            event_handler=lambda event: None,
+            steering_callback=_steer,
+        )
+    )
+
+    await asyncio.wait_for(tool_a.started.wait(), timeout=1)
+    pending_steer = True
+    tool_a.release.set()
+    result = await asyncio.wait_for(task, timeout=1)
+
+    assert result == "done"
+    second_create_kwargs = client.responses.create_kwargs[1]
+    assert second_create_kwargs["input"] == [
+        {"role": "user", "content": "run tools"},
+        {
+            "arguments": json.dumps({}),
+            "call_id": "call_1",
+            "id": "tool-1",
+            "name": "tool_a",
+            "status": "completed",
+            "type": "function_call",
+        },
+        {
+            "output": json.dumps({"ok": True, "tool": "tool_a"}),
+            "call_id": "call_1",
+            "type": "function_call_output",
+        },
+        {"role": "user", "content": "steer now"},
+    ]
+    assert not any(
+        isinstance(item, dict)
+        and item.get("type") == "function_call"
+        and item.get("id") == "tool-2"
+        for item in second_create_kwargs["input"]
     )
 
 
