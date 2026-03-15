@@ -32,6 +32,7 @@ from meshagent.tools.script import DEFAULT_CONTAINER_MOUNT_SPEC
 
 from meshagent.api.specs.service import ContainerMountSpec
 import json
+import codecs
 from collections.abc import AsyncIterable, Awaitable, Mapping
 from typing import Any, List, Literal, cast
 from meshagent.openai.proxy import get_client, get_logging_httpx_client
@@ -1774,13 +1775,19 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                         }
                                                     )
 
+                                                    caller_context: dict[
+                                                        str, object
+                                                    ] = {"chat": context.to_json()}
+                                                    if isinstance(tool_call.id, str):
+                                                        caller_context["item_id"] = (
+                                                            tool_call.id
+                                                        )
                                                     tool_context = ToolContext(
                                                         room=room,
                                                         caller=room.local_participant,
                                                         on_behalf_of=on_behalf_of,
-                                                        caller_context={
-                                                            "chat": context.to_json()
-                                                        },
+                                                        caller_context=caller_context,
+                                                        event_handler=event_handler,
                                                     )
                                                     if event_handler is not None:
                                                         event_handler(
@@ -1999,6 +2006,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                                 caller_context={
                                                                     "chat": context.to_json()
                                                                 },
+                                                                event_handler=event_handler,
                                                             )
 
                                                             try:
@@ -2356,6 +2364,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                                         caller_context={
                                                                             "chat": context.to_json()
                                                                         },
+                                                                        event_handler=event_handler,
                                                                     )
 
                                                                     await callbacks[
@@ -2643,6 +2652,90 @@ class LocalShellToolkitBuilder(ToolkitBuilder):
 
 
 MAX_SHELL_OUTPUT_SIZE = 1024 * 100
+_SHELL_LOG_EVENT_TYPE = "meshagent.handler.output"
+
+
+def _emit_shell_output_lines(
+    context: ToolContext,
+    *,
+    item_id: str,
+    source: Literal["stdout", "stderr"],
+    lines: list[str],
+) -> None:
+    if item_id == "" or len(lines) == 0:
+        return
+
+    context.emit(
+        {
+            "type": _SHELL_LOG_EVENT_TYPE,
+            "item_id": item_id,
+            "lines": [{"source": source, "text": line} for line in lines],
+        }
+    )
+
+
+def _drain_complete_log_lines(*, buffer: str) -> tuple[list[str], str]:
+    if buffer == "":
+        return [], ""
+
+    parts = buffer.split("\n")
+    complete_lines = [part.rstrip("\r") for part in parts[:-1]]
+    return complete_lines, parts[-1]
+
+
+async def _stream_reader_chunks(
+    reader: asyncio.StreamReader | None,
+) -> AsyncIterable[bytes]:
+    if reader is None:
+        return
+
+    while True:
+        chunk = await reader.read(4096)
+        if chunk == b"":
+            break
+        yield chunk
+
+
+async def _collect_shell_output_stream(
+    *,
+    stream: AsyncIterable[bytes],
+    collector: bytearray,
+    encoding: str,
+    context: ToolContext,
+    item_id: str,
+    source: Literal["stdout", "stderr"],
+) -> None:
+    decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+    buffered_text = ""
+
+    async for chunk in stream:
+        collector.extend(chunk)
+        buffered_text += decoder.decode(chunk)
+        lines, buffered_text = _drain_complete_log_lines(buffer=buffered_text)
+        _emit_shell_output_lines(
+            context,
+            item_id=item_id,
+            source=source,
+            lines=lines,
+        )
+
+    buffered_text += decoder.decode(b"", final=True)
+    if buffered_text != "":
+        _emit_shell_output_lines(
+            context,
+            item_id=item_id,
+            source=source,
+            lines=[buffered_text.rstrip("\r")],
+        )
+
+
+async def _await_output_tasks(*tasks: asyncio.Task[None]) -> None:
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for result in results:
+        if isinstance(result, Exception) and not isinstance(
+            result, asyncio.CancelledError
+        ):
+            logger.debug("shell output stream task failed", exc_info=result)
 
 
 class LocalShellTool(OpenAIResponsesTool):
@@ -2671,11 +2764,19 @@ class LocalShellTool(OpenAIResponsesTool):
         command: list[str],
         env: dict,
         type: str,
+        item_id: str,
         timeout_ms: int | None = None,
         user: str | None = None,
         working_dir: str | None = None,
     ):
         merged_env = {**os.environ, **(env or {})}
+        encoding = os.device_encoding(1) or "utf-8"
+        timeout = float(timeout_ms) / 1000.0 if timeout_ms else 20.0
+        stdout = bytearray()
+        stderr = bytearray()
+        proc: asyncio.subprocess.Process | None = None
+        stdout_task: asyncio.Task[None] | None = None
+        stderr_task: asyncio.Task[None] | None = None
 
         try:
             # Spawn the process
@@ -2687,24 +2788,43 @@ class LocalShellTool(OpenAIResponsesTool):
                 stderr=asyncio.subprocess.PIPE,
             )
 
-            timeout = float(timeout_ms) / 1000.0 if timeout_ms else 20.0
-
             logger.info(f"executing command {command} with timeout: {timeout}s")
-
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=timeout,
+            stdout_task = asyncio.create_task(
+                _collect_shell_output_stream(
+                    stream=_stream_reader_chunks(proc.stdout),
+                    collector=stdout,
+                    encoding=encoding,
+                    context=context,
+                    item_id=item_id,
+                    source="stdout",
+                )
             )
+            stderr_task = asyncio.create_task(
+                _collect_shell_output_stream(
+                    stream=_stream_reader_chunks(proc.stderr),
+                    collector=stderr,
+                    encoding=encoding,
+                    context=context,
+                    item_id=item_id,
+                    source="stderr",
+                )
+            )
+
+            await asyncio.wait_for(proc.wait(), timeout=timeout)
+            await _await_output_tasks(stdout_task, stderr_task)
         except asyncio.TimeoutError:
-            proc.kill()  # send SIGKILL / TerminateProcess
+            if proc is not None:
+                proc.kill()  # send SIGKILL / TerminateProcess
             logger.info(f"The command timed out after {timeout}s")
-            stdout, stderr = await proc.communicate()
+            if proc is not None:
+                await proc.wait()
+            if stdout_task is not None and stderr_task is not None:
+                await _await_output_tasks(stdout_task, stderr_task)
             return f"The command timed out after {timeout}s"
             # re-raise so caller sees the timeout
         except Exception as ex:
             return f"The command failed: {ex}"
 
-        encoding = os.device_encoding(1) or "utf-8"
         stdout = stdout.decode(encoding, errors="replace")
         stderr = stderr.decode(encoding, errors="replace")
 
@@ -2725,7 +2845,7 @@ class LocalShellTool(OpenAIResponsesTool):
         type: str,
         **extra,
     ):
-        result = await self.execute_shell_command(context, **action)
+        result = await self.execute_shell_command(context, item_id=id, **action)
 
         output_item = {
             "type": "local_shell_call_output",
@@ -2800,6 +2920,7 @@ class ShellTool(OpenAIResponsesTool):
         context: ToolContext,
         *,
         commands: list[str],
+        item_id: str,
         max_output_length: Optional[int] = None,
         timeout_ms: Optional[int] = None,
     ):
@@ -2819,7 +2940,7 @@ class ShellTool(OpenAIResponsesTool):
             else:
                 return s
 
-        timeout = float(timeout_ms) / 1000.0 if timeout_ms else 20 * 1000.0
+        timeout = float(timeout_ms) / 1000.0 if timeout_ms else 20.0
 
         if self.image is not None:
             running = False
@@ -2860,16 +2981,33 @@ class ShellTool(OpenAIResponsesTool):
 
                     stdout = bytearray()
                     stderr = bytearray()
+                    stdout_task: asyncio.Task[None] | None = None
+                    stderr_task: asyncio.Task[None] | None = None
 
                     try:
+                        stdout_task = asyncio.create_task(
+                            _collect_shell_output_stream(
+                                stream=exec.stdout(),
+                                collector=stdout,
+                                encoding=encoding,
+                                context=context,
+                                item_id=item_id,
+                                source="stdout",
+                            )
+                        )
+                        stderr_task = asyncio.create_task(
+                            _collect_shell_output_stream(
+                                stream=exec.stderr(),
+                                collector=stderr,
+                                encoding=encoding,
+                                context=context,
+                                item_id=item_id,
+                                source="stderr",
+                            )
+                        )
                         async with asyncio.timeout(timeout):
-                            async for se in exec.stderr():
-                                stderr.extend(se)
-
-                            async for so in exec.stdout():
-                                stdout.extend(so)
-
                             exit_code = await exec.result
+                            await _await_output_tasks(stdout_task, stderr_task)
 
                             results.append(
                                 {
@@ -2885,6 +3023,8 @@ class ShellTool(OpenAIResponsesTool):
                     except asyncio.TimeoutError:
                         logger.info(f"The command timed out after {timeout}s")
                         await exec.kill()
+                        if stdout_task is not None and stderr_task is not None:
+                            await _await_output_tasks(stdout_task, stderr_task)
 
                         results.append(
                             {
@@ -2929,6 +3069,11 @@ class ShellTool(OpenAIResponsesTool):
                 logger.info(f"executing command {command} with timeout: {timeout}s")
 
                 # Spawn the process
+                proc: asyncio.subprocess.Process | None = None
+                stdout_task: asyncio.Task[None] | None = None
+                stderr_task: asyncio.Task[None] | None = None
+                stdout = bytearray()
+                stderr = bytearray()
                 try:
                     import shlex
 
@@ -2939,16 +3084,38 @@ class ShellTool(OpenAIResponsesTool):
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
-
-                    stdout, stderr = await asyncio.wait_for(
-                        proc.communicate(),
-                        timeout=timeout,
+                    stdout_task = asyncio.create_task(
+                        _collect_shell_output_stream(
+                            stream=_stream_reader_chunks(proc.stdout),
+                            collector=stdout,
+                            encoding=encoding,
+                            context=context,
+                            item_id=item_id,
+                            source="stdout",
+                        )
                     )
+                    stderr_task = asyncio.create_task(
+                        _collect_shell_output_stream(
+                            stream=_stream_reader_chunks(proc.stderr),
+                            collector=stderr,
+                            encoding=encoding,
+                            context=context,
+                            item_id=item_id,
+                            source="stderr",
+                        )
+                    )
+
+                    await asyncio.wait_for(proc.wait(), timeout=timeout)
+                    await _await_output_tasks(stdout_task, stderr_task)
                 except asyncio.TimeoutError:
                     logger.info(f"The command timed out after {timeout}s")
-                    proc.kill()  # send SIGKILL / TerminateProcess
+                    if proc is not None:
+                        proc.kill()  # send SIGKILL / TerminateProcess
 
-                    stdout, stderr = await proc.communicate()
+                    if proc is not None:
+                        await proc.wait()
+                    if stdout_task is not None and stderr_task is not None:
+                        await _await_output_tasks(stdout_task, stderr_task)
 
                     results.append(
                         {
@@ -2977,7 +3144,7 @@ class ShellTool(OpenAIResponsesTool):
                     {
                         "outcome": {
                             "type": "exit",
-                            "exit_code": proc.returncode,
+                            "exit_code": proc.returncode if proc is not None else 1,
                         },
                         "stdout": limit(stdout.decode(encoding, errors="replace")),
                         "stderr": limit(stderr.decode(encoding, errors="replace")),
@@ -2997,7 +3164,7 @@ class ShellTool(OpenAIResponsesTool):
         type: str,
         **extra,
     ):
-        result = await self.execute_shell_command(context, **action)
+        result = await self.execute_shell_command(context, item_id=id, **action)
 
         output_item = {
             "type": "shell_call_output",

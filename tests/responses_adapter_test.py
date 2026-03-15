@@ -6,6 +6,7 @@ import httpx
 import logging
 import aiohttp
 import pytest
+import sys
 from aiohttp.client_reqrep import RequestInfo
 from multidict import CIMultiDict, CIMultiDictProxy
 from openai._models import BaseModel as OpenAIBaseModel
@@ -27,6 +28,8 @@ from meshagent.agents.messages import (
     AgentTextContentDelta,
     AgentTextContentEnded,
     AgentTextContentStarted,
+    AgentToolCallPending,
+    AgentToolCallLogDelta,
     AgentToolCallEnded,
     AgentToolCallStarted,
 )
@@ -37,14 +40,16 @@ from meshagent.computers.operator import Operator
 from meshagent.openai.tools.responses_adapter import (
     MCPConfig,
     MCPTool,
+    LocalShellTool,
     OpenAIResponsesAdapter,
     OpenAIResponsesSessionContext,
     ResponsesToolBundle,
+    ShellTool,
     WebSearchTool,
     _consume_streaming_tool_result,
     safe_tool_name,
 )
-from meshagent.tools import FunctionTool, Toolkit
+from meshagent.tools import FunctionTool, Toolkit, ToolContext
 
 
 class _FakeDeveloper:
@@ -67,6 +72,80 @@ class _FakeRoom:
     def __init__(self):
         self.local_participant = _FakeParticipant()
         self.developer = _FakeDeveloper()
+
+
+class _FakeContainerInfo:
+    def __init__(self, *, container_id: str):
+        self.id = container_id
+
+
+class _FakeContainerExec:
+    def __init__(
+        self,
+        *,
+        stdout_chunks: list[bytes],
+        stderr_chunks: list[bytes],
+        exit_code: int = 0,
+    ) -> None:
+        self._stdout_chunks = stdout_chunks
+        self._stderr_chunks = stderr_chunks
+        self._result = asyncio.get_running_loop().create_future()
+        self._result.set_result(exit_code)
+
+    @property
+    def result(self):
+        return self._result
+
+    async def stdout(self):
+        for chunk in self._stdout_chunks:
+            await asyncio.sleep(0)
+            yield chunk
+
+    async def stderr(self):
+        for chunk in self._stderr_chunks:
+            await asyncio.sleep(0)
+            yield chunk
+
+    async def kill(self) -> None:
+        return None
+
+
+class _FakeContainers:
+    def __init__(self, *, exec_factory):
+        self._exec_factory = exec_factory
+        self.run_calls: list[dict[str, object]] = []
+        self.exec_calls: list[dict[str, object]] = []
+
+    async def list(self):
+        return []
+
+    async def run(self, *, command, image, mounts, writable_root_fs, env):
+        self.run_calls.append(
+            {
+                "command": command,
+                "image": image,
+                "mounts": mounts,
+                "writable_root_fs": writable_root_fs,
+                "env": env,
+            }
+        )
+        return "container-1"
+
+    async def exec(self, *, container_id, command, tty):
+        self.exec_calls.append(
+            {
+                "container_id": container_id,
+                "command": command,
+                "tty": tty,
+            }
+        )
+        return self._exec_factory()
+
+
+class _FakeContainerRoom(_FakeRoom):
+    def __init__(self, *, exec_factory):
+        super().__init__()
+        self.containers = _FakeContainers(exec_factory=exec_factory)
 
 
 class _AnyArgsTool(FunctionTool):
@@ -2221,6 +2300,7 @@ def test_make_agent_event_publisher_emits_content_and_tool_messages() -> None:
         AgentFileContentStarted,
         AgentFileContentDelta,
         AgentFileContentEnded,
+        AgentToolCallPending,
         AgentToolCallStarted,
         AgentToolCallEnded,
         AgentToolCallStarted,
@@ -2243,13 +2323,13 @@ def test_make_agent_event_publisher_emits_content_and_tool_messages() -> None:
     assert isinstance(file_delta, AgentFileContentDelta)
     assert file_delta.url == "https://example.com/report.pdf"
 
-    function_started = published[9]
+    function_started = published[10]
     assert isinstance(function_started, AgentToolCallStarted)
     assert function_started.toolkit == "function"
     assert function_started.tool == "lookup"
     assert function_started.arguments == {"q": "meshagent"}
 
-    web_search_ended = published[12]
+    web_search_ended = published[13]
     assert isinstance(web_search_ended, AgentToolCallEnded)
     assert isinstance(web_search_ended.result, JsonContent)
     assert web_search_ended.result.json == {"results": [{"title": "MeshAgent"}]}
@@ -2353,10 +2433,11 @@ def test_make_agent_event_publisher_unmangles_function_tool_names_from_tool_bund
     publisher({"type": "meshagent.handler.done", "item_id": "call_1"})
 
     assert [type(event) for event in published] == [
+        AgentToolCallPending,
         AgentToolCallStarted,
         AgentToolCallEnded,
     ]
-    started = published[0]
+    started = published[1]
     assert isinstance(started, AgentToolCallStarted)
     assert started.toolkit == "search"
     assert started.tool == "lookup/web"
@@ -2408,15 +2489,20 @@ def test_make_agent_event_publisher_updates_function_tool_failure_from_handler_d
     )
 
     assert [type(event) for event in published] == [
-        AgentToolCallStarted,
+        AgentToolCallPending,
+        AgentToolCallPending,
         AgentToolCallStarted,
         AgentToolCallEnded,
     ]
-    updated_started = published[1]
-    assert isinstance(updated_started, AgentToolCallStarted)
-    assert updated_started.arguments == {"path": "src/app.py"}
+    updated_pending = published[1]
+    assert isinstance(updated_pending, AgentToolCallPending)
+    assert updated_pending.arguments == {"path": "src/app.py"}
 
-    ended = published[2]
+    started = published[2]
+    assert isinstance(started, AgentToolCallStarted)
+    assert started.arguments == {"path": "src/app.py"}
+
+    ended = published[3]
     assert isinstance(ended, AgentToolCallEnded)
     assert ended.error is not None
     assert ended.error.message == "'text' is a required property"
@@ -2574,19 +2660,27 @@ def test_make_agent_event_publisher_emits_shell_tool_events() -> None:
     )
 
     assert [type(event) for event in published] == [
+        AgentToolCallPending,
         AgentToolCallStarted,
         AgentToolCallEnded,
+        AgentToolCallPending,
         AgentToolCallStarted,
         AgentToolCallEnded,
     ]
 
-    shell_started = published[0]
+    shell_pending = published[0]
+    assert isinstance(shell_pending, AgentToolCallPending)
+    assert shell_pending.toolkit == "openai"
+    assert shell_pending.tool == "shell"
+    assert shell_pending.arguments == {"action": {"command": ["echo", "hi"]}}
+
+    shell_started = published[1]
     assert isinstance(shell_started, AgentToolCallStarted)
     assert shell_started.toolkit == "openai"
     assert shell_started.tool == "shell"
     assert shell_started.arguments == {"action": {"command": ["echo", "hi"]}}
 
-    shell_ended = published[1]
+    shell_ended = published[2]
     assert isinstance(shell_ended, AgentToolCallEnded)
     assert isinstance(shell_ended.result, JsonContent)
     assert shell_ended.result.json == {
@@ -2599,13 +2693,19 @@ def test_make_agent_event_publisher_emits_shell_tool_events() -> None:
         ]
     }
 
-    local_shell_started = published[2]
+    local_shell_pending = published[3]
+    assert isinstance(local_shell_pending, AgentToolCallPending)
+    assert local_shell_pending.toolkit == "openai"
+    assert local_shell_pending.tool == "local_shell"
+    assert local_shell_pending.arguments == {"action": {"command": "echo hi"}}
+
+    local_shell_started = published[4]
     assert isinstance(local_shell_started, AgentToolCallStarted)
     assert local_shell_started.toolkit == "openai"
     assert local_shell_started.tool == "local_shell"
     assert local_shell_started.arguments == {"action": {"command": "echo hi"}}
 
-    local_shell_ended = published[3]
+    local_shell_ended = published[5]
     assert isinstance(local_shell_ended, AgentToolCallEnded)
     assert isinstance(local_shell_ended.result, TextContent)
     assert local_shell_ended.result.text == "hi\n"
@@ -2679,18 +2779,19 @@ def test_make_agent_event_publisher_updates_shell_tool_arguments_before_handler_
     )
 
     assert [type(event) for event in published] == [
-        AgentToolCallStarted,
+        AgentToolCallPending,
+        AgentToolCallPending,
         AgentToolCallStarted,
         AgentToolCallEnded,
     ]
 
-    initial_started = published[0]
-    assert isinstance(initial_started, AgentToolCallStarted)
-    assert initial_started.arguments == {"action": {}}
+    initial_pending = published[0]
+    assert isinstance(initial_pending, AgentToolCallPending)
+    assert initial_pending.arguments == {"action": {}}
 
-    updated_started = published[1]
-    assert isinstance(updated_started, AgentToolCallStarted)
-    assert updated_started.arguments == {
+    updated_pending = published[1]
+    assert isinstance(updated_pending, AgentToolCallPending)
+    assert updated_pending.arguments == {
         "action": {
             "command": [
                 "mkdir",
@@ -2704,7 +2805,11 @@ def test_make_agent_event_publisher_updates_shell_tool_arguments_before_handler_
         }
     }
 
-    ended = published[2]
+    started = published[2]
+    assert isinstance(started, AgentToolCallStarted)
+    assert started.arguments == updated_pending.arguments
+
+    ended = published[3]
     assert isinstance(ended, AgentToolCallEnded)
     assert ended.item_id == "shell_1"
 
@@ -2754,14 +2859,19 @@ def test_make_agent_event_publisher_ends_shell_tool_when_handler_done_arrives_wi
     )
 
     assert [type(event) for event in published] == [
+        AgentToolCallPending,
         AgentToolCallStarted,
         AgentToolCallEnded,
     ]
-    started = published[0]
+    pending = published[0]
+    assert isinstance(pending, AgentToolCallPending)
+    assert pending.item_id == "shell_1"
+
+    started = published[1]
     assert isinstance(started, AgentToolCallStarted)
     assert started.item_id == "shell_1"
 
-    ended = published[1]
+    ended = published[2]
     assert isinstance(ended, AgentToolCallEnded)
     assert ended.item_id == "shell_1"
     assert isinstance(ended.result, JsonContent)
@@ -2774,3 +2884,131 @@ def test_make_agent_event_publisher_ends_shell_tool_when_handler_done_arrives_wi
             }
         ]
     }
+
+
+def test_make_agent_event_publisher_emits_tool_log_delta() -> None:
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    publisher(
+        {
+            "type": "meshagent.handler.output",
+            "item_id": "shell_1",
+            "lines": [
+                {"source": "stdout", "text": "one"},
+                {"source": "stderr", "text": "two"},
+            ],
+        }
+    )
+
+    assert len(published) == 1
+    log_delta = published[0]
+    assert isinstance(log_delta, AgentToolCallLogDelta)
+    assert log_delta.item_id == "shell_1"
+    assert [(line.source, line.text) for line in log_delta.lines] == [
+        ("stdout", "one"),
+        ("stderr", "two"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_local_shell_tool_execute_shell_command_emits_live_output_events() -> (
+    None
+):
+    tool = LocalShellTool()
+    emitted_events: list[dict[str, object]] = []
+    context = ToolContext(
+        room=_FakeRoom(),
+        caller=_FakeParticipant(),
+        event_handler=emitted_events.append,
+    )
+
+    result = await tool.execute_shell_command(
+        context,
+        command=[
+            sys.executable,
+            "-c",
+            "import sys; print('one'); print('two', file=sys.stderr)",
+        ],
+        env={},
+        type="local_shell_call",
+        item_id="local-shell-1",
+        timeout_ms=5000,
+    )
+
+    assert "one" in result
+    assert "two" in result
+    assert len(emitted_events) == 2
+    assert {
+        (
+            event["item_id"],
+            tuple(
+                (line["source"], line["text"])
+                for line in event["lines"]  # type: ignore[index]
+            ),
+        )
+        for event in emitted_events
+    } == {
+        ("local-shell-1", (("stdout", "one"),)),
+        ("local-shell-1", (("stderr", "two"),)),
+    }
+
+
+@pytest.mark.asyncio
+async def test_shell_tool_container_exec_emits_live_output_events() -> None:
+    tool = ShellTool(image="python:3.13")
+    room = _FakeContainerRoom(
+        exec_factory=lambda: _FakeContainerExec(
+            stdout_chunks=[b"one\n", b"three\n"],
+            stderr_chunks=[b"two\n"],
+            exit_code=0,
+        )
+    )
+    emitted_events: list[dict[str, object]] = []
+    context = ToolContext(
+        room=room,
+        caller=_FakeParticipant(),
+        event_handler=emitted_events.append,
+    )
+
+    result = await tool.execute_shell_command(
+        context,
+        commands=["echo hi"],
+        item_id="shell-1",
+        timeout_ms=5000,
+    )
+
+    assert room.containers.run_calls[0]["image"] == "python:3.13"
+    assert room.containers.exec_calls[0]["command"] == ["bash", "-lc", "echo hi"]
+    assert result == [
+        {
+            "outcome": {"type": "exit", "exit_code": 0},
+            "stdout": "one\nthree\n",
+            "stderr": "two\n",
+        }
+    ]
+    assert emitted_events == [
+        {
+            "type": "meshagent.handler.output",
+            "item_id": "shell-1",
+            "lines": [{"source": "stdout", "text": "one"}],
+        },
+        {
+            "type": "meshagent.handler.output",
+            "item_id": "shell-1",
+            "lines": [{"source": "stderr", "text": "two"}],
+        },
+        {
+            "type": "meshagent.handler.output",
+            "item_id": "shell-1",
+            "lines": [{"source": "stdout", "text": "three"}],
+        },
+    ]

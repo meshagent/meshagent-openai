@@ -390,10 +390,16 @@ class OpenAICompletionsAdapter(LLMAdapter):
 
                     async def do_tool_call(tool_call: ChatCompletionMessageToolCall):
                         try:
+                            caller_context: dict[str, object] = {
+                                "chat": context.to_json()
+                            }
+                            if isinstance(tool_call.id, str):
+                                caller_context["item_id"] = tool_call.id
                             tool_context = ToolContext(
                                 room=room,
                                 caller=room.local_participant,
-                                caller_context={"chat": context.to_json()},
+                                caller_context=caller_context,
+                                event_handler=event_handler,
                             )
                             tool_response = await tool_bundle.execute(
                                 context=tool_context, tool_call=tool_call
