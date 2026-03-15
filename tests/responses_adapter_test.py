@@ -2384,6 +2384,73 @@ def test_make_agent_event_publisher_preserves_text_delta_whitespace() -> None:
     assert "".join(deltas) == "Hello world"
 
 
+def test_make_agent_event_publisher_keeps_reasoning_item_id_stable_when_delta_arrives_before_output_item() -> (
+    None
+):
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    publisher(
+        {
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 1,
+            "delta": "official OpenAI deep research overview research agent browse synthesize report",
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "type": "reasoning",
+                "id": "rs_1",
+                "status": "in_progress",
+                "summary": [],
+                "content": [],
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "type": "reasoning",
+                "id": "rs_1",
+                "status": "completed",
+                "summary": [],
+                "content": [],
+            },
+        }
+    )
+
+    assert [type(event) for event in published] == [
+        AgentReasoningContentStarted,
+        AgentReasoningContentDelta,
+        AgentReasoningContentEnded,
+    ]
+
+    started = published[0]
+    assert isinstance(started, AgentReasoningContentStarted)
+    assert started.item_id == "output:1"
+
+    delta = published[1]
+    assert isinstance(delta, AgentReasoningContentDelta)
+    assert delta.item_id == "output:1"
+
+    ended = published[2]
+    assert isinstance(ended, AgentReasoningContentEnded)
+    assert ended.item_id == "output:1"
+
+
 def test_make_agent_event_publisher_unmangles_function_tool_names_from_tool_bundle():
     adapter = OpenAIResponsesAdapter(
         client=_FakeOpenAIClient(outcomes=[]),
