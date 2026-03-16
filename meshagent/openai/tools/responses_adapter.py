@@ -19,6 +19,8 @@ from meshagent.api.messaging import (
 
 from meshagent.api.messaging import ensure_content
 from meshagent.agents.adapter import (
+    DEFAULT_MAX_TOOL_CALL_LENGTH,
+    DEFAULT_MAX_TOOL_CALL_LINES,
     ToolResponseAdapter,
     LLMAdapter,
     SteeringCallback,
@@ -646,10 +648,30 @@ class ResponsesToolBundle:
 
 # Converts a tool response into a series of messages that can be inserted into the openai context
 class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
-    def __init__(self):
-        pass
+    def __init__(
+        self,
+        *,
+        max_tool_call_length: int = DEFAULT_MAX_TOOL_CALL_LENGTH,
+        max_tool_call_lines: int = DEFAULT_MAX_TOOL_CALL_LINES,
+    ):
+        super().__init__(
+            max_tool_call_length=max_tool_call_length,
+            max_tool_call_lines=max_tool_call_lines,
+        )
 
     async def to_plain_text(self, *, room: RoomClient, response: Content) -> str:
+        text_file = await self.file_content_to_text_content(
+            room=room,
+            content=response,
+        )
+        if text_file is not None:
+            if isinstance(response, FileContent) and _is_html_mime_type(
+                response.mime_type
+            ):
+                text_file = TextContent(text=convert(text_file.text))
+            response = self.truncate(room=room, content=text_file)
+        else:
+            response = self.truncate(room=room, content=response)
         if isinstance(response, LinkContent):
             return json.dumps(
                 {
@@ -728,7 +750,24 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
                 span.set_attribute("kind", "text")
 
                 if isinstance(response, FileContent):
-                    if response.mime_type and response.mime_type.startswith("image/"):
+                    text_file = await self.file_content_to_text_content(
+                        room=room,
+                        content=response,
+                    )
+                    if text_file is not None:
+                        if _is_html_mime_type(response.mime_type):
+                            text_file = TextContent(text=convert(text_file.text))
+                        output = await self.to_plain_text(
+                            room=room,
+                            response=text_file,
+                        )
+                        span.set_attribute("output", output)
+                        message = {
+                            "output": output,
+                            "call_id": tool_call.call_id,
+                            "type": "function_call_output",
+                        }
+                    elif response.mime_type and response.mime_type.startswith("image/"):
                         span.set_attribute(
                             "output", f"image: {response.name}, {response.mime_type}"
                         )
@@ -760,21 +799,6 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
                                 "call_id": tool_call.call_id,
                                 "type": "function_call_output",
                             }
-                        elif response.mime_type is not None and (
-                            response.mime_type.startswith("text/")
-                            or response.mime_type == "application/json"
-                            or response.mime_type == "application/xhtml+xml"
-                        ):
-                            if _is_html_mime_type(response.mime_type):
-                                text = convert(_decode_text(response.data))
-                            else:
-                                text = _decode_text(response.data)
-                            message = {
-                                "output": text,
-                                "call_id": tool_call.call_id,
-                                "type": "function_call_output",
-                            }
-
                         else:
                             message = {
                                 "output": f"{response.name} was not in a supported format",
@@ -849,6 +873,9 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         websocket_timeout: float = _default_websocket_timeout_seconds,
         context_management: Literal["auto", "standalone", "none"] = "auto",
         compaction_threshold: Optional[int | float] = None,
+        *,
+        max_tool_call_length: int = DEFAULT_MAX_TOOL_CALL_LENGTH,
+        max_tool_call_lines: int = DEFAULT_MAX_TOOL_CALL_LINES,
     ):
         if max_retries < 0:
             raise ValueError("max_retries must be greater than or equal to 0")
@@ -895,6 +922,8 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         self._max_retries = max_retries
         self._mode = mode
         self._websocket_timeout = websocket_timeout
+        self._max_tool_call_length = max_tool_call_length
+        self._max_tool_call_lines = max_tool_call_lines
         self._tool_call_approval_handler: ToolCallApprovalHandler | None = None
 
     def default_model(self) -> str:
@@ -932,6 +961,12 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             websocket_timeout=self._websocket_timeout,
         )
         return context
+
+    def _make_tool_response_adapter(self) -> OpenAIResponsesToolResponseAdapter:
+        return OpenAIResponsesToolResponseAdapter(
+            max_tool_call_length=self._max_tool_call_length,
+            max_tool_call_lines=self._max_tool_call_lines,
+        )
 
     def context_window_size(self, model: str) -> float:
         model_key = model.lower()
@@ -1574,7 +1609,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                 if isinstance(context, OpenAIResponsesSessionContext):
                     await exit_stack.enter_async_context(context._request_lock)
 
-                tool_adapter = OpenAIResponsesToolResponseAdapter()
+                tool_adapter = self._make_tool_response_adapter()
                 context_messages_snapshot = copy.deepcopy(context.messages)
                 context_previous_messages_snapshot = copy.deepcopy(
                     context.previous_messages

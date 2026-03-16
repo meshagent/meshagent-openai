@@ -5,9 +5,10 @@ from typing import Any
 
 import pytest
 
-from meshagent.api.messaging import JsonContent, TextContent
+from meshagent.api.messaging import FileContent, JsonContent, TextContent
 from meshagent.openai.tools.completions_adapter import (
     OpenAICompletionsAdapter,
+    OpenAICompletionsToolResponseAdapter,
     _consume_streaming_tool_result,
 )
 from meshagent.tools import FunctionTool, Toolkit
@@ -134,6 +135,56 @@ class _ToolItemStream:
     async def _run(self):
         for item in self._items:
             yield item
+
+
+@pytest.mark.asyncio
+async def test_openai_completions_tool_response_adapter_truncates_json_output() -> None:
+    adapter = OpenAICompletionsToolResponseAdapter(
+        max_tool_call_length=18,
+        max_tool_call_lines=4,
+    )
+
+    output = await adapter.to_plain_text(
+        room=_FakeRoom(),
+        response=JsonContent(json={"message": "x" * 40}),
+    )
+
+    assert "The tool call returned too much data and was truncated." in output
+
+
+@pytest.mark.asyncio
+async def test_openai_completions_tool_response_adapter_truncates_utf8_file_output() -> (
+    None
+):
+    adapter = OpenAICompletionsToolResponseAdapter(
+        max_tool_call_length=16,
+        max_tool_call_lines=2,
+    )
+
+    output = await adapter.to_plain_text(
+        room=_FakeRoom(),
+        response=FileContent(
+            data=b"line1\nline2\nline3\nline4",
+            name="README",
+            mime_type="application/octet-stream",
+        ),
+    )
+
+    assert "line1\nline2" in output
+    assert "line3" not in output
+    assert "The tool call returned too much data and was truncated." in output
+
+
+def test_openai_completions_adapter_passes_through_tool_truncation_limits() -> None:
+    adapter = OpenAICompletionsAdapter(
+        max_tool_call_length=321,
+        max_tool_call_lines=9,
+    )
+
+    tool_adapter = adapter._make_tool_response_adapter()
+
+    assert tool_adapter.max_tool_call_length == 321
+    assert tool_adapter.max_tool_call_lines == 9
 
 
 @pytest.mark.asyncio

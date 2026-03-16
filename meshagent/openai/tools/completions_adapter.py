@@ -11,7 +11,13 @@ from meshagent.api.messaging import (
     _ControlContent,
 )
 from meshagent.api.messaging import ensure_content
-from meshagent.agents.adapter import ToolResponseAdapter, LLMAdapter, SteeringCallback
+from meshagent.agents.adapter import (
+    DEFAULT_MAX_TOOL_CALL_LENGTH,
+    DEFAULT_MAX_TOOL_CALL_LINES,
+    ToolResponseAdapter,
+    LLMAdapter,
+    SteeringCallback,
+)
 import json
 from typing import List
 
@@ -33,6 +39,7 @@ from meshagent.openai.tools.usage import (
     normalize_openai_usage,
     preprocess_openai_usage,
 )
+from html_to_markdown import convert
 
 logger = logging.getLogger("openai_agent")
 
@@ -64,6 +71,11 @@ def _replace_non_matching(text: str, allowed_chars: str, replacement: str) -> st
 
 def safe_tool_name(name: str):
     return _replace_non_matching(name, "a-zA-Z0-9_-", "_")
+
+
+def _is_html_mime_type(mime_type: str | None) -> bool:
+    normalized = (mime_type or "").strip().lower()
+    return normalized in {"text/html", "application/xhtml+xml"}
 
 
 async def _consume_streaming_tool_result(
@@ -176,10 +188,30 @@ class CompletionsToolBundle:
 
 # Converts a tool response into a series of messages that can be inserted into the openai context
 class OpenAICompletionsToolResponseAdapter(ToolResponseAdapter):
-    def __init__(self):
-        pass
+    def __init__(
+        self,
+        *,
+        max_tool_call_length: int = DEFAULT_MAX_TOOL_CALL_LENGTH,
+        max_tool_call_lines: int = DEFAULT_MAX_TOOL_CALL_LINES,
+    ):
+        super().__init__(
+            max_tool_call_length=max_tool_call_length,
+            max_tool_call_lines=max_tool_call_lines,
+        )
 
     async def to_plain_text(self, *, room: RoomClient, response: Content) -> str:
+        text_file = await self.file_content_to_text_content(
+            room=room,
+            content=response,
+        )
+        if text_file is not None:
+            if isinstance(response, FileContent) and _is_html_mime_type(
+                response.mime_type
+            ):
+                text_file = TextContent(text=convert(text_file.text))
+            response = self.truncate(room=room, content=text_file)
+        else:
+            response = self.truncate(room=room, content=response)
         if isinstance(response, LinkContent):
             return json.dumps(
                 {
@@ -261,10 +293,15 @@ class OpenAICompletionsAdapter(LLMAdapter):
         model: str = os.getenv("OPENAI_MODEL"),
         parallel_tool_calls: Optional[bool] = None,
         client: Optional[AsyncOpenAI] = None,
+        *,
+        max_tool_call_length: int = DEFAULT_MAX_TOOL_CALL_LENGTH,
+        max_tool_call_lines: int = DEFAULT_MAX_TOOL_CALL_LINES,
     ):
         self._model = model
         self._parallel_tool_calls = parallel_tool_calls
         self._client = client
+        self._max_tool_call_length = max_tool_call_length
+        self._max_tool_call_lines = max_tool_call_lines
 
     def create_session(self):
         system_role = "system"
@@ -294,6 +331,12 @@ class OpenAICompletionsAdapter(LLMAdapter):
             return
         add_usage_metrics(totals=context.usage, usage=flattened_usage)
 
+    def _make_tool_response_adapter(self) -> OpenAICompletionsToolResponseAdapter:
+        return OpenAICompletionsToolResponseAdapter(
+            max_tool_call_length=self._max_tool_call_length,
+            max_tool_call_lines=self._max_tool_call_lines,
+        )
+
     # Takes the current chat context, executes a completion request and processes the response.
     # If a tool calls are requested, invokes the tools, processes the tool calls results, and appends the tool call results to the context
     async def next(
@@ -314,7 +357,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
         del options
 
         context.turn_count += 1
-        tool_adapter = OpenAICompletionsToolResponseAdapter()
+        tool_adapter = self._make_tool_response_adapter()
 
         try:
             openai = self._client if self._client is not None else get_client(room=room)

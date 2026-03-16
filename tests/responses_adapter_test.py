@@ -34,7 +34,7 @@ from meshagent.agents.messages import (
     AgentToolCallStarted,
 )
 from meshagent.api import RoomException
-from meshagent.api.messaging import JsonContent, TextContent
+from meshagent.api.messaging import FileContent, JsonContent, TextContent
 from meshagent.computers.agent import ComputerToolkit
 from meshagent.computers.operator import Operator
 from meshagent.openai.tools.responses_adapter import (
@@ -42,6 +42,7 @@ from meshagent.openai.tools.responses_adapter import (
     MCPTool,
     LocalShellTool,
     OpenAIResponsesAdapter,
+    OpenAIResponsesToolResponseAdapter,
     OpenAIResponsesSessionContext,
     ResponsesToolBundle,
     ShellTool,
@@ -241,6 +242,58 @@ class _FakeResponse:
             "id": self.id,
             "output": [output.to_dict(mode="json") for output in self.output],
         }
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_tool_response_adapter_truncates_text_output() -> None:
+    adapter = OpenAIResponsesToolResponseAdapter(
+        max_tool_call_length=16,
+        max_tool_call_lines=2,
+    )
+
+    output = await adapter.to_plain_text(
+        room=_FakeRoom(),
+        response=TextContent(text="line1\nline2\nline3\nline4"),
+    )
+
+    assert "line1\nline2" in output
+    assert "line3" not in output
+    assert "The tool call returned too much data and was truncated." in output
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_tool_response_adapter_truncates_text_file_output() -> (
+    None
+):
+    adapter = OpenAIResponsesToolResponseAdapter(
+        max_tool_call_length=16,
+        max_tool_call_lines=2,
+    )
+
+    output = await adapter.to_plain_text(
+        room=_FakeRoom(),
+        response=FileContent(
+            data=b"line1\nline2\nline3\nline4",
+            name="notes.txt",
+            mime_type="text/plain",
+        ),
+    )
+
+    assert "line1\nline2" in output
+    assert "line3" not in output
+    assert "The tool call returned too much data and was truncated." in output
+
+
+def test_openai_responses_adapter_passes_through_tool_truncation_limits() -> None:
+    adapter = OpenAIResponsesAdapter(
+        max_tool_call_length=123,
+        max_tool_call_lines=7,
+    )
+
+    tool_adapter = adapter._make_tool_response_adapter()
+
+    assert tool_adapter.max_tool_call_length == 123
+    assert tool_adapter.max_tool_call_lines == 7
 
 
 def test_openai_mcp_tool_coerces_headers_dict_to_strict_header_entries() -> None:
