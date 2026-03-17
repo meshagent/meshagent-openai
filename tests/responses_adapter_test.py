@@ -2437,6 +2437,100 @@ def test_make_agent_event_publisher_preserves_text_delta_whitespace() -> None:
     assert "".join(deltas) == "Hello world"
 
 
+def test_make_agent_event_publisher_resets_output_index_mapping_for_new_response() -> (
+    None
+):
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    publisher({"type": "response.created", "response": {"id": "resp_1"}})
+    publisher(
+        {
+            "type": "response.content_part.added",
+            "output_index": 0,
+            "item_id": "msg_1",
+            "part": {"type": "output_text", "text": ""},
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "item_id": "msg_1",
+            "delta": "First",
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_text.done",
+            "output_index": 0,
+            "item_id": "msg_1",
+            "text": "First",
+        }
+    )
+
+    publisher({"type": "response.created", "response": {"id": "resp_2"}})
+    publisher(
+        {
+            "type": "response.content_part.added",
+            "output_index": 0,
+            "item_id": "msg_2",
+            "part": {"type": "output_text", "text": ""},
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "item_id": "msg_2",
+            "delta": "Second",
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_text.done",
+            "output_index": 0,
+            "item_id": "msg_2",
+            "text": "Second",
+        }
+    )
+
+    assert [type(event) for event in published] == [
+        AgentTextContentStarted,
+        AgentTextContentDelta,
+        AgentTextContentEnded,
+        AgentTextContentStarted,
+        AgentTextContentDelta,
+        AgentTextContentEnded,
+    ]
+
+    first_started = published[0]
+    assert isinstance(first_started, AgentTextContentStarted)
+    assert first_started.item_id == "msg_1"
+
+    first_delta = published[1]
+    assert isinstance(first_delta, AgentTextContentDelta)
+    assert first_delta.item_id == "msg_1"
+    assert first_delta.text == "First"
+
+    second_started = published[3]
+    assert isinstance(second_started, AgentTextContentStarted)
+    assert second_started.item_id == "msg_2"
+
+    second_delta = published[4]
+    assert isinstance(second_delta, AgentTextContentDelta)
+    assert second_delta.item_id == "msg_2"
+    assert second_delta.text == "Second"
+
+
 def test_make_agent_event_publisher_keeps_reasoning_item_id_stable_when_delta_arrives_before_output_item() -> (
     None
 ):
