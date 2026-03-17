@@ -6,6 +6,11 @@ from meshagent.agents.event_publisher import (
 )
 from meshagent.agents.messages import AgentMessage
 from meshagent.tools import Toolkit, ToolContext, FunctionTool, BaseTool
+from meshagent.tools._shell_output import (
+    DEFAULT_MAX_LOG_LINE_LENGTH,
+    StreamOutputAccumulator,
+    collect_output_stream,
+)
 from meshagent.api.messaging import (
     Content,
     LinkContent,
@@ -34,7 +39,6 @@ from meshagent.tools.script import DEFAULT_CONTAINER_MOUNT_SPEC
 
 from meshagent.api.specs.service import ContainerMountSpec
 import json
-import codecs
 from collections.abc import AsyncIterable, Awaitable, Mapping
 from typing import Any, List, Literal, cast
 from meshagent.openai.proxy import get_client, get_logging_httpx_client
@@ -2687,35 +2691,7 @@ class LocalShellToolkitBuilder(ToolkitBuilder):
 
 
 MAX_SHELL_OUTPUT_SIZE = 1024 * 100
-_SHELL_LOG_EVENT_TYPE = "meshagent.handler.output"
-
-
-def _emit_shell_output_lines(
-    context: ToolContext,
-    *,
-    item_id: str,
-    source: Literal["stdout", "stderr"],
-    lines: list[str],
-) -> None:
-    if item_id == "" or len(lines) == 0:
-        return
-
-    context.emit(
-        {
-            "type": _SHELL_LOG_EVENT_TYPE,
-            "item_id": item_id,
-            "lines": [{"source": source, "text": line} for line in lines],
-        }
-    )
-
-
-def _drain_complete_log_lines(*, buffer: str) -> tuple[list[str], str]:
-    if buffer == "":
-        return [], ""
-
-    parts = buffer.split("\n")
-    complete_lines = [part.rstrip("\r") for part in parts[:-1]]
-    return complete_lines, parts[-1]
+MAX_SHELL_LOG_LINE_LENGTH = DEFAULT_MAX_LOG_LINE_LENGTH
 
 
 async def _stream_reader_chunks(
@@ -2734,34 +2710,9 @@ async def _stream_reader_chunks(
 async def _collect_shell_output_stream(
     *,
     stream: AsyncIterable[bytes],
-    collector: bytearray,
-    encoding: str,
-    context: ToolContext,
-    item_id: str,
-    source: Literal["stdout", "stderr"],
+    accumulator: StreamOutputAccumulator,
 ) -> None:
-    decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
-    buffered_text = ""
-
-    async for chunk in stream:
-        collector.extend(chunk)
-        buffered_text += decoder.decode(chunk)
-        lines, buffered_text = _drain_complete_log_lines(buffer=buffered_text)
-        _emit_shell_output_lines(
-            context,
-            item_id=item_id,
-            source=source,
-            lines=lines,
-        )
-
-    buffered_text += decoder.decode(b"", final=True)
-    if buffered_text != "":
-        _emit_shell_output_lines(
-            context,
-            item_id=item_id,
-            source=source,
-            lines=[buffered_text.rstrip("\r")],
-        )
+    await collect_output_stream(stream=stream, accumulator=accumulator)
 
 
 async def _await_output_tasks(*tasks: asyncio.Task[None]) -> None:
@@ -2807,8 +2758,22 @@ class LocalShellTool(OpenAIResponsesTool):
         merged_env = {**os.environ, **(env or {})}
         encoding = os.device_encoding(1) or "utf-8"
         timeout = float(timeout_ms) / 1000.0 if timeout_ms else 20.0
-        stdout = bytearray()
-        stderr = bytearray()
+        stdout = StreamOutputAccumulator(
+            context=context,
+            item_id=item_id,
+            source="stdout",
+            encoding=encoding,
+            max_length=MAX_SHELL_OUTPUT_SIZE,
+            max_log_line_length=MAX_SHELL_LOG_LINE_LENGTH,
+        )
+        stderr = StreamOutputAccumulator(
+            context=context,
+            item_id=item_id,
+            source="stderr",
+            encoding=encoding,
+            max_length=MAX_SHELL_OUTPUT_SIZE,
+            max_log_line_length=MAX_SHELL_LOG_LINE_LENGTH,
+        )
         proc: asyncio.subprocess.Process | None = None
         stdout_task: asyncio.Task[None] | None = None
         stderr_task: asyncio.Task[None] | None = None
@@ -2827,21 +2792,13 @@ class LocalShellTool(OpenAIResponsesTool):
             stdout_task = asyncio.create_task(
                 _collect_shell_output_stream(
                     stream=_stream_reader_chunks(proc.stdout),
-                    collector=stdout,
-                    encoding=encoding,
-                    context=context,
-                    item_id=item_id,
-                    source="stdout",
+                    accumulator=stdout,
                 )
             )
             stderr_task = asyncio.create_task(
                 _collect_shell_output_stream(
                     stream=_stream_reader_chunks(proc.stderr),
-                    collector=stderr,
-                    encoding=encoding,
-                    context=context,
-                    item_id=item_id,
-                    source="stderr",
+                    accumulator=stderr,
                 )
             )
 
@@ -2860,14 +2817,7 @@ class LocalShellTool(OpenAIResponsesTool):
         except Exception as ex:
             return f"The command failed: {ex}"
 
-        stdout = stdout.decode(encoding, errors="replace")
-        stderr = stderr.decode(encoding, errors="replace")
-
-        result = stdout + stderr
-        if len(result) > MAX_SHELL_OUTPUT_SIZE:
-            return f"Error: the command returned too much data ({result} bytes)"
-
-        return result
+        return stdout.finish() + stderr.finish()
 
     async def handle_local_shell_call(
         self,
@@ -2963,17 +2913,13 @@ class ShellTool(OpenAIResponsesTool):
 
         results = []
         encoding = os.device_encoding(1) or "utf-8"
-
-        left = max_output_length
-
-        def limit(s: str):
-            nonlocal left
-            if left is not None:
-                s = s[0:left]
-                left -= len(s)
-                return s
-            else:
-                return s
+        effective_max_output_length = (
+            max_output_length
+            if max_output_length is not None
+            else MAX_SHELL_OUTPUT_SIZE
+        )
+        if effective_max_output_length <= 0:
+            raise ValueError("max_output_length must be greater than 0")
 
         timeout = float(timeout_ms) / 1000.0 if timeout_ms else 20.0
 
@@ -3014,8 +2960,22 @@ class ShellTool(OpenAIResponsesTool):
                         tty=False,
                     )
 
-                    stdout = bytearray()
-                    stderr = bytearray()
+                    stdout = StreamOutputAccumulator(
+                        context=context,
+                        item_id=item_id,
+                        source="stdout",
+                        encoding=encoding,
+                        max_length=effective_max_output_length,
+                        max_log_line_length=MAX_SHELL_LOG_LINE_LENGTH,
+                    )
+                    stderr = StreamOutputAccumulator(
+                        context=context,
+                        item_id=item_id,
+                        source="stderr",
+                        encoding=encoding,
+                        max_length=effective_max_output_length,
+                        max_log_line_length=MAX_SHELL_LOG_LINE_LENGTH,
+                    )
                     stdout_task: asyncio.Task[None] | None = None
                     stderr_task: asyncio.Task[None] | None = None
 
@@ -3023,21 +2983,13 @@ class ShellTool(OpenAIResponsesTool):
                         stdout_task = asyncio.create_task(
                             _collect_shell_output_stream(
                                 stream=exec.stdout(),
-                                collector=stdout,
-                                encoding=encoding,
-                                context=context,
-                                item_id=item_id,
-                                source="stdout",
+                                accumulator=stdout,
                             )
                         )
                         stderr_task = asyncio.create_task(
                             _collect_shell_output_stream(
                                 stream=exec.stderr(),
-                                collector=stderr,
-                                encoding=encoding,
-                                context=context,
-                                item_id=item_id,
-                                source="stderr",
+                                accumulator=stderr,
                             )
                         )
                         async with asyncio.timeout(timeout):
@@ -3050,8 +3002,8 @@ class ShellTool(OpenAIResponsesTool):
                                         "type": "exit",
                                         "exit_code": exit_code,
                                     },
-                                    "stdout": stdout.decode(),
-                                    "stderr": stderr.decode(),
+                                    "stdout": stdout.finish(),
+                                    "stderr": stderr.finish(),
                                 }
                             )
 
@@ -3064,12 +3016,8 @@ class ShellTool(OpenAIResponsesTool):
                         results.append(
                             {
                                 "outcome": {"type": "timeout"},
-                                "stdout": limit(
-                                    stdout.decode(encoding, errors="replace")
-                                ),
-                                "stderr": limit(
-                                    stderr.decode(encoding, errors="replace")
-                                ),
+                                "stdout": stdout.finish(),
+                                "stderr": stderr.finish(),
                             }
                         )
                         break
@@ -3107,8 +3055,22 @@ class ShellTool(OpenAIResponsesTool):
                 proc: asyncio.subprocess.Process | None = None
                 stdout_task: asyncio.Task[None] | None = None
                 stderr_task: asyncio.Task[None] | None = None
-                stdout = bytearray()
-                stderr = bytearray()
+                stdout = StreamOutputAccumulator(
+                    context=context,
+                    item_id=item_id,
+                    source="stdout",
+                    encoding=encoding,
+                    max_length=effective_max_output_length,
+                    max_log_line_length=MAX_SHELL_LOG_LINE_LENGTH,
+                )
+                stderr = StreamOutputAccumulator(
+                    context=context,
+                    item_id=item_id,
+                    source="stderr",
+                    encoding=encoding,
+                    max_length=effective_max_output_length,
+                    max_log_line_length=MAX_SHELL_LOG_LINE_LENGTH,
+                )
                 try:
                     import shlex
 
@@ -3122,21 +3084,13 @@ class ShellTool(OpenAIResponsesTool):
                     stdout_task = asyncio.create_task(
                         _collect_shell_output_stream(
                             stream=_stream_reader_chunks(proc.stdout),
-                            collector=stdout,
-                            encoding=encoding,
-                            context=context,
-                            item_id=item_id,
-                            source="stdout",
+                            accumulator=stdout,
                         )
                     )
                     stderr_task = asyncio.create_task(
                         _collect_shell_output_stream(
                             stream=_stream_reader_chunks(proc.stderr),
-                            collector=stderr,
-                            encoding=encoding,
-                            context=context,
-                            item_id=item_id,
-                            source="stderr",
+                            accumulator=stderr,
                         )
                     )
 
@@ -3155,8 +3109,8 @@ class ShellTool(OpenAIResponsesTool):
                     results.append(
                         {
                             "outcome": {"type": "timeout"},
-                            "stdout": limit(stdout.decode(encoding, errors="replace")),
-                            "stderr": limit(stderr.decode(encoding, errors="replace")),
+                            "stdout": stdout.finish(),
+                            "stderr": stderr.finish(),
                         }
                     )
 
@@ -3181,8 +3135,8 @@ class ShellTool(OpenAIResponsesTool):
                             "type": "exit",
                             "exit_code": proc.returncode if proc is not None else 1,
                         },
-                        "stdout": limit(stdout.decode(encoding, errors="replace")),
-                        "stderr": limit(stderr.decode(encoding, errors="replace")),
+                        "stdout": stdout.finish(),
+                        "stderr": stderr.finish(),
                     }
                 )
 

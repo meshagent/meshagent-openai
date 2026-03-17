@@ -37,6 +37,7 @@ from meshagent.api import RoomException
 from meshagent.api.messaging import FileContent, JsonContent, TextContent
 from meshagent.computers.agent import ComputerToolkit
 from meshagent.computers.operator import Operator
+import meshagent.openai.tools.responses_adapter as responses_adapter_module
 from meshagent.openai.tools.responses_adapter import (
     MCPConfig,
     MCPTool,
@@ -3177,6 +3178,45 @@ async def test_local_shell_tool_execute_shell_command_emits_live_output_events()
 
 
 @pytest.mark.asyncio
+async def test_local_shell_tool_execute_shell_command_truncates_success_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(responses_adapter_module, "MAX_SHELL_OUTPUT_SIZE", 8)
+
+    tool = LocalShellTool()
+    emitted_events: list[dict[str, object]] = []
+    context = ToolContext(
+        room=_FakeRoom(),
+        caller=_FakeParticipant(),
+        event_handler=emitted_events.append,
+    )
+
+    result = await tool.execute_shell_command(
+        context,
+        command=[sys.executable, "-c", "print('abcdefghijk', end='')"],
+        env={},
+        type="local_shell_call",
+        item_id="local-shell-1",
+        timeout_ms=5000,
+    )
+
+    assert result == "abcdefgh\n\n[output truncated after 8 characters]"
+    assert emitted_events == [
+        {
+            "type": "meshagent.handler.output",
+            "item_id": "local-shell-1",
+            "lines": [
+                {"source": "stdout", "text": "abcdefgh"},
+                {
+                    "source": "stdout",
+                    "text": "[output truncated after 8 characters]",
+                },
+            ],
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_shell_tool_container_exec_emits_live_output_events() -> None:
     tool = ShellTool(image="python:3.13")
     room = _FakeContainerRoom(
@@ -3225,4 +3265,97 @@ async def test_shell_tool_container_exec_emits_live_output_events() -> None:
             "item_id": "shell-1",
             "lines": [{"source": "stdout", "text": "three"}],
         },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_shell_tool_container_exec_truncates_success_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(responses_adapter_module, "MAX_SHELL_OUTPUT_SIZE", 8)
+
+    tool = ShellTool(image="python:3.13")
+    room = _FakeContainerRoom(
+        exec_factory=lambda: _FakeContainerExec(
+            stdout_chunks=[b"abcdefghijk"],
+            stderr_chunks=[],
+            exit_code=0,
+        )
+    )
+    emitted_events: list[dict[str, object]] = []
+    context = ToolContext(
+        room=room,
+        caller=_FakeParticipant(),
+        event_handler=emitted_events.append,
+    )
+
+    result = await tool.execute_shell_command(
+        context,
+        commands=["echo hi"],
+        item_id="shell-1",
+        timeout_ms=5000,
+    )
+
+    assert result == [
+        {
+            "outcome": {"type": "exit", "exit_code": 0},
+            "stdout": "abcdefgh\n\n[output truncated after 8 characters]",
+            "stderr": "",
+        }
+    ]
+    assert emitted_events == [
+        {
+            "type": "meshagent.handler.output",
+            "item_id": "shell-1",
+            "lines": [
+                {"source": "stdout", "text": "abcdefgh"},
+                {
+                    "source": "stdout",
+                    "text": "[output truncated after 8 characters]",
+                },
+            ],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_shell_tool_local_exec_truncates_success_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(responses_adapter_module, "MAX_SHELL_OUTPUT_SIZE", 8)
+
+    tool = ShellTool(image=None)
+    emitted_events: list[dict[str, object]] = []
+    context = ToolContext(
+        room=_FakeRoom(),
+        caller=_FakeParticipant(),
+        event_handler=emitted_events.append,
+    )
+
+    result = await tool.execute_shell_command(
+        context,
+        commands=["printf 'abcdefghijk'"],
+        item_id="shell-1",
+        timeout_ms=5000,
+    )
+
+    assert result == [
+        {
+            "outcome": {"type": "exit", "exit_code": 0},
+            "stdout": "abcdefgh\n\n[output truncated after 8 characters]",
+            "stderr": "",
+        }
+    ]
+    assert emitted_events == [
+        {
+            "type": "meshagent.handler.output",
+            "item_id": "shell-1",
+            "lines": [
+                {"source": "stdout", "text": "abcdefgh"},
+                {
+                    "source": "stdout",
+                    "text": "[output truncated after 8 characters]",
+                },
+            ],
+        }
     ]
