@@ -3065,7 +3065,7 @@ class LocalShellTool(OpenAIResponsesTool):
     ):
         merged_env = {**os.environ, **(env or {})}
         encoding = os.device_encoding(1) or "utf-8"
-        timeout = float(timeout_ms) / 1000.0 if timeout_ms else 20.0
+        timeout = float(timeout_ms) / 1000.0 if timeout_ms else 60.0
         stdout = StreamOutputAccumulator(
             context=context,
             item_id=item_id,
@@ -3115,7 +3115,7 @@ class LocalShellTool(OpenAIResponsesTool):
         except asyncio.TimeoutError:
             if proc is not None:
                 proc.kill()  # send SIGKILL / TerminateProcess
-            logger.info(f"The command timed out after {timeout}s")
+            logger.warning(f"The command timed out after {timeout}s")
             if proc is not None:
                 await proc.wait()
             if stdout_task is not None and stderr_task is not None:
@@ -3229,7 +3229,7 @@ class ShellTool(OpenAIResponsesTool):
         if effective_max_output_length <= 0:
             raise ValueError("max_output_length must be greater than 0")
 
-        timeout = float(timeout_ms) / 1000.0 if timeout_ms else 20.0
+        timeout = float(timeout_ms) / 1000.0 if timeout_ms else 60.0
 
         if self.image is not None:
             running = False
@@ -3316,7 +3316,7 @@ class ShellTool(OpenAIResponsesTool):
                             )
 
                     except asyncio.TimeoutError:
-                        logger.info(f"The command timed out after {timeout}s")
+                        logger.warning(f"The command timed out after {timeout}s")
                         await exec.kill()
                         if stdout_task is not None and stderr_task is not None:
                             await _await_output_tasks(stdout_task, stderr_task)
@@ -3405,7 +3405,7 @@ class ShellTool(OpenAIResponsesTool):
                     await asyncio.wait_for(proc.wait(), timeout=timeout)
                     await _await_output_tasks(stdout_task, stderr_task)
                 except asyncio.TimeoutError:
-                    logger.info(f"The command timed out after {timeout}s")
+                    logger.warning(f"The command timed out after {timeout}s")
                     if proc is not None:
                         proc.kill()  # send SIGKILL / TerminateProcess
 
