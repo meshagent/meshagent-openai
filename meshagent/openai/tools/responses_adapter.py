@@ -38,6 +38,7 @@ from meshagent.agents.adapter import (
 from meshagent.tools.script import DEFAULT_CONTAINER_MOUNT_SPEC
 
 from meshagent.api.specs.service import ContainerMountSpec
+from meshagent.api.error_codes import ErrorCode
 import json
 from collections.abc import AsyncIterable, Awaitable, Mapping
 from typing import Any, List, Literal, cast
@@ -943,11 +944,13 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         turn_id: str,
         thread_id: str,
         callback: Callable[[AgentMessage], None],
+        custom_event_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> Callable[[dict[str, Any]], None]:
         return make_openai_agent_event_publisher(
             turn_id=turn_id,
             thread_id=thread_id,
             callback=callback,
+            custom_event_callback=custom_event_callback,
         )
 
     def _set_function_tool_name_resolver(
@@ -1237,7 +1240,141 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             )
         return True
 
-    def _retry_delay_seconds(self, *, retry_number: int, error: APIError) -> float:
+    def _is_retryable_websocket_transport_error(
+        self,
+        *,
+        error: RoomException,
+    ) -> bool:
+        return error.code in {ErrorCode.TIMEOUT, ErrorCode.OPERATION_FAILED} and str(
+            error
+        ).startswith("OpenAI websocket")
+
+    def _is_retryable_room_error(self, *, error: RoomException) -> bool:
+        if error.status_code in {408, 409, 429} or error.status_code >= 500:
+            return True
+
+        return self._is_retryable_websocket_transport_error(error=error)
+
+    @staticmethod
+    def _session_metadata_string(
+        *,
+        context: AgentSessionContext,
+        key: str,
+    ) -> str | None:
+        value = context.metadata.get(key)
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        return normalized if normalized != "" else None
+
+    def _retry_correlation_key(self, *, context: AgentSessionContext) -> str:
+        turn_id = self._session_metadata_string(context=context, key="turn_id")
+        if turn_id is None:
+            return "llm.retry"
+        return f"llm.retry:{turn_id}"
+
+    def _retry_headline(
+        self,
+        *,
+        error: Exception,
+        retry_number: int,
+        state: Literal["in_progress", "completed", "failed"],
+    ) -> str:
+        is_reconnect = isinstance(error, RoomException) and (
+            self._is_retryable_websocket_transport_error(error=error)
+        )
+        if state == "in_progress":
+            if is_reconnect:
+                return (
+                    "Reconnecting to the LLM "
+                    f"(retry {retry_number}/{self._max_retries})"
+                )
+            return (
+                f"Retrying the LLM request (retry {retry_number}/{self._max_retries})"
+            )
+
+        if state == "completed":
+            if is_reconnect:
+                return "Reconnected to the LLM"
+            return "LLM request retry succeeded"
+
+        if is_reconnect:
+            return "Unable to reconnect to the LLM"
+        return "LLM request retry failed"
+
+    def _retry_detail_lines(
+        self,
+        *,
+        error: Exception,
+        retry_number: int,
+        state: Literal["in_progress", "completed", "failed"],
+        delay_seconds: float | None = None,
+    ) -> list[str]:
+        if state == "completed":
+            if retry_number == 1:
+                return ["Recovered after 1 retry."]
+            return [f"Recovered after {retry_number} retries."]
+
+        detail_lines: list[str] = []
+        if state == "in_progress" and delay_seconds is not None:
+            detail_lines.append(
+                f"Retry {retry_number} of {self._max_retries} in {delay_seconds:.2f}s."
+            )
+        if state == "failed":
+            detail_lines.append(
+                f"Retry budget exhausted after {retry_number} attempts."
+            )
+
+        error_message = str(error).strip()
+        if error_message != "":
+            detail_lines.append(f"Last error: {error_message}")
+        return detail_lines
+
+    def _emit_retry_event(
+        self,
+        *,
+        context: AgentSessionContext,
+        event_handler: Callable[[dict[str, Any]], None] | None,
+        error: Exception,
+        retry_number: int,
+        state: Literal["in_progress", "completed", "failed"],
+        delay_seconds: float | None = None,
+    ) -> None:
+        if event_handler is None:
+            return
+
+        event: dict[str, Any] = {
+            "type": "agent.event",
+            "source": self._provider,
+            "name": "openai.retry",
+            "kind": "message",
+            "state": state,
+            "method": "openai.retry",
+            "summary": self._retry_headline(
+                error=error,
+                retry_number=retry_number,
+                state=state,
+            ),
+            "headline": self._retry_headline(
+                error=error,
+                retry_number=retry_number,
+                state=state,
+            ),
+            "details": self._retry_detail_lines(
+                error=error,
+                retry_number=retry_number,
+                state=state,
+                delay_seconds=delay_seconds,
+            ),
+            "correlation_key": self._retry_correlation_key(context=context),
+            "append_details": True,
+        }
+        turn_id = self._session_metadata_string(context=context, key="turn_id")
+        if turn_id is not None:
+            event["turn_id"] = turn_id
+        event_handler(event)
+
+    def _retry_delay_seconds(self, *, retry_number: int, error: Exception) -> float:
         if isinstance(error, APIStatusError):
             retry_after = error.response.headers.get("retry-after")
             if retry_after is not None:
@@ -1261,17 +1398,24 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
     def _log_retry(
         self,
         *,
-        error: APIError,
+        error: Exception,
         retry_number: int,
         delay_seconds: float,
     ) -> None:
+        log_message = "openai request failed, retrying"
+        if isinstance(
+            error, RoomException
+        ) and self._is_retryable_websocket_transport_error(error=error):
+            log_message = "openai websocket request failed, retrying"
+
         request_id = None
         if isinstance(error, APIStatusError):
             request_id = error.request_id
 
         if request_id:
             logger.warning(
-                "openai request failed, retrying (%s/%s) in %.2fs (request_id=%s): %s",
+                "%s (%s/%s) in %.2fs (request_id=%s): %s",
+                log_message,
                 retry_number,
                 self._max_retries,
                 delay_seconds,
@@ -1280,7 +1424,8 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             )
         else:
             logger.warning(
-                "openai request failed, retrying (%s/%s) in %.2fs: %s",
+                "%s (%s/%s) in %.2fs: %s",
+                log_message,
                 retry_number,
                 self._max_retries,
                 delay_seconds,
@@ -1401,6 +1546,41 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             "response.incomplete",
         }
 
+    @staticmethod
+    def _websocket_close_error(
+        *,
+        websocket: aiohttp.ClientWebSocketResponse,
+        message: str,
+    ) -> RoomException:
+        error = websocket.exception()
+        close_code = websocket.close_code
+
+        suffix = ""
+        if close_code is not None:
+            suffix = f" (close_code={close_code})"
+
+        if error is not None:
+            detail = str(error).strip()
+            if detail != "":
+                message = f"{message}{suffix}: {detail}"
+            else:
+                message = f"{message}{suffix}: {error!r}"
+        else:
+            message = f"{message}{suffix}"
+
+        if isinstance(error, TimeoutError):
+            return RoomException(
+                message,
+                status_code=408,
+                code=ErrorCode.TIMEOUT,
+            )
+
+        return RoomException(
+            message,
+            status_code=503,
+            code=ErrorCode.OPERATION_FAILED,
+        )
+
     async def _receive_websocket_payload(
         self,
         *,
@@ -1434,13 +1614,25 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                 return payload
 
             if msg.type == aiohttp.WSMsgType.CLOSED:
-                raise RoomException("OpenAI websocket closed unexpectedly")
+                raise self._websocket_close_error(
+                    websocket=websocket,
+                    message="OpenAI websocket closed unexpectedly",
+                )
             if msg.type == aiohttp.WSMsgType.CLOSE:
-                raise RoomException("OpenAI websocket closed unexpectedly")
+                raise self._websocket_close_error(
+                    websocket=websocket,
+                    message="OpenAI websocket closed unexpectedly",
+                )
             if msg.type == aiohttp.WSMsgType.CLOSING:
-                raise RoomException("OpenAI websocket is closing unexpectedly")
+                raise self._websocket_close_error(
+                    websocket=websocket,
+                    message="OpenAI websocket is closing unexpectedly",
+                )
             if msg.type == aiohttp.WSMsgType.ERROR:
-                raise RoomException(f"OpenAI websocket error: {websocket.exception()}")
+                raise self._websocket_close_error(
+                    websocket=websocket,
+                    message="OpenAI websocket error",
+                )
             if msg.type == aiohttp.WSMsgType.BINARY:
                 raise RoomException(
                     "OpenAI websocket returned unexpected binary message"
@@ -1747,23 +1939,27 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                 **(options or {}),
                             }
                             self._add_auto_compaction_entry(create_kwargs=create_kwargs)
-                            if self._mode == "websocket":
-                                response: Content = (
-                                    await self._create_response_websocket_stream(
-                                        context=context,
-                                        room=room,
+                            response: Content | None = None
+                            if not stream:
+                                if self._mode == "websocket":
+                                    response = (
+                                        await self._create_response_websocket_stream(
+                                            context=context,
+                                            room=room,
+                                            openai=openai,
+                                            create_kwargs=create_kwargs,
+                                            extra_headers=extra_headers,
+                                        )
+                                    )
+                                else:
+                                    response = await self._create_response_with_retries(
                                         openai=openai,
                                         create_kwargs=create_kwargs,
-                                        extra_headers=extra_headers,
                                     )
-                                )
-                            else:
-                                response = await self._create_response_with_retries(
-                                    openai=openai,
-                                    create_kwargs=create_kwargs,
-                                )
 
                             if self._mode == "request" and not stream:
+                                if response is None:
+                                    raise RuntimeError("response must be available")
                                 self._store_usage(
                                     context=context,
                                     usage=response.usage,
@@ -2148,6 +2344,8 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                     return [], False
 
                             if not stream:
+                                if response is None:
+                                    raise RuntimeError("response must be available")
                                 room.developer.log_nowait(
                                     type="llm.message",
                                     data={
@@ -2237,12 +2435,51 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
 
                             else:
                                 stream_retry_number = 0
+                                pending_retry_completion_number: int | None = None
+                                pending_retry_error: Exception | None = None
                                 while True:
                                     final_outputs = []
                                     all_outputs = []
                                     response_output_messages: list[dict[str, Any]] = []
                                     restart_after_tool_boundary = False
                                     try:
+                                        if response is None:
+                                            if self._mode == "websocket":
+                                                response = await self._create_response_websocket_stream(
+                                                    context=context,
+                                                    room=room,
+                                                    openai=openai,
+                                                    create_kwargs=create_kwargs,
+                                                    extra_headers=extra_headers,
+                                                )
+                                            else:
+                                                response = (
+                                                    await openai.responses.create(
+                                                        **create_kwargs
+                                                    )
+                                                )
+
+                                            if (
+                                                pending_retry_completion_number
+                                                is not None
+                                            ):
+                                                self._emit_retry_event(
+                                                    context=context,
+                                                    event_handler=event_handler,
+                                                    error=(
+                                                        pending_retry_error
+                                                        if pending_retry_error
+                                                        is not None
+                                                        else RoomException(
+                                                            "OpenAI request retry recovered"
+                                                        )
+                                                    ),
+                                                    retry_number=pending_retry_completion_number,
+                                                    state="completed",
+                                                )
+                                                pending_retry_completion_number = None
+                                                pending_retry_error = None
+
                                         async for e in response:
                                             with tracer.start_as_current_span(
                                                 "llm.stream.event"
@@ -2414,6 +2651,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                 if len(final_outputs) > 0:
                                                     return final_outputs[0]
                                         if restart_after_tool_boundary:
+                                            response = None
                                             continue
                                         break
 
@@ -2421,8 +2659,24 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                         if not self._is_retryable_openai_error(
                                             error=error
                                         ):
+                                            if stream_retry_number > 0:
+                                                self._emit_retry_event(
+                                                    context=context,
+                                                    event_handler=event_handler,
+                                                    error=error,
+                                                    retry_number=stream_retry_number,
+                                                    state="failed",
+                                                )
                                             raise
                                         if stream_retry_number >= self._max_retries:
+                                            if stream_retry_number > 0:
+                                                self._emit_retry_event(
+                                                    context=context,
+                                                    event_handler=event_handler,
+                                                    error=error,
+                                                    retry_number=stream_retry_number,
+                                                    state="failed",
+                                                )
                                             raise
 
                                         stream_retry_number += 1
@@ -2435,23 +2689,79 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                             retry_number=stream_retry_number,
                                             delay_seconds=delay_seconds,
                                         )
+                                        self._emit_retry_event(
+                                            context=context,
+                                            event_handler=event_handler,
+                                            error=error,
+                                            retry_number=stream_retry_number,
+                                            state="in_progress",
+                                            delay_seconds=delay_seconds,
+                                        )
 
                                         restore_context_snapshot()
+                                        response = None
+                                        pending_retry_completion_number = (
+                                            stream_retry_number
+                                        )
+                                        pending_retry_error = error
 
                                         await asyncio.sleep(delay_seconds)
-                                        if self._mode == "websocket":
-                                            response = await self._create_response_websocket_stream(
-                                                context=context,
-                                                room=room,
-                                                openai=openai,
-                                                create_kwargs=create_kwargs,
-                                                extra_headers=extra_headers,
-                                            )
-                                        else:
-                                            response = await self._create_response_with_retries(
-                                                openai=openai,
-                                                create_kwargs=create_kwargs,
-                                            )
+                                    except RoomException as error:
+                                        if not self._is_retryable_room_error(
+                                            error=error
+                                        ):
+                                            if stream_retry_number > 0:
+                                                self._emit_retry_event(
+                                                    context=context,
+                                                    event_handler=event_handler,
+                                                    error=error,
+                                                    retry_number=stream_retry_number,
+                                                    state="failed",
+                                                )
+                                            raise
+                                        if stream_retry_number >= self._max_retries:
+                                            if stream_retry_number > 0:
+                                                self._emit_retry_event(
+                                                    context=context,
+                                                    event_handler=event_handler,
+                                                    error=error,
+                                                    retry_number=stream_retry_number,
+                                                    state="failed",
+                                                )
+                                            raise
+
+                                        stream_retry_number += 1
+                                        delay_seconds = self._retry_delay_seconds(
+                                            retry_number=stream_retry_number,
+                                            error=error,
+                                        )
+                                        self._log_retry(
+                                            error=error,
+                                            retry_number=stream_retry_number,
+                                            delay_seconds=delay_seconds,
+                                        )
+                                        self._emit_retry_event(
+                                            context=context,
+                                            event_handler=event_handler,
+                                            error=error,
+                                            retry_number=stream_retry_number,
+                                            state="in_progress",
+                                            delay_seconds=delay_seconds,
+                                        )
+
+                                        restore_context_snapshot()
+                                        response = None
+                                        pending_retry_completion_number = (
+                                            stream_retry_number
+                                        )
+                                        pending_retry_error = error
+                                        if self._mode == "websocket" and isinstance(
+                                            context, OpenAIResponsesSessionContext
+                                        ):
+                                            with contextlib.suppress(Exception):
+                                                await context.close_websocket()
+
+                                        await asyncio.sleep(delay_seconds)
 
                 except asyncio.CancelledError:
                     if not iteration_committed:

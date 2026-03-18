@@ -34,6 +34,7 @@ from meshagent.agents.messages import (
     AgentToolCallStarted,
 )
 from meshagent.api import RoomException
+from meshagent.api.error_codes import ErrorCode
 from meshagent.api.messaging import FileContent, JsonContent, TextContent
 from meshagent.computers.agent import ComputerToolkit
 from meshagent.computers.operator import Operator
@@ -452,10 +453,18 @@ class _FakeLoggingWsMessage:
 
 
 class _FakeLoggingWebSocket:
-    def __init__(self, *, messages: list[_FakeLoggingWsMessage]):
+    def __init__(
+        self,
+        *,
+        messages: list[_FakeLoggingWsMessage],
+        exception: Exception | None = None,
+        close_code: int | None = None,
+    ):
         self._messages = messages.copy()
         self.sent_payloads: list[str] = []
         self.closed = False
+        self._exception = exception
+        self.close_code = close_code
 
     async def send_str(self, payload: str):
         self.sent_payloads.append(payload)
@@ -469,21 +478,34 @@ class _FakeLoggingWebSocket:
         self.closed = True
 
     def exception(self):
-        return None
+        return self._exception
 
 
 class _QueuedLoggingWebSocket:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        exception: Exception | None = None,
+        close_code: int | None = None,
+    ) -> None:
         self._messages: asyncio.Queue[_FakeLoggingWsMessage] = asyncio.Queue()
         self.sent_payloads: list[str] = []
         self.closed = False
+        self._exception = exception
+        self.close_code = close_code
 
-    def queue_json(self, payload: dict[str, object]) -> None:
+    def queue_message(self, *, message_type: aiohttp.WSMsgType, data: str = "") -> None:
         self._messages.put_nowait(
             _FakeLoggingWsMessage(
-                type=aiohttp.WSMsgType.TEXT,
-                data=json.dumps(payload),
+                type=message_type,
+                data=data,
             )
+        )
+
+    def queue_json(self, payload: dict[str, object]) -> None:
+        self.queue_message(
+            message_type=aiohttp.WSMsgType.TEXT,
+            data=json.dumps(payload),
         )
 
     async def send_str(self, payload: str):
@@ -496,7 +518,7 @@ class _QueuedLoggingWebSocket:
         self.closed = True
 
     def exception(self):
-        return None
+        return self._exception
 
 
 class _SequentialClientSession:
@@ -2233,7 +2255,114 @@ async def test_next_retries_after_stream_iterator_api_error(monkeypatch):
     assert result == ""
     assert client.responses.calls == 2
     assert sleep_calls == [1.0]
-    assert [event["type"] for event in stream_events] == ["response.completed"]
+    assert [event["type"] for event in stream_events] == [
+        "agent.event",
+        "agent.event",
+        "response.completed",
+    ]
+    assert stream_events[0]["state"] == "in_progress"
+    assert stream_events[0]["headline"] == "Retrying the LLM request (retry 1/3)"
+    assert stream_events[1]["state"] == "completed"
+    assert stream_events[1]["headline"] == "LLM request retry succeeded"
+
+
+@pytest.mark.asyncio
+async def test_receive_websocket_payload_marks_timeout_close_as_retryable():
+    adapter = OpenAIResponsesAdapter(mode="websocket")
+    websocket = _FakeLoggingWebSocket(
+        messages=[
+            _FakeLoggingWsMessage(
+                type=aiohttp.WSMsgType.CLOSED,
+                data="",
+            )
+        ],
+        exception=TimeoutError("No PONG received after 15.0 seconds"),
+        close_code=1006,
+    )
+
+    with pytest.raises(RoomException) as exc_info:
+        await adapter._receive_websocket_payload(websocket=websocket)
+
+    assert exc_info.value.code == ErrorCode.TIMEOUT
+    assert exc_info.value.status_code == 408
+    assert "OpenAI websocket closed unexpectedly" in str(exc_info.value)
+    assert "No PONG received after 15.0 seconds" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_next_retries_after_websocket_close(monkeypatch):
+    adapter = OpenAIResponsesAdapter(mode="websocket", max_retries=2)
+    first_websocket = _QueuedLoggingWebSocket(
+        exception=TimeoutError("No PONG received after 15.0 seconds"),
+        close_code=1006,
+    )
+    first_websocket.queue_message(message_type=aiohttp.WSMsgType.CLOSED)
+    second_websocket = _QueuedLoggingWebSocket()
+    second_websocket.queue_json(
+        {
+            "type": "response.completed",
+            "response": {"id": "resp_second", "output": [], "usage": None},
+        }
+    )
+    client_session = _SequentialClientSession([first_websocket, second_websocket])
+    context = OpenAIResponsesSessionContext(
+        system_role=None,
+        session=client_session,
+        websocket_ping_interval_seconds=3600,
+        websocket_timeout=3600,
+    )
+    context.append_user_message("hello")
+    stream_events: list[dict] = []
+
+    monkeypatch.setattr(
+        adapter,
+        "_retry_delay_seconds",
+        lambda *, retry_number, error: 0.0,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "get_openai_client",
+        lambda *, room: SimpleNamespace(
+            base_url="https://example.com/openai/v1",
+            default_headers={"Authorization": "Bearer test-token"},
+        ),
+    )
+
+    def _fake_coerce_response_stream_event(payload: dict):
+        payload_type = payload["type"]
+        if payload_type in {"response.completed", "response.done"}:
+            response = payload.get("response", {})
+            response_id = response.get("id", "resp_ws")
+            return _FakeCompletedEvent(response=_FakeResponse(response_id=response_id))
+        return SimpleNamespace(type=payload_type)
+
+    monkeypatch.setattr(
+        adapter,
+        "_coerce_response_stream_event",
+        _fake_coerce_response_stream_event,
+    )
+    try:
+        result = await adapter.next(
+            context=context,
+            room=_FakeRoom(),
+            toolkits=[],
+            event_handler=stream_events.append,
+        )
+
+        assert result == ""
+        assert client_session.connect_calls == 2
+        assert first_websocket.closed is True
+        assert [event["type"] for event in stream_events] == [
+            "agent.event",
+            "agent.event",
+            "response.completed",
+        ]
+        assert stream_events[0]["state"] == "in_progress"
+        assert stream_events[0]["headline"] == "Reconnecting to the LLM (retry 1/2)"
+        assert stream_events[1]["state"] == "completed"
+        assert stream_events[1]["headline"] == "Reconnected to the LLM"
+    finally:
+        await context.close()
 
 
 @pytest.mark.asyncio
@@ -2450,6 +2579,36 @@ def test_make_agent_event_publisher_emits_content_and_tool_messages() -> None:
     assert isinstance(web_search_ended, AgentToolCallEnded)
     assert isinstance(web_search_ended.result, JsonContent)
     assert web_search_ended.result.json == {"results": [{"title": "MeshAgent"}]}
+
+
+def test_make_agent_event_publisher_forwards_custom_events() -> None:
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    published: list[object] = []
+    custom_events: list[dict[str, object]] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+        custom_event_callback=custom_events.append,
+    )
+
+    publisher(
+        {
+            "type": "agent.event",
+            "headline": "Retrying the LLM request",
+        }
+    )
+
+    assert published == []
+    assert custom_events == [
+        {
+            "type": "agent.event",
+            "headline": "Retrying the LLM request",
+        }
+    ]
 
 
 def test_make_agent_event_publisher_preserves_text_delta_whitespace() -> None:
