@@ -71,6 +71,21 @@ class _BlockingTool(FunctionTool):
         await asyncio.Future()
 
 
+class _CallerContextTool(FunctionTool):
+    def __init__(self, name: str):
+        super().__init__(
+            name=name,
+            input_schema={"type": "object", "additionalProperties": True},
+            description="caller context test tool",
+        )
+        self.caller_contexts: list[dict[str, Any] | None] = []
+
+    async def execute(self, context, **kwargs):
+        del kwargs
+        self.caller_contexts.append(context.caller_context)
+        return {"ok": True}
+
+
 class _FakeToolFunction:
     def __init__(self, *, name: str, arguments: dict):
         self.name = name
@@ -264,6 +279,52 @@ async def test_next_consumes_streaming_tool_events_and_uses_final_item_result():
     assert context.turn_count == 1
     assert context.usage == {"input_tokens": 7.0, "output_tokens": 4.0}
     assert events == [{"type": "agent.event", "headline": "working"}]
+
+
+@pytest.mark.asyncio
+async def test_next_passes_thread_and_turn_ids_in_tool_caller_context() -> None:
+    tool = _CallerContextTool("context_tool")
+    adapter = OpenAICompletionsAdapter(
+        model="gpt-4o-mini",
+        client=_FakeOpenAIClient(
+            responses=[
+                _FakeChatCompletion(
+                    message=_FakeMessage(
+                        tool_calls=[
+                            _FakeToolCall(
+                                tool_call_id="call_1",
+                                name="context_tool",
+                                arguments={},
+                            )
+                        ],
+                        content=None,
+                    )
+                ),
+                _FakeChatCompletion(
+                    message=_FakeMessage(tool_calls=None, content="done"),
+                ),
+            ]
+        ),
+    )
+    context = adapter.create_session()
+    context.append_user_message("run tool")
+    context.metadata["thread_id"] = "thread-1"
+    context.metadata["turn_id"] = "turn-1"
+
+    result = await adapter.next(
+        context=context,
+        room=_FakeRoom(),
+        toolkits=[Toolkit(name="tools", tools=[tool])],
+    )
+
+    assert result == "done"
+    assert len(tool.caller_contexts) == 1
+    caller_context = tool.caller_contexts[0]
+    assert isinstance(caller_context, dict)
+    assert caller_context["thread_id"] == "thread-1"
+    assert caller_context["turn_id"] == "turn-1"
+    assert caller_context["item_id"] == "call_1"
+    assert isinstance(caller_context.get("chat"), dict)
 
 
 @pytest.mark.asyncio

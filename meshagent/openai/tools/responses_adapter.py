@@ -1814,13 +1814,15 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                         }
                                                     )
 
-                                                    caller_context: dict[
-                                                        str, object
-                                                    ] = {"chat": context.to_json()}
-                                                    if isinstance(tool_call.id, str):
-                                                        caller_context["item_id"] = (
-                                                            tool_call.id
+                                                    caller_context = (
+                                                        context.to_tool_caller_context(
+                                                            item_id=tool_call.id
+                                                            if isinstance(
+                                                                tool_call.id, str
+                                                            )
+                                                            else None
                                                         )
+                                                    )
                                                     tool_context = ToolContext(
                                                         room=room,
                                                         caller=room.local_participant,
@@ -2042,9 +2044,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                             tool_context = ToolContext(
                                                                 room=room,
                                                                 caller=room.local_participant,
-                                                                caller_context={
-                                                                    "chat": context.to_json()
-                                                                },
+                                                                caller_context=context.to_tool_caller_context(),
                                                                 event_handler=event_handler,
                                                             )
 
@@ -2400,9 +2400,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                                     tool_context = ToolContext(
                                                                         room=room,
                                                                         caller=room.local_participant,
-                                                                        caller_context={
-                                                                            "chat": context.to_json()
-                                                                        },
+                                                                        caller_context=context.to_tool_caller_context(),
                                                                         event_handler=event_handler,
                                                                     )
 
