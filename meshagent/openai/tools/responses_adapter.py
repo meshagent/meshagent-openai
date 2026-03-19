@@ -1250,10 +1250,8 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         ).startswith("OpenAI websocket")
 
     def _is_retryable_room_error(self, *, error: RoomException) -> bool:
-        if error.status_code in {408, 409, 429} or error.status_code >= 500:
-            return True
-
-        return self._is_retryable_websocket_transport_error(error=error)
+        del error
+        return True
 
     @staticmethod
     def _session_metadata_string(

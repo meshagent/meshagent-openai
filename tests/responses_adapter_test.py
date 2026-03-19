@@ -13,6 +13,9 @@ from openai._models import BaseModel as OpenAIBaseModel
 from types import SimpleNamespace
 from openai import APIError
 from openai.types.responses.response_computer_tool_call import ResponseComputerToolCall
+from openai.types.responses.response_function_shell_tool_call import (
+    ResponseFunctionShellToolCall,
+)
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai.types.responses.response_output_message import ResponseOutputMessage
 from openai.types.responses.response_output_text import ResponseOutputText
@@ -114,8 +117,9 @@ class _FakeContainerExec:
 
 
 class _FakeContainers:
-    def __init__(self, *, exec_factory):
+    def __init__(self, *, exec_factory, run_error: Exception | None = None):
         self._exec_factory = exec_factory
+        self._run_error = run_error
         self.run_calls: list[dict[str, object]] = []
         self.exec_calls: list[dict[str, object]] = []
 
@@ -132,6 +136,8 @@ class _FakeContainers:
                 "env": env,
             }
         )
+        if self._run_error is not None:
+            raise self._run_error
         return "container-1"
 
     async def exec(self, *, container_id, command, tty):
@@ -146,9 +152,12 @@ class _FakeContainers:
 
 
 class _FakeContainerRoom(_FakeRoom):
-    def __init__(self, *, exec_factory):
+    def __init__(self, *, exec_factory, run_error: Exception | None = None):
         super().__init__()
-        self.containers = _FakeContainers(exec_factory=exec_factory)
+        self.containers = _FakeContainers(
+            exec_factory=exec_factory,
+            run_error=run_error,
+        )
 
 
 class _AnyArgsTool(FunctionTool):
@@ -222,7 +231,8 @@ class _FakeBrowserComputer:
         self.enter_count = 0
         self.exit_count = 0
 
-    async def __aenter__(self):
+    async def __aenter__(self, context=None):
+        del context
         self.enter_count += 1
         return self
 
@@ -232,14 +242,74 @@ class _FakeBrowserComputer:
         del exc_tb
         self.exit_count += 1
 
-    async def click(self, x: int, y: int, button: str = "left") -> None:
+    async def click(
+        self,
+        context,
+        *,
+        x: int,
+        y: int,
+        button: str = "left",
+    ) -> None:
+        del context
         self.calls.append(("click", {"x": x, "y": y, "button": button}))
 
-    async def screenshot(self) -> str:
+    async def double_click(self, context, *, x: int, y: int) -> None:
+        del context
+        self.calls.append(("double_click", {"x": x, "y": y}))
+
+    async def scroll(
+        self,
+        context,
+        *,
+        x: int,
+        y: int,
+        scroll_x: int,
+        scroll_y: int,
+    ) -> None:
+        del context
+        self.calls.append(
+            ("scroll", {"x": x, "y": y, "scroll_x": scroll_x, "scroll_y": scroll_y})
+        )
+
+    async def type(self, context, *, text: str) -> None:
+        del context
+        self.calls.append(("type", {"text": text}))
+
+    async def wait(self, context, *, ms: int = 1000) -> None:
+        del context
+        self.calls.append(("wait", {"ms": ms}))
+
+    async def move(self, context, *, x: int, y: int) -> None:
+        del context
+        self.calls.append(("move", {"x": x, "y": y}))
+
+    async def keypress(self, context, *, keys: list[str]) -> None:
+        del context
+        self.calls.append(("keypress", {"keys": keys}))
+
+    async def drag(self, context, *, path: list[dict[str, int]]) -> None:
+        del context
+        self.calls.append(("drag", {"path": path}))
+
+    async def screenshot(self, context) -> str:
+        del context
         return "ZmFrZS1zY3JlZW5zaG90"
 
-    async def get_current_url(self) -> str:
+    async def get_current_url(self, context) -> str:
+        del context
         return "https://example.com"
+
+    async def goto(self, context, *, url: str) -> None:
+        del context
+        self.calls.append(("goto", {"url": url}))
+
+    async def back(self, context) -> None:
+        del context
+        self.calls.append(("back", {}))
+
+    async def forward(self, context) -> None:
+        del context
+        self.calls.append(("forward", {}))
 
 
 class _FakeResponse:
@@ -654,6 +724,21 @@ def _make_function_tool_call(
         call_id=call_id,
         arguments=json.dumps(arguments),
         type="function_call",
+        status="completed",
+    )
+
+
+def _make_shell_tool_call(
+    *,
+    item_id: str,
+    call_id: str,
+    commands: list[str],
+) -> ResponseFunctionShellToolCall:
+    return ResponseFunctionShellToolCall(
+        id=item_id,
+        action={"commands": commands},
+        call_id=call_id,
+        type="shell_call",
         status="completed",
     )
 
@@ -2264,6 +2349,81 @@ async def test_next_retries_after_stream_iterator_api_error(monkeypatch):
     assert stream_events[0]["headline"] == "Retrying the LLM request (retry 1/3)"
     assert stream_events[1]["state"] == "completed"
     assert stream_events[1]["headline"] == "LLM request retry succeeded"
+
+
+@pytest.mark.asyncio
+async def test_next_retries_after_shell_tool_room_exception(monkeypatch):
+    sleep_calls: list[float] = []
+
+    async def _fake_sleep(delay: float):
+        sleep_calls.append(delay)
+
+    monkeypatch.setattr(
+        "meshagent.openai.tools.responses_adapter.asyncio.sleep",
+        _fake_sleep,
+    )
+
+    shell_call = _make_shell_tool_call(
+        item_id="shell_1",
+        call_id="call_1",
+        commands=["echo hi"],
+    )
+    client = _FakeOpenAIClient(
+        outcomes=[
+            _EventStream(
+                events=[
+                    _FakeOutputItemDoneEvent(item=shell_call),
+                ]
+            ),
+            _CompletedStream(
+                event=_FakeCompletedEvent(
+                    response=_FakeResponse(
+                        response_id="resp_done",
+                        output=[_make_output_message(message_id="msg_1", text="done")],
+                    )
+                )
+            ),
+        ]
+    )
+
+    adapter = OpenAIResponsesAdapter(client=client, max_retries=3, mode="request")
+    context = adapter.create_session()
+    context.append_user_message("hello")
+    stream_events: list[dict] = []
+    room = _FakeContainerRoom(
+        exec_factory=lambda: _FakeContainerExec(
+            stdout_chunks=[],
+            stderr_chunks=[],
+            exit_code=0,
+        ),
+        run_error=RoomException(
+            "unable to pull image: failed to pull and unpack image "
+            '"docker.io/library/none:latest"',
+            code=ErrorCode.OPERATION_FAILED,
+        ),
+    )
+
+    result = await adapter.next(
+        context=context,
+        room=room,
+        toolkits=[Toolkit(name="openai", tools=[ShellTool(image="python:3.13")])],
+        event_handler=stream_events.append,
+    )
+
+    assert result == "done"
+    assert client.responses.calls == 2
+    assert sleep_calls == [1.0]
+    assert len(room.containers.run_calls) == 1
+    assert room.containers.run_calls[0]["command"] == "sleep infinity"
+    assert room.containers.run_calls[0]["image"] == "python:3.13"
+    assert room.containers.run_calls[0]["writable_root_fs"] is True
+    assert room.containers.run_calls[0]["env"] is None
+    retry_events = [
+        event for event in stream_events if event.get("type") == "agent.event"
+    ]
+    assert [event["state"] for event in retry_events] == ["in_progress", "completed"]
+    assert retry_events[0]["headline"] == "Retrying the LLM request (retry 1/3)"
+    assert retry_events[1]["headline"] == "LLM request retry succeeded"
 
 
 @pytest.mark.asyncio
