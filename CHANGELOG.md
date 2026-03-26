@@ -1,3 +1,7 @@
+## [0.34.0]
+- Added a queue listing command that returns room queues in table or JSON format.
+- Route upserts now store the originating service ID in route annotations, avoiding unnecessary updates.
+
 ## [0.33.3]
 - Stability
 
