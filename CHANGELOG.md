@@ -1,3 +1,9 @@
+## [0.35.0]
+- Meshagent client adds managed secrets with project/room CRUD (base64 payloads), get/list/delete APIs, and external OAuth registration CRUD; list_secrets now resolves managed secret data.
+- Agent runtime now formats live turn messages with sender + ISO timestamps via thread adapter hooks, and file-attachment messages include sender context.
+- Chat agent shutdown now closes message channels and waits for thread tasks before teardown.
+- Diagnostics improved by filtering unsupported computer action arguments and logging tool-call failures with exception details.
+
 ## [0.34.0]
 - Added a queue listing command that returns room queues in table or JSON format.
 - Route upserts now store the originating service ID in route annotations, avoiding unnecessary updates.
