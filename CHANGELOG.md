@@ -1,3 +1,6 @@
+## [0.35.3]
+- Stability
+
 ## [0.35.2]
 - Outbound SMTP now includes a resolved local hostname (from `SMTP_LOCAL_HOSTNAME`, system hostname, or `localhost`) to improve mail delivery when the host name is missing.
 
