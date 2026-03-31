@@ -1,3 +1,8 @@
+## [0.35.1]
+- Breaking: container build APIs now return a build id and add build lifecycle endpoints (`start_build`, `list_builds`, `cancel_build`, `delete_build`, `get_build_logs`), with optional context-archive fields for packed build contexts.
+- Breaking: image builds moved to the new `meshagent image` CLI, which adds `pack` support for OCI archives, room storage uploads, and optional service/route deployment; CLI log output now strips CRI prefixes.
+- Chat agent should-reply logic now tolerates unstructured responses; Stagehand availability now requires the SEA binary before reporting ready.
+
 ## [0.35.0]
 - Meshagent client adds managed secrets with project/room CRUD (base64 payloads), get/list/delete APIs, and external OAuth registration CRUD; list_secrets now resolves managed secret data.
 - Agent runtime now formats live turn messages with sender + ISO timestamps via thread adapter hooks, and file-attachment messages include sender context.
