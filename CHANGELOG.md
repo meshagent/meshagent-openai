@@ -1,3 +1,6 @@
+## [0.35.2]
+- Outbound SMTP now includes a resolved local hostname (from `SMTP_LOCAL_HOSTNAME`, system hostname, or `localhost`) to improve mail delivery when the host name is missing.
+
 ## [0.35.1]
 - Breaking: container build APIs now return a build id and add build lifecycle endpoints (`start_build`, `list_builds`, `cancel_build`, `delete_build`, `get_build_logs`), with optional context-archive fields for packed build contexts.
 - Breaking: image builds moved to the new `meshagent image` CLI, which adds `pack` support for OCI archives, room storage uploads, and optional service/route deployment; CLI log output now strips CRI prefixes.
