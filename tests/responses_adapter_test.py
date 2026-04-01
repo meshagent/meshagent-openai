@@ -3701,6 +3701,43 @@ async def test_shell_tool_container_exec_truncates_success_output(
 
 
 @pytest.mark.asyncio
+async def test_shell_tool_container_exec_uses_configured_working_dir() -> None:
+    tool = ShellTool(image="python:3.13", working_dir="/workspace")
+    room = _FakeContainerRoom(
+        exec_factory=lambda: _FakeContainerExec(
+            stdout_chunks=[b"/workspace\n"],
+            stderr_chunks=[],
+            exit_code=0,
+        )
+    )
+    context = ToolContext(
+        room=room,
+        caller=_FakeParticipant(),
+        event_handler=lambda event: None,
+    )
+
+    result = await tool.execute_shell_command(
+        context,
+        commands=["pwd"],
+        item_id="shell-1",
+        timeout_ms=5000,
+    )
+
+    assert room.containers.exec_calls[0]["command"] == [
+        "bash",
+        "-lc",
+        "cd /workspace && pwd",
+    ]
+    assert result == [
+        {
+            "outcome": {"type": "exit", "exit_code": 0},
+            "stdout": "/workspace\n",
+            "stderr": "",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_shell_tool_local_exec_truncates_success_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3739,5 +3776,38 @@ async def test_shell_tool_local_exec_truncates_success_output(
                     "text": "[output truncated after 8 characters]",
                 },
             ],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_shell_tool_local_exec_uses_configured_env() -> None:
+    tool = ShellTool(image=None, env={"EXAMPLE_VAR": "hello"})
+    emitted_events: list[dict[str, object]] = []
+    context = ToolContext(
+        room=_FakeRoom(),
+        caller=_FakeParticipant(),
+        event_handler=emitted_events.append,
+    )
+
+    result = await tool.execute_shell_command(
+        context,
+        commands=["printf '%s' \"$EXAMPLE_VAR\""],
+        item_id="shell-1",
+        timeout_ms=5000,
+    )
+
+    assert result == [
+        {
+            "outcome": {"type": "exit", "exit_code": 0},
+            "stdout": "hello",
+            "stderr": "",
+        }
+    ]
+    assert emitted_events == [
+        {
+            "type": "meshagent.handler.output",
+            "item_id": "shell-1",
+            "lines": [{"source": "stdout", "text": "hello"}],
         }
     ]

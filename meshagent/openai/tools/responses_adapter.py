@@ -6,6 +6,7 @@ from meshagent.agents.event_publisher import (
 )
 from meshagent.agents.messages import AgentMessage
 from meshagent.tools import Toolkit, ToolContext, FunctionTool, BaseTool
+from meshagent.tools.container_shell import ContainerShellTool, ProcessShellTool
 from meshagent.tools._shell_output import (
     DEFAULT_MAX_LOG_LINE_LENGTH,
     StreamOutputAccumulator,
@@ -3197,14 +3198,45 @@ class ShellTool(OpenAIResponsesTool):
         self.working_dir = working_dir
         self.image = image
         self.mounts = mounts
-        self._container_id = None
         self.env = env
+        self._provider: ContainerShellTool | ProcessShellTool
+        if image is None:
+            self._provider = ProcessShellTool(
+                name="shell",
+                working_dir=working_dir,
+                env=env,
+            )
+        else:
+            self._provider = ContainerShellTool(
+                name="shell",
+                working_dir=working_dir,
+                image=image,
+                mounts=mounts,
+                env=env,
+            )
 
     def get_open_ai_tool_definitions(self):
         return [{"type": "shell"}]
 
     def get_open_ai_output_handlers(self):
         return {"shell_call": self.handle_shell_call}
+
+    def _provider_context(
+        self,
+        context: ToolContext,
+        *,
+        item_id: str,
+    ) -> ToolContext:
+        caller_context = dict(context.caller_context or {})
+        caller_context["item_id"] = item_id
+        return ToolContext(
+            room=context.room,
+            caller=context.caller,
+            on_behalf_of=context.on_behalf_of,
+            caller_context=caller_context,
+            event_handler=context.emit,
+            validation_mode=context.validation_mode,
+        )
 
     async def execute_shell_command(
         self,
@@ -3215,238 +3247,19 @@ class ShellTool(OpenAIResponsesTool):
         max_output_length: Optional[int] = None,
         timeout_ms: Optional[int] = None,
     ):
-        merged_env = {**os.environ}
-
-        results = []
-        encoding = os.device_encoding(1) or "utf-8"
         effective_max_output_length = (
             max_output_length
             if max_output_length is not None
             else MAX_SHELL_OUTPUT_SIZE
         )
-        if effective_max_output_length <= 0:
-            raise ValueError("max_output_length must be greater than 0")
+        result = await self._provider.execute(
+            self._provider_context(context, item_id=item_id),
+            commands=commands,
+            max_output_length=effective_max_output_length,
+            timeout_ms=timeout_ms,
+        )
 
-        timeout = float(timeout_ms) / 1000.0 if timeout_ms else 60.0
-
-        if self.image is not None:
-            running = False
-
-            if self._container_id:
-                # make sure container is still running
-
-                for c in await context.room.containers.list():
-                    if c.id == self._container_id:
-                        running = True
-            else:
-                logger.info("not currently a running shell")
-
-            if not running:
-                logger.info("starting a new container for shell command")
-                self._container_id = await context.room.containers.run(
-                    command="sleep infinity",
-                    image=self.image,
-                    mounts=self.mounts,
-                    writable_root_fs=True,
-                    env=self.env,
-                )
-
-            container_id = self._container_id
-
-            try:
-                # TODO: what if container start fails
-
-                logger.info(
-                    f"executing shell commands in container {container_id} with timeout {timeout}: {commands}"
-                )
-                for command in commands:
-                    exec = await context.room.containers.exec(
-                        container_id=container_id,
-                        command=["bash", "-lc", command],
-                        tty=False,
-                    )
-
-                    stdout = StreamOutputAccumulator(
-                        context=context,
-                        item_id=item_id,
-                        source="stdout",
-                        encoding=encoding,
-                        max_length=effective_max_output_length,
-                        max_log_line_length=MAX_SHELL_LOG_LINE_LENGTH,
-                    )
-                    stderr = StreamOutputAccumulator(
-                        context=context,
-                        item_id=item_id,
-                        source="stderr",
-                        encoding=encoding,
-                        max_length=effective_max_output_length,
-                        max_log_line_length=MAX_SHELL_LOG_LINE_LENGTH,
-                    )
-                    stdout_task: asyncio.Task[None] | None = None
-                    stderr_task: asyncio.Task[None] | None = None
-
-                    try:
-                        stdout_task = asyncio.create_task(
-                            _collect_shell_output_stream(
-                                stream=exec.stdout(),
-                                accumulator=stdout,
-                            )
-                        )
-                        stderr_task = asyncio.create_task(
-                            _collect_shell_output_stream(
-                                stream=exec.stderr(),
-                                accumulator=stderr,
-                            )
-                        )
-                        async with asyncio.timeout(timeout):
-                            exit_code = await exec.result
-                            await _await_output_tasks(stdout_task, stderr_task)
-
-                            results.append(
-                                {
-                                    "outcome": {
-                                        "type": "exit",
-                                        "exit_code": exit_code,
-                                    },
-                                    "stdout": stdout.finish(),
-                                    "stderr": stderr.finish(),
-                                }
-                            )
-
-                    except asyncio.TimeoutError:
-                        logger.warning(f"The command timed out after {timeout}s")
-                        await exec.kill()
-                        if stdout_task is not None and stderr_task is not None:
-                            await _await_output_tasks(stdout_task, stderr_task)
-
-                        results.append(
-                            {
-                                "outcome": {"type": "timeout"},
-                                "stdout": stdout.finish(),
-                                "stderr": stderr.finish(),
-                            }
-                        )
-                        break
-
-                    except Exception as ex:
-                        results.append(
-                            {
-                                "outcome": {
-                                    "type": "exit",
-                                    "exit_code": 1,
-                                },
-                                "stdout": "",
-                                "stderr": f"{ex}",
-                            }
-                        )
-                        break
-
-            except Exception as ex:
-                results.append(
-                    {
-                        "outcome": {
-                            "type": "exit",
-                            "exit_code": 1,
-                        },
-                        "stdout": "",
-                        "stderr": f"{ex}",
-                    }
-                )
-
-        else:
-            for command in commands:
-                logger.info(f"executing command {command} with timeout: {timeout}s")
-
-                # Spawn the process
-                proc: asyncio.subprocess.Process | None = None
-                stdout_task: asyncio.Task[None] | None = None
-                stderr_task: asyncio.Task[None] | None = None
-                stdout = StreamOutputAccumulator(
-                    context=context,
-                    item_id=item_id,
-                    source="stdout",
-                    encoding=encoding,
-                    max_length=effective_max_output_length,
-                    max_log_line_length=MAX_SHELL_LOG_LINE_LENGTH,
-                )
-                stderr = StreamOutputAccumulator(
-                    context=context,
-                    item_id=item_id,
-                    source="stderr",
-                    encoding=encoding,
-                    max_length=effective_max_output_length,
-                    max_log_line_length=MAX_SHELL_LOG_LINE_LENGTH,
-                )
-                try:
-                    import shlex
-
-                    proc = await asyncio.create_subprocess_shell(
-                        shlex.join(["bash", "-c", command]),
-                        cwd=self.working_dir or os.getcwd(),
-                        env=merged_env,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    stdout_task = asyncio.create_task(
-                        _collect_shell_output_stream(
-                            stream=_stream_reader_chunks(proc.stdout),
-                            accumulator=stdout,
-                        )
-                    )
-                    stderr_task = asyncio.create_task(
-                        _collect_shell_output_stream(
-                            stream=_stream_reader_chunks(proc.stderr),
-                            accumulator=stderr,
-                        )
-                    )
-
-                    await asyncio.wait_for(proc.wait(), timeout=timeout)
-                    await _await_output_tasks(stdout_task, stderr_task)
-                except asyncio.TimeoutError:
-                    logger.warning(f"The command timed out after {timeout}s")
-                    if proc is not None:
-                        proc.kill()  # send SIGKILL / TerminateProcess
-
-                    if proc is not None:
-                        await proc.wait()
-                    if stdout_task is not None and stderr_task is not None:
-                        await _await_output_tasks(stdout_task, stderr_task)
-
-                    results.append(
-                        {
-                            "outcome": {"type": "timeout"},
-                            "stdout": stdout.finish(),
-                            "stderr": stderr.finish(),
-                        }
-                    )
-
-                    break
-
-                except Exception as ex:
-                    results.append(
-                        {
-                            "outcome": {
-                                "type": "exit",
-                                "exit_code": 1,
-                            },
-                            "stdout": "",
-                            "stderr": f"{ex}",
-                        }
-                    )
-                    break
-
-                results.append(
-                    {
-                        "outcome": {
-                            "type": "exit",
-                            "exit_code": proc.returncode if proc is not None else 1,
-                        },
-                        "stdout": stdout.finish(),
-                        "stderr": stderr.finish(),
-                    }
-                )
-
-        return results
+        return result["results"]
 
     async def handle_shell_call(
         self,
