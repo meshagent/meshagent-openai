@@ -1,3 +1,7 @@
+## [0.35.5]
+- Shell tooling now supports local process execution and runtime selection between OpenAI, container, or process shells, with unified execution outputs.
+- Image deploy updates request-validation and published-port annotations when toggling public/private, using cookie-based validation for private services.
+
 ## [0.35.4]
 - Added `ApiScope.user_default` to create participant tokens with default user grants.
 - Added a managed container toolkit (start/list/stop/run) with strict JSON schemas and structured results for container shell execution.
