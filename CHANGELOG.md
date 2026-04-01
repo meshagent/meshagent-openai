@@ -1,3 +1,11 @@
+## [0.35.4]
+- Added `ApiScope.user_default` to create participant tokens with default user grants.
+- Added a managed container toolkit (start/list/stop/run) with strict JSON schemas and structured results for container shell execution.
+- CLI now supports `--require-advanced-shell` to expose the managed container toolkit with working-dir support and optional token delegation.
+- Breaking: `image build --deploy/--domain` was replaced by `image deploy`, which updates services with mounts (room/project/image/empty-dir), env vars, env-token scopes, and optional domain routing.
+- Breaking: `containers exec` removed interactive TTY mode (`--tty` is no longer available).
+- CLI help output now hides selected top-level commands, and generated CLI docs omit hidden groups.
+
 ## [0.35.3]
 - Stability
 
