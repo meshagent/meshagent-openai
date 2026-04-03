@@ -1,3 +1,14 @@
+## [0.35.6]
+- Breaking: document runtime no longer falls back to STPyV8; environments must provide the CRDT backend.
+- Containers client adds room-storage OCI archive loading with a new import result type; CLI image loading now targets room-storage paths and loads directly into the room.
+- Storage upload streaming now uses server-provided `chunk_size` pull headers to drive client chunking.
+- CLI now lazily loads subcommands, adds `api-key show`/`api-key env` and interactive setup, and emits OCI zstd layers when packing images.
+- New MeshAgent Harbor package provides Harbor-compatible agent/environment classes for running tasks via MeshAgent rooms/containers.
+- Shell tooling now supports stopping/deleting cached containers and reuses shell toolkits across turns for process agents.
+- Observability improvements add descriptive toolkit/tool span names for tool execution and invocation.
+- API key parsing errors now include a key prefix for easier debugging.
+- Dependency updates: `pathspec` now `>=1.0.3,<2`, added `zstandard~=0.25.0`, and new Harbor package depends on `harbor>=0.3.0`, `pytest~=8.4`, `pytest-asyncio~=0.26`.
+
 ## [0.35.5]
 - Shell tooling now supports local process execution and runtime selection between OpenAI, container, or process shells, with unified execution outputs.
 - Image deploy updates request-validation and published-port annotations when toggling public/private, using cookie-based validation for private services.
