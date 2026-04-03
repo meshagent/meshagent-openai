@@ -1,3 +1,8 @@
+## [0.35.7]
+- Breaking: Messaging stream APIs were removed from the Python SDK (stream callbacks, MessageStream types, and `create_stream`); use streaming toolkits instead.
+- Breaking: MessageStreamLLMAdapter and ChatKit messaging-stream responses were removed; use streaming toolkits instead.
+- OpenAI responses adapter now logs request payloads for websocket errors (especially 4xx) and surfaces nested error messages for debugging.
+
 ## [0.35.6]
 - Breaking: document runtime no longer falls back to STPyV8; environments must provide the CRDT backend.
 - Containers client adds room-storage OCI archive loading with a new import result type; CLI image loading now targets room-storage paths and loads directly into the room.
