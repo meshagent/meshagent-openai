@@ -1584,6 +1584,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         self,
         *,
         websocket: aiohttp.ClientWebSocketResponse,
+        request_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         while True:
             msg = await websocket.receive()
@@ -1603,7 +1604,25 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                     logger.info("body=%s", _safe_json_for_log(payload))
 
                 if payload_type == "error":
+                    status = payload.get("status")
+                    should_log_request_payload = self._log_requests or (
+                        isinstance(status, int)
+                        and not isinstance(status, bool)
+                        and 400 <= status < 500
+                    )
+                    if should_log_request_payload and request_payload is not None:
+                        logger.error(
+                            "OpenAI websocket error request body=%s",
+                            _safe_json_for_log(request_payload),
+                        )
+
                     message = payload.get("message")
+                    if not isinstance(message, str):
+                        error = payload.get("error")
+                        if isinstance(error, dict):
+                            nested_message = error.get("message")
+                            if isinstance(nested_message, str):
+                                message = nested_message
                     if isinstance(message, str):
                         raise RoomException(f"Error from OpenAI websocket: {message}")
                     raise RoomException(
@@ -1747,6 +1766,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             while True:
                 payload = await self._receive_websocket_payload(
                     websocket=websocket,
+                    request_payload=request_payload,
                 )
 
                 payload_response_id = self._response_id_from_payload(payload)

@@ -2450,6 +2450,69 @@ async def test_receive_websocket_payload_marks_timeout_close_as_retryable():
 
 
 @pytest.mark.asyncio
+async def test_receive_websocket_payload_logs_request_body_for_4xx_error_event(
+    caplog,
+):
+    adapter = OpenAIResponsesAdapter(mode="websocket")
+    websocket = _FakeLoggingWebSocket(
+        messages=[
+            _FakeLoggingWsMessage(
+                type=aiohttp.WSMsgType.TEXT,
+                data=json.dumps(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": (
+                                "[ObjectParam] [input[0].output[0].outcome.exit_code] "
+                                "[unknown_parameter] Unknown parameter: "
+                                "'input[0].output[0].outcome.exit_code'."
+                            ),
+                        },
+                        "status": 400,
+                    }
+                ),
+            )
+        ]
+    )
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.2",
+        "input": [
+            {
+                "type": "shell_call_output",
+                "call_id": "call_1",
+                "output": [
+                    {
+                        "outcome": {"type": "exit", "exit_code": 0},
+                        "stdout": "hi\n",
+                        "stderr": "",
+                    }
+                ],
+            }
+        ],
+    }
+
+    caplog.set_level(logging.ERROR, logger="openai_agent")
+
+    with pytest.raises(RoomException) as exc_info:
+        await adapter._receive_websocket_payload(
+            websocket=websocket,
+            request_payload=request_payload,
+        )
+
+    assert "unknown_parameter" in str(exc_info.value)
+    assert "outcome.exit_code" in str(exc_info.value)
+    logged_messages = [record.message for record in caplog.records]
+    assert any(
+        message.startswith("OpenAI websocket error request body=")
+        for message in logged_messages
+    )
+    assert any('"type": "shell_call_output"' in message for message in logged_messages)
+    assert any('"exit_code": 0' in message for message in logged_messages)
+
+
+@pytest.mark.asyncio
 async def test_next_retries_after_websocket_close(monkeypatch):
     adapter = OpenAIResponsesAdapter(mode="websocket", max_retries=2)
     first_websocket = _QueuedLoggingWebSocket(
