@@ -1,3 +1,7 @@
+## [0.35.8]
+- Harbor agent event logs now record turn-start messages (including instructions) before dispatch.
+- Python SDK examples updated to use storage upload and call-style webhook handling, with corrected entrypoint guard and cleanup of empty example stubs.
+
 ## [0.35.7]
 - Breaking: Messaging stream APIs were removed from the Python SDK (stream callbacks, MessageStream types, and `create_stream`); use streaming toolkits instead.
 - Breaking: MessageStreamLLMAdapter and ChatKit messaging-stream responses were removed; use streaming toolkits instead.
