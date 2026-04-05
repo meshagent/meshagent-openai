@@ -1,3 +1,10 @@
+## [0.36.0]
+- Added AgentInputContent (text/file), agent email/heartbeat settings, service files, and config mounts to service models.
+- Breaking: container API key provisioning was removed from container specs.
+- Queue channels now accept structured `content`/`prompt` payloads (including `room://` file references), resolve legacy prompt files, and support thread ID templates with time tokens.
+- Container shell tooling now expands config mounts by injecting runtime spec/members files, and the CLI adds `--shell-tool-config-mount` to pass these mounts.
+- Service template conversions now include config and empty-dir mounts alongside project/image/file mounts.
+
 ## [0.35.8]
 - Harbor agent event logs now record turn-start messages (including instructions) before dispatch.
 - Python SDK examples updated to use storage upload and call-style webhook handling, with corrected entrypoint guard and cleanup of empty example stubs.
