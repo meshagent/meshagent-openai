@@ -2406,7 +2406,7 @@ async def test_next_retries_after_shell_tool_room_exception(monkeypatch):
     result = await adapter.next(
         context=context,
         room=room,
-        toolkits=[Toolkit(name="openai", tools=[ShellTool(image="python:3.13")])],
+        toolkits=[Toolkit(name="openai", tools=[ShellTool(image="meshagent/python:default")])],
         event_handler=stream_events.append,
     )
 
@@ -2415,7 +2415,7 @@ async def test_next_retries_after_shell_tool_room_exception(monkeypatch):
     assert sleep_calls == [1.0]
     assert len(room.containers.run_calls) == 1
     assert room.containers.run_calls[0]["command"] == "sleep infinity"
-    assert room.containers.run_calls[0]["image"] == "python:3.13"
+    assert room.containers.run_calls[0]["image"] == "meshagent/python:default"
     assert room.containers.run_calls[0]["writable_root_fs"] is True
     assert room.containers.run_calls[0]["env"] is None
     retry_events = [
@@ -3663,7 +3663,7 @@ async def test_local_shell_tool_execute_shell_command_truncates_success_output(
 
 @pytest.mark.asyncio
 async def test_shell_tool_container_exec_emits_live_output_events() -> None:
-    tool = ShellTool(image="python:3.13")
+    tool = ShellTool(image="meshagent/python:default")
     room = _FakeContainerRoom(
         exec_factory=lambda: _FakeContainerExec(
             stdout_chunks=[b"one\n", b"three\n"],
@@ -3685,7 +3685,7 @@ async def test_shell_tool_container_exec_emits_live_output_events() -> None:
         timeout_ms=5000,
     )
 
-    assert room.containers.run_calls[0]["image"] == "python:3.13"
+    assert room.containers.run_calls[0]["image"] == "meshagent/python:default"
     assert room.containers.exec_calls[0]["command"] == ["bash", "-lc", "echo hi"]
     assert result == [
         {
@@ -3719,7 +3719,7 @@ async def test_shell_tool_container_exec_truncates_success_output(
 ) -> None:
     monkeypatch.setattr(responses_adapter_module, "MAX_SHELL_OUTPUT_SIZE", 8)
 
-    tool = ShellTool(image="python:3.13")
+    tool = ShellTool(image="meshagent/python:default")
     room = _FakeContainerRoom(
         exec_factory=lambda: _FakeContainerExec(
             stdout_chunks=[b"abcdefghijk"],
@@ -3765,7 +3765,7 @@ async def test_shell_tool_container_exec_truncates_success_output(
 
 @pytest.mark.asyncio
 async def test_shell_tool_container_exec_uses_configured_working_dir() -> None:
-    tool = ShellTool(image="python:3.13", working_dir="/workspace")
+    tool = ShellTool(image="meshagent/python:default", working_dir="/workspace")
     room = _FakeContainerRoom(
         exec_factory=lambda: _FakeContainerExec(
             stdout_chunks=[b"/workspace\n"],

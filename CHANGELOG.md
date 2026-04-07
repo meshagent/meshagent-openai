@@ -329,7 +329,7 @@
 ## [0.19.2]
 - Add boolean data type support plus `nullable`/`metadata` on schema types and generated JSON Schema.
 - BREAKING: OpenAI proxy client creation now takes an optional `http_client` (request logging is configured via a separate logging client helper).
-- Shell tool now reuses a long-lived container with a writable root filesystem, runs commands via `bash -lc`, and defaults to the `python:3.13` image.
+- Shell tool now reuses a long-lived container with a writable root filesystem, runs commands via `bash -lc`, and defaults to the `meshagent/python:default` image.
 - Add `log_llm_requests` support to enable OpenAI request/response logging.
 
 ## [0.19.1]
