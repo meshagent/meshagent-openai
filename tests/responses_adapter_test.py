@@ -2406,7 +2406,9 @@ async def test_next_retries_after_shell_tool_room_exception(monkeypatch):
     result = await adapter.next(
         context=context,
         room=room,
-        toolkits=[Toolkit(name="openai", tools=[ShellTool(image="meshagent/python:default")])],
+        toolkits=[
+            Toolkit(name="openai", tools=[ShellTool(image="meshagent/python:default")])
+        ],
         event_handler=stream_events.append,
     )
 
