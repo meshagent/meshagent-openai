@@ -1,3 +1,13 @@
+## [0.36.1]
+- Breaking: room internal API port standardized to `8078` with `ROOM_INTERNAL_API_PORT`/`room_api_base_url`, and service port specs now reject reserved room ports.
+- Participant container grants now include `ContainerRegistryGrant` for registry list/pull/run/write patterns.
+- Containers build APIs accept `optimize_image` (default true) to enable eStargz optimization, and image runtime definitions for node/python were added.
+- Room client lifecycle hardened: `wait_for_close` is cancellation-safe, `__aenter__` fails if the connection closes before ready, and `__aexit__` cancels close watchers and fails pending tool streams.
+- CLI image deploy now parses packed Dockerfile metadata to infer ports, default HTTP liveness to `/`, validates reserved ports, and supports `meshagent.runtime` runtime overrides with mounted app images; pack preserves Dockerfile/.dockerignore paths.
+- CLI container sessions now use the room URL returned by the account service when opening WebSocket connections.
+- Skills prompt generation supports location remapping; Harbor agents embed the skills prompt under `/skills` and can optionally delegate `MESHAGENT_TOKEN` into container env.
+- Default shell image across CLI/tools/OpenAI/Slack switched to `meshagent/python:default`.
+
 ## [0.36.0]
 - Added AgentInputContent (text/file), agent email/heartbeat settings, service files, and config mounts to service models.
 - Breaking: container API key provisioning was removed from container specs.
