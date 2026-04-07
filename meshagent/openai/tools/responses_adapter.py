@@ -3177,7 +3177,7 @@ class ShellToolkitBuilder(ToolkitBuilder):
         self,
         *,
         working_dir: Optional[str] = None,
-        image: Optional[str] = "meshagent/python:default",
+        image: Optional[str] = "python:3.13",
         mounts: Optional[ContainerMountSpec] = DEFAULT_CONTAINER_MOUNT_SPEC,
         env: Optional[dict[str, str]] = None,
     ):
@@ -3208,7 +3208,7 @@ class ShellTool(OpenAIResponsesTool):
         *,
         config: Optional[ShellConfig] = None,
         working_dir: Optional[str] = None,
-        image: Optional[str] = "meshagent/python:default",
+        image: Optional[str] = "python:3.13",
         mounts: Optional[ContainerMountSpec] = DEFAULT_CONTAINER_MOUNT_SPEC,
         env: Optional[dict[str, str]] = None,
     ):
