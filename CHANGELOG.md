@@ -1,3 +1,10 @@
+## [0.36.3]
+- Storage client now supports move operations and emits `file.moved` events.
+- Secrets client now supports existence checks.
+- Project user add calls now omit permission fields unless explicitly set.
+- CLI image deploy now supports `--env-secret` and `--meshagent-token` with `--identity` validation, plus Dockerfile `VOLUME` mount and secret existence checks.
+- CLI room connect now supports `--env` and `--env-secret` with optional local token minting; API key list and room list outputs now surface active keys and table views.
+
 ## [0.36.2]
 - Breaking: Removed share-connect API from the Python client (`connect_share` / RoomShareConnectionInfo).
 - Added full OAuth scope constants (FULL_OAUTH_SCOPE/FULL_OAUTH_SCOPES) and CLI auth now defaults to requesting the full scope set.
