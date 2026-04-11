@@ -665,19 +665,16 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
             max_tool_call_lines=max_tool_call_lines,
         )
 
-    async def to_plain_text(self, *, room: RoomClient, response: Content) -> str:
-        text_file = await self.file_content_to_text_content(
-            room=room,
-            content=response,
-        )
+    async def to_plain_text(self, *, response: Content) -> str:
+        text_file = await self.file_content_to_text_content(content=response)
         if text_file is not None:
             if isinstance(response, FileContent) and _is_html_mime_type(
                 response.mime_type
             ):
                 text_file = TextContent(text=convert(text_file.text))
-            response = self.truncate(room=room, content=text_file)
+            response = self.truncate(content=text_file)
         else:
-            response = self.truncate(room=room, content=response)
+            response = self.truncate(content=response)
         if isinstance(response, LinkContent):
             return json.dumps(
                 {
@@ -731,25 +728,12 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
         *,
         context: AgentSessionContext,
         tool_call: ResponseFunctionToolCall,
-        room: RoomClient,
         response: Content,
     ) -> list:
+        del context
         with tracer.start_as_current_span("llm.tool_adapter.create_messages") as span:
             if isinstance(response, RawOutputsContent):
                 span.set_attribute("kind", "raw")
-                for output in response.outputs:
-                    room.developer.log_nowait(
-                        type="llm.message",
-                        data={
-                            "context": context.id,
-                            "participant_id": room.local_participant.id,
-                            "participant_name": room.local_participant.get_attribute(
-                                "name"
-                            ),
-                            "message": output,
-                        },
-                    )
-
                 return response.outputs
 
             else:
@@ -757,16 +741,12 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
 
                 if isinstance(response, FileContent):
                     text_file = await self.file_content_to_text_content(
-                        room=room,
-                        content=response,
+                        content=response
                     )
                     if text_file is not None:
                         if _is_html_mime_type(response.mime_type):
                             text_file = TextContent(text=convert(text_file.text))
-                        output = await self.to_plain_text(
-                            room=room,
-                            response=text_file,
-                        )
+                        output = await self.to_plain_text(response=text_file)
                         span.set_attribute("output", output)
                         message = {
                             "output": output,
@@ -812,21 +792,9 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
                                 "type": "function_call_output",
                             }
 
-                    room.developer.log_nowait(
-                        type="llm.message",
-                        data={
-                            "context": context.id,
-                            "participant_id": room.local_participant.id,
-                            "participant_name": room.local_participant.get_attribute(
-                                "name"
-                            ),
-                            "message": message,
-                        },
-                    )
-
                     return [message]
                 else:
-                    output = await self.to_plain_text(room=room, response=response)
+                    output = await self.to_plain_text(response=response)
                     span.set_attribute("output", output)
 
                     message = {
@@ -834,18 +802,6 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
                         "call_id": tool_call.call_id,
                         "type": "function_call_output",
                     }
-
-                    room.developer.log_nowait(
-                        type="llm.message",
-                        data={
-                            "context": context.id,
-                            "participant_id": room.local_participant.id,
-                            "participant_name": room.local_participant.get_attribute(
-                                "name"
-                            ),
-                            "message": message,
-                        },
-                    )
 
                     return [message]
 
@@ -880,6 +836,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         context_management: Literal["auto", "standalone", "none"] = "auto",
         compaction_threshold: Optional[int | float] = None,
         *,
+        base_url: str | None = None,
         max_tool_call_length: int = DEFAULT_MAX_TOOL_CALL_LENGTH,
         max_tool_call_lines: int = DEFAULT_MAX_TOOL_CALL_LINES,
     ):
@@ -918,6 +875,11 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         self._model = model
         self._parallel_tool_calls = parallel_tool_calls
         self._client = client
+        if base_url is None:
+            base_url = os.getenv("OPENAI_BASE_URL")
+        if base_url is not None:
+            base_url = base_url.strip() or None
+        self._base_url = base_url
         self._response_options = response_options
         self._provider = provider
         self._reasoning_effort = reasoning_effort
@@ -1070,7 +1032,6 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         self,
         *,
         context: AgentSessionContext,
-        room: RoomClient,
         model: Optional[str] = None,
     ) -> None:
         if model is None:
@@ -1083,9 +1044,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             if context.previous_response_id is not None
             else NOT_GIVEN
         )
-        openai = self.get_openai_client(
-            room=room,
-        )
+        openai = self.get_openai_client()
         response = await openai.responses.compact(
             model=model,
             input=[*context.messages],
@@ -1143,13 +1102,12 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         *,
         context: AgentSessionContext,
         model: str,
-        room: Optional[RoomClient] = None,
         toolkits: Optional[list[Toolkit]] = None,
         output_schema: Optional[dict] = None,
     ) -> int:
         tool_bundle = ResponsesToolBundle(
             toolkits=[
-                *toolkits,
+                *(toolkits or []),
             ]
         )
         open_ai_tools = tool_bundle.to_json()
@@ -1157,9 +1115,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         if open_ai_tools is None:
             open_ai_tools = NOT_GIVEN
 
-        openai = self.get_openai_client(
-            room=room,
-        )
+        openai = self.get_openai_client()
 
         response_name = "response"
         text = NOT_GIVEN
@@ -1183,10 +1139,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
 
         return response.input_tokens
 
-    async def check_for_termination(
-        self, *, context: AgentSessionContext, room: RoomClient
-    ) -> bool:
-        del room
+    async def check_for_termination(self, *, context: AgentSessionContext) -> bool:
         for message in context.messages:
             if message.get("type", "message") != "message":
                 return False
@@ -1217,7 +1170,6 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
     def get_openai_client(
         self,
         *,
-        room: RoomClient,
         session: httpx.AsyncClient | None = None,
     ) -> AsyncOpenAI:
         if self._client is not None:
@@ -1226,7 +1178,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         if http_client is None and self._log_requests:
             http_client = get_logging_httpx_client()
         return get_client(
-            room=room,
+            base_url=self._base_url,
             http_client=http_client,
             session=session,
         )
@@ -1941,9 +1893,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                 f"requesting response from openai with model: {model}"
                             )
 
-                            openai = self.get_openai_client(
-                                room=room,
-                            )
+                            openai = self.get_openai_client()
                             create_kwargs = {
                                 "extra_headers": extra_headers,
                                 "stream": stream,
@@ -2106,7 +2056,6 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                     return await tool_adapter.create_messages(
                                                         context=context,
                                                         tool_call=tool_call,
-                                                        room=room,
                                                         response=tool_response,
                                                     )
 
@@ -2438,7 +2387,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                     "llm.turn.check_for_termination"
                                 ) as span:
                                     term = await self.check_for_termination(
-                                        context=context, room=room
+                                        context=context
                                     )
                                     if term:
                                         span.set_attribute("terminate", True)
@@ -2568,7 +2517,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                         "llm.turn.check_for_termination"
                                                     ) as span:
                                                         term = await self.check_for_termination(
-                                                            context=context, room=room
+                                                            context=context
                                                         )
 
                                                         if term:
@@ -2830,9 +2779,8 @@ class ImageGenerationToolkitBuilder(ToolkitBuilder):
     def __init__(self):
         super().__init__(name="image_generation", type=ImageGenerationConfig)
 
-    async def make(
-        self, *, room: RoomClient, model: str, config: ImageGenerationConfig
-    ):
+    async def make(self, *, model: str, config: ImageGenerationConfig):
+        del model
         return Toolkit(
             name="image_generation", tools=[ImageGenerationTool(config=config)]
         )
@@ -3010,7 +2958,8 @@ class LocalShellToolkitBuilder(ToolkitBuilder):
         super().__init__(name="local_shell", type=LocalShellConfig)
         self.working_dir = working_dir
 
-    async def make(self, *, room: RoomClient, model: str, config: LocalShellConfig):
+    async def make(self, *, model: str, config: LocalShellConfig):
+        del model
         return Toolkit(
             name="local_shell",
             tools=[LocalShellTool(config=config, working_dir=self.working_dir)],
@@ -3187,7 +3136,8 @@ class ShellToolkitBuilder(ToolkitBuilder):
         self.mounts = mounts
         self.env = env
 
-    async def make(self, *, room: RoomClient, model: str, config: ShellConfig):
+    async def make(self, *, model: str, config: ShellConfig):
+        del model
         return Toolkit(
             name="shell",
             tools=[
@@ -3255,7 +3205,6 @@ class ShellTool(OpenAIResponsesTool):
             on_behalf_of=context.on_behalf_of,
             caller_context=caller_context,
             event_handler=context.emit,
-            validation_mode=context.validation_mode,
         )
 
     async def execute_shell_command(
@@ -3446,7 +3395,8 @@ class MCPToolkitBuilder(ToolkitBuilder):
     def __init__(self):
         super().__init__(name="mcp", type=MCPConfig)
 
-    async def make(self, *, room: RoomClient, model: str, config: MCPConfig):
+    async def make(self, *, model: str, config: MCPConfig):
+        del model
         return Toolkit(name="mcp", tools=[MCPTool(config=config)])
 
 
@@ -3841,7 +3791,8 @@ class WebSearchToolkitBuilder(ToolkitBuilder):
     def __init__(self):
         super().__init__(name="web_search", type=WebSearchConfig)
 
-    async def make(self, *, room: RoomClient, model: str, config: WebSearchConfig):
+    async def make(self, *, model: str, config: WebSearchConfig):
+        del model
         return Toolkit(name="web_search", tools=[WebSearchTool(config=config)])
 
 
@@ -4033,7 +3984,8 @@ class ApplyPatchToolkitBuilder(ToolkitBuilder):
     def __init__(self):
         super().__init__(name="apply_patch", type=ApplyPatchConfig)
 
-    async def make(self, *, room: RoomClient, model: str, config: ApplyPatchConfig):
+    async def make(self, *, model: str, config: ApplyPatchConfig):
+        del model
         return Toolkit(name="apply_patch", tools=[ApplyPatchTool(config=config)])
 
 

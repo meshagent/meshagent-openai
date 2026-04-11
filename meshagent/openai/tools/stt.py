@@ -5,6 +5,7 @@ from meshagent.openai.proxy import get_client
 from typing import Optional
 import io
 import pathlib
+import os
 
 
 async def _transcribe(
@@ -37,7 +38,12 @@ async def _transcribe(
 
 
 class OpenAIAudioFileSTT(FunctionTool):
-    def __init__(self, *, client: Optional[AsyncOpenAI] = None):
+    def __init__(
+        self,
+        *,
+        client: Optional[AsyncOpenAI] = None,
+        base_url: Optional[str] = None,
+    ):
         super().__init__(
             name="openai-file-stt",
             input_schema={
@@ -83,6 +89,11 @@ class OpenAIAudioFileSTT(FunctionTool):
             description="transcribes an audio file to text",
         )
         self.client = client
+        if base_url is None:
+            base_url = os.getenv("OPENAI_BASE_URL")
+        if base_url is not None:
+            base_url = base_url.strip() or None
+        self.base_url = base_url
 
     async def execute(
         self,
@@ -97,7 +108,7 @@ class OpenAIAudioFileSTT(FunctionTool):
         file_data = await context.room.storage.download(path=path)
         client = self.client
         if client is None:
-            client = get_client(room=context.room)
+            client = get_client(base_url=self.base_url)
 
         return await _transcribe(
             client=client,
@@ -110,9 +121,9 @@ class OpenAIAudioFileSTT(FunctionTool):
 
 
 class OpenAISTTToolkit(Toolkit):
-    def __init__(self):
+    def __init__(self, *, base_url: Optional[str] = None):
         super().__init__(
             name="openai-stt",
             description="tools for speech to text using openai",
-            tools=[OpenAIAudioFileSTT()],
+            tools=[OpenAIAudioFileSTT(base_url=base_url)],
         )

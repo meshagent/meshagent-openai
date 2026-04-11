@@ -160,7 +160,6 @@ async def test_openai_completions_tool_response_adapter_truncates_json_output() 
     )
 
     output = await adapter.to_plain_text(
-        room=_FakeRoom(),
         response=JsonContent(json={"message": "x" * 40}),
     )
 
@@ -177,7 +176,6 @@ async def test_openai_completions_tool_response_adapter_truncates_utf8_file_outp
     )
 
     output = await adapter.to_plain_text(
-        room=_FakeRoom(),
         response=FileContent(
             data=b"line1\nline2\nline3\nline4",
             name="README",
@@ -200,6 +198,60 @@ def test_openai_completions_adapter_passes_through_tool_truncation_limits() -> N
 
     assert tool_adapter.max_tool_call_length == 321
     assert tool_adapter.max_tool_call_lines == 9
+
+
+@pytest.mark.asyncio
+async def test_openai_completions_adapter_passes_base_url_to_get_client(monkeypatch):
+    fake_client = _FakeOpenAIClient(
+        responses=[
+            _FakeChatCompletion(
+                message=_FakeMessage(tool_calls=None, content="done"),
+                usage={"prompt_tokens": 1, "completion_tokens": 1},
+            )
+        ]
+    )
+    call_args: dict[str, object] = {}
+
+    def _fake_get_client(
+        *, base_url=None, http_client=None, session=None, api_key=None
+    ):
+        call_args["base_url"] = base_url
+        call_args["http_client"] = http_client
+        call_args["session"] = session
+        call_args["api_key"] = api_key
+        return fake_client
+
+    monkeypatch.setattr(
+        "meshagent.openai.tools.completions_adapter.get_client",
+        _fake_get_client,
+    )
+
+    adapter = OpenAICompletionsAdapter(
+        model="gpt-4o-mini",
+        base_url="https://example.test/v1",
+    )
+    context = adapter.create_session()
+    context.append_user_message("hello")
+
+    result = await adapter.next(
+        context=context,
+        room=_FakeRoom(),
+        toolkits=[],
+    )
+
+    assert result == "done"
+    assert call_args["base_url"] == "https://example.test/v1"
+    assert call_args["http_client"] is None
+    assert call_args["session"] is None
+    assert call_args["api_key"] is None
+
+
+def test_openai_completions_adapter_reads_base_url_from_environment(monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://env.example.test/v1")
+
+    adapter = OpenAICompletionsAdapter(model="gpt-4o-mini")
+
+    assert adapter._base_url == "https://env.example.test/v1"
 
 
 @pytest.mark.asyncio

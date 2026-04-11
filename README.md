@@ -17,6 +17,8 @@ from openai import AsyncOpenAI
 adapter = OpenAIResponsesAdapter(client=AsyncOpenAI(api_key="sk-..."))
 ```
 
+You can also pass `base_url=` to the built-in OpenAI adapters. If omitted, MeshAgent reads `OPENAI_BASE_URL` from the environment when constructing the provider client.
+
 ### Tool Response Adapter
 The ``OpenAICompletionsToolResponseAdapter`` and ``OpenAIResponsesToolResponseAdapter``convert a tool's structured response into plain text or JSOn that can beinserted into an OpenAI chat context. 
 

@@ -1,4 +1,5 @@
 ## [0.36.3]
+- Breaking: `OpenAIResponsesAdapter`/`OpenAICompletionsAdapter` now take `base_url` in the constructor, default it from `OPENAI_BASE_URL`, and no longer derive provider clients from a `RoomClient`; `meshagent.openai.proxy.get_client` also dropped its `room` parameter.
 - Storage client now supports move operations and emits `file.moved` events.
 - Secrets client now supports existence checks.
 - Project user add calls now omit permission fields unless explicitly set.

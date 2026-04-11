@@ -339,7 +339,6 @@ async def test_openai_responses_tool_response_adapter_truncates_text_output() ->
     )
 
     output = await adapter.to_plain_text(
-        room=_FakeRoom(),
         response=TextContent(text="line1\nline2\nline3\nline4"),
     )
 
@@ -358,7 +357,6 @@ async def test_openai_responses_tool_response_adapter_truncates_text_file_output
     )
 
     output = await adapter.to_plain_text(
-        room=_FakeRoom(),
         response=FileContent(
             data=b"line1\nline2\nline3\nline4",
             name="notes.txt",
@@ -502,6 +500,16 @@ class _FakeResponsesClient:
 class _FakeOpenAIClient:
     def __init__(self, *, outcomes: list[object]):
         self.responses = _FakeResponsesClient(outcomes=outcomes)
+
+
+class _FakeInputTokenCounter:
+    def __init__(self, *, input_tokens: int):
+        self.input_tokens = input_tokens
+        self.calls: list[dict] = []
+
+    async def count(self, **kwargs):
+        self.calls.append(copy.deepcopy(kwargs))
+        return SimpleNamespace(input_tokens=self.input_tokens)
 
 
 class _FakeWebSocket:
@@ -752,16 +760,18 @@ async def test_create_session_returns_openai_responses_session_context():
 
 @pytest.mark.asyncio
 async def test_get_openai_client_passes_optional_session(monkeypatch):
-    adapter = OpenAIResponsesAdapter()
-    room = _FakeRoom()
+    adapter = OpenAIResponsesAdapter(base_url="https://example.test/v1")
     client_session = httpx.AsyncClient()
     fake_client = object()
     call_args: dict[str, object] = {}
 
-    def _fake_get_client(*, room, http_client=None, session=None):
-        call_args["room"] = room
+    def _fake_get_client(
+        *, base_url=None, http_client=None, session=None, api_key=None
+    ):
+        call_args["base_url"] = base_url
         call_args["http_client"] = http_client
         call_args["session"] = session
+        call_args["api_key"] = api_key
         return fake_client
 
     monkeypatch.setattr(
@@ -770,14 +780,43 @@ async def test_get_openai_client_passes_optional_session(monkeypatch):
     )
 
     try:
-        client = adapter.get_openai_client(room=room, session=client_session)
+        client = adapter.get_openai_client(session=client_session)
     finally:
         await client_session.aclose()
 
     assert client is fake_client
-    assert call_args["room"] is room
+    assert call_args["base_url"] == "https://example.test/v1"
     assert call_args["http_client"] is call_args["session"]
     assert call_args["session"] is client_session
+    assert call_args["api_key"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_input_tokens_does_not_require_room() -> None:
+    adapter = OpenAIResponsesAdapter()
+    context = adapter.create_session()
+    context.append_user_message("hello")
+    counter = _FakeInputTokenCounter(input_tokens=42)
+    adapter._client = SimpleNamespace(
+        responses=SimpleNamespace(input_tokens=counter),
+    )
+
+    input_tokens = await adapter.get_input_tokens(
+        context=context,
+        model="gpt-4o-mini",
+    )
+
+    assert input_tokens == 42
+    assert len(counter.calls) == 1
+    assert counter.calls[0]["input"] == context.messages
+
+
+def test_openai_responses_adapter_reads_base_url_from_environment(monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://env.example.test/v1")
+
+    adapter = OpenAIResponsesAdapter()
+
+    assert adapter._base_url == "https://env.example.test/v1"
 
 
 def test_constructor_rejects_invalid_compaction_threshold():

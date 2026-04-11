@@ -199,19 +199,16 @@ class OpenAICompletionsToolResponseAdapter(ToolResponseAdapter):
             max_tool_call_lines=max_tool_call_lines,
         )
 
-    async def to_plain_text(self, *, room: RoomClient, response: Content) -> str:
-        text_file = await self.file_content_to_text_content(
-            room=room,
-            content=response,
-        )
+    async def to_plain_text(self, *, response: Content) -> str:
+        text_file = await self.file_content_to_text_content(content=response)
         if text_file is not None:
             if isinstance(response, FileContent) and _is_html_mime_type(
                 response.mime_type
             ):
                 text_file = TextContent(text=convert(text_file.text))
-            response = self.truncate(room=room, content=text_file)
+            response = self.truncate(content=text_file)
         else:
-            response = self.truncate(room=room, content=response)
+            response = self.truncate(content=response)
         if isinstance(response, LinkContent):
             return json.dumps(
                 {
@@ -265,24 +262,14 @@ class OpenAICompletionsToolResponseAdapter(ToolResponseAdapter):
         *,
         context: AgentSessionContext,
         tool_call: Any,
-        room: RoomClient,
         response: Content,
     ) -> list:
+        del context
         message = {
             "role": "tool",
-            "content": await self.to_plain_text(room=room, response=response),
+            "content": await self.to_plain_text(response=response),
             "tool_call_id": tool_call.id,
         }
-
-        room.developer.log_nowait(
-            type="llm.message",
-            data={
-                "context": context.id,
-                "participant_id": room.local_participant.id,
-                "participant_name": room.local_participant.get_attribute("name"),
-                "message": message,
-            },
-        )
 
         return [message]
 
@@ -294,12 +281,18 @@ class OpenAICompletionsAdapter(LLMAdapter):
         parallel_tool_calls: Optional[bool] = None,
         client: Optional[AsyncOpenAI] = None,
         *,
+        base_url: str | None = None,
         max_tool_call_length: int = DEFAULT_MAX_TOOL_CALL_LENGTH,
         max_tool_call_lines: int = DEFAULT_MAX_TOOL_CALL_LINES,
     ):
         self._model = model
         self._parallel_tool_calls = parallel_tool_calls
         self._client = client
+        if base_url is None:
+            base_url = os.getenv("OPENAI_BASE_URL")
+        if base_url is not None:
+            base_url = base_url.strip() or None
+        self._base_url = base_url
         self._max_tool_call_length = max_tool_call_length
         self._max_tool_call_lines = max_tool_call_lines
 
@@ -337,6 +330,11 @@ class OpenAICompletionsAdapter(LLMAdapter):
             max_tool_call_lines=self._max_tool_call_lines,
         )
 
+    def get_openai_client(self) -> AsyncOpenAI:
+        if self._client is not None:
+            return self._client
+        return get_client(base_url=self._base_url)
+
     # Takes the current chat context, executes a completion request and processes the response.
     # If a tool calls are requested, invokes the tools, processes the tool calls results, and appends the tool call results to the context
     async def next(
@@ -359,7 +357,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
         tool_adapter = self._make_tool_response_adapter()
 
         try:
-            openai = self._client if self._client is not None else get_client(room=room)
+            openai = self.get_openai_client()
 
             tool_bundle = CompletionsToolBundle(
                 toolkits=[
@@ -458,7 +456,6 @@ class OpenAICompletionsAdapter(LLMAdapter):
                             return await tool_adapter.create_messages(
                                 context=context,
                                 tool_call=tool_call,
-                                room=room,
                                 response=tool_response,
                             )
 

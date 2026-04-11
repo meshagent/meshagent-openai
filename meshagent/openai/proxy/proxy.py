@@ -1,8 +1,8 @@
-from meshagent.api import RoomClient
 from openai import AsyncOpenAI
 import logging
 import json
 import httpx
+import os
 from typing import Optional
 
 logger = logging.getLogger("openai.client")
@@ -52,34 +52,21 @@ def get_logging_httpx_client() -> httpx.AsyncClient:
 
 def get_client(
     *,
-    room: RoomClient,
+    base_url: str | None = None,
     http_client: Optional[httpx.AsyncClient] = None,
     session: Optional[httpx.AsyncClient] = None,
+    api_key: str | None = None,
 ) -> AsyncOpenAI:
     resolved_http_client = http_client if http_client is not None else session
-    token: str = room.protocol.token
-
-    # when running inside the room pod, the room.room_url currently points to the external url
-    # so we need to use url off the protocol (if available).
-    # TODO: room_url should be set properly, but may need a claim in the token to be set during call to say it is local
-    url = getattr(room.protocol, "url")
-    if url is None:
-        logger.debug(
-            f"protocol does not have url, openai client falling back to room url {room.room_url}"
-        )
-        url = room.room_url
-    else:
-        logger.debug(f"protocol had url, openai client will use {url}")
-
-    room_proxy_url = f"{url}/openai/v1"
-
-    if room_proxy_url.startswith("ws:") or room_proxy_url.startswith("wss:"):
-        room_proxy_url = room_proxy_url.replace("ws", "http", 1)
-
-    openai = AsyncOpenAI(
-        http_client=resolved_http_client,
-        api_key=token,
-        base_url=room_proxy_url,
-        default_headers={"Meshagent-Session": room.session_id},
-    )
-    return openai
+    if base_url is None:
+        base_url = os.getenv("OPENAI_BASE_URL")
+    if base_url is not None:
+        base_url = base_url.strip() or None
+    kwargs: dict[str, object] = {}
+    if resolved_http_client is not None:
+        kwargs["http_client"] = resolved_http_client
+    if base_url is not None:
+        kwargs["base_url"] = base_url
+    if api_key is not None:
+        kwargs["api_key"] = api_key
+    return AsyncOpenAI(**kwargs)
