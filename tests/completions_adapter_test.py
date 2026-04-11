@@ -235,7 +235,7 @@ async def test_openai_completions_adapter_passes_base_url_to_get_client(monkeypa
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[],
     )
 
@@ -322,7 +322,7 @@ async def test_next_consumes_streaming_tool_events_and_uses_final_item_result():
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[Toolkit(name="tools", tools=[_StreamingTool()])],
         event_handler=events.append,
     )
@@ -365,7 +365,7 @@ async def test_next_passes_thread_and_turn_ids_in_tool_caller_context() -> None:
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[Toolkit(name="tools", tools=[tool])],
     )
 
@@ -401,7 +401,7 @@ async def test_next_tracks_usage_for_single_completion_response():
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[],
     )
 
@@ -452,7 +452,7 @@ async def test_next_inserts_steering_messages_after_tool_results() -> None:
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[Toolkit(name="tools", tools=[_StreamingTool()])],
         steering_callback=_steer,
     )
@@ -502,7 +502,7 @@ async def test_cancellation_restores_context_during_tool_call() -> None:
     task = asyncio.create_task(
         adapter.next(
             context=context,
-            room=_FakeRoom(),
+            caller=_FakeRoom().local_participant,
             toolkits=[Toolkit(name="storage", tools=[blocking_tool])],
         )
     )

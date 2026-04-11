@@ -1,12 +1,18 @@
 from meshagent.agents.agent import AgentSessionContext
-from meshagent.api import RoomClient, RoomException, RemoteParticipant
+from meshagent.api import Participant, RoomClient, RoomException
 from meshagent.agents.event_publisher import (
     _OpenAIAgentEventPublisher,
     make_openai_agent_event_publisher,
 )
 from meshagent.agents.messages import AgentMessage
-from meshagent.tools import Toolkit, ToolContext, FunctionTool, BaseTool
+from meshagent.tools import (
+    Toolkit,
+    ToolContext,
+    FunctionTool,
+    BaseTool,
+)
 from meshagent.tools.container_shell import ContainerShellTool, ProcessShellTool
+from meshagent.tools.storage import StorageToolkit
 from meshagent.tools._shell_output import (
     DEFAULT_MAX_LOG_LINE_LENGTH,
     StreamOutputAccumulator,
@@ -30,8 +36,6 @@ from meshagent.agents.adapter import (
     ToolResponseAdapter,
     LLMAdapter,
     SteeringCallback,
-    ToolkitBuilder,
-    ToolkitConfig,
     ToolCallApprovalHandler,
     ToolCallApprovalRequest,
 )
@@ -1666,7 +1670,6 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         self,
         *,
         context: AgentSessionContext,
-        room: RoomClient,
         openai: AsyncOpenAI,
         create_kwargs: dict,
         extra_headers: dict[str, str],
@@ -1749,12 +1752,12 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         *,
         model: Optional[str] = None,
         context: AgentSessionContext,
-        room: RoomClient,
+        caller: Participant,
         toolkits: list[Toolkit],
         output_schema: Optional[dict] = None,
         event_handler: Optional[Callable[[dict[str, Any]], None]] = None,
         steering_callback: SteeringCallback | None = None,
-        on_behalf_of: Optional[RemoteParticipant] = None,
+        on_behalf_of: Optional[Participant] = None,
         options: Optional[dict] = None,
     ):
         if model is None:
@@ -1766,7 +1769,6 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             logger.error("llm request needs compaction, compacting request")
             await self.compact(
                 context=context,
-                room=room,
                 model=model,
             )
 
@@ -1882,16 +1884,15 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                             extra_headers = {}
                             if on_behalf_of is not None:
                                 on_behalf_of_name = on_behalf_of.get_attribute("name")
+                                caller_name = caller.get_attribute("name")
                                 logger.info(
-                                    f"{room.local_participant.get_attribute('name')} making openai request on behalf of {on_behalf_of_name}"
+                                    "%s making openai request on behalf of %s",
+                                    caller_name,
+                                    on_behalf_of_name,
                                 )
                                 extra_headers["Meshagent-On-Behalf-Of"] = (
                                     on_behalf_of_name
                                 )
-
-                            logger.info(
-                                f"requesting response from openai with model: {model}"
-                            )
 
                             openai = self.get_openai_client()
                             create_kwargs = {
@@ -1914,7 +1915,6 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                     response = (
                                         await self._create_response_websocket_stream(
                                             context=context,
-                                            room=room,
                                             openai=openai,
                                             create_kwargs=create_kwargs,
                                             extra_headers=extra_headers,
@@ -1944,18 +1944,6 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                             "type": message.type,
                                             "message": safe_model_dump(message),
                                         }
-                                    )
-
-                                    room.developer.log_nowait(
-                                        type="llm.message",
-                                        data={
-                                            "context": context.id,
-                                            "participant_id": room.local_participant.id,
-                                            "participant_name": room.local_participant.get_attribute(
-                                                "name"
-                                            ),
-                                            "message": message.to_dict(),
-                                        },
                                     )
 
                                     if message.type == "function_call":
@@ -1989,8 +1977,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                         )
                                                     )
                                                     tool_context = ToolContext(
-                                                        room=room,
-                                                        caller=room.local_participant,
+                                                        caller=caller,
                                                         on_behalf_of=on_behalf_of,
                                                         caller_context=caller_context,
                                                         event_handler=event_handler,
@@ -2050,9 +2037,6 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                                 "result": handler_result,
                                                             }
                                                         )
-                                                    logger.info(
-                                                        f"tool response {tool_response}"
-                                                    )
                                                     return await tool_adapter.create_messages(
                                                         context=context,
                                                         tool_call=tool_call,
@@ -2074,17 +2058,6 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                     f"unable to complete tool call {tool_call}",
                                                     exc_info=e,
                                                 )
-                                                room.developer.log_nowait(
-                                                    type="llm.error",
-                                                    data={
-                                                        "participant_id": room.local_participant.id,
-                                                        "participant_name": room.local_participant.get_attribute(
-                                                            "name"
-                                                        ),
-                                                        "error": f"{e}",
-                                                    },
-                                                )
-
                                                 if event_handler is not None:
                                                     event_handler(
                                                         {
@@ -2114,17 +2087,6 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
 
                                         all_results = []
                                         for result in results:
-                                            room.developer.log_nowait(
-                                                type="llm.message",
-                                                data={
-                                                    "context": context.id,
-                                                    "participant_id": room.local_participant.id,
-                                                    "participant_name": room.local_participant.get_attribute(
-                                                        "name"
-                                                    ),
-                                                    "message": result,
-                                                },
-                                            )
                                             all_results.extend(result)
 
                                         return all_results, False
@@ -2167,17 +2129,6 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                                         error=e
                                                                     ),
                                                                 }
-                                                                room.developer.log_nowait(
-                                                                    type="llm.message",
-                                                                    data={
-                                                                        "context": message.id,
-                                                                        "participant_id": room.local_participant.id,
-                                                                        "participant_name": room.local_participant.get_attribute(
-                                                                            "name"
-                                                                        ),
-                                                                        "message": error,
-                                                                    },
-                                                                )
                                                                 return [error], False
 
                                                 return [full_response], True
@@ -2206,8 +2157,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                         handlers = tool.get_open_ai_output_handlers()
                                                         if message.type in handlers:
                                                             tool_context = ToolContext(
-                                                                room=room,
-                                                                caller=room.local_participant,
+                                                                caller=caller,
                                                                 caller_context=context.to_tool_caller_context(),
                                                                 event_handler=event_handler,
                                                             )
@@ -2314,18 +2264,6 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                             if not stream:
                                 if response is None:
                                     raise RuntimeError("response must be available")
-                                room.developer.log_nowait(
-                                    type="llm.message",
-                                    data={
-                                        "context": context.id,
-                                        "participant_id": room.local_participant.id,
-                                        "participant_name": room.local_participant.get_attribute(
-                                            "name"
-                                        ),
-                                        "response": response.to_dict(),
-                                    },
-                                )
-
                                 final_outputs = []
                                 next_messages: list[Any] = []
                                 response_output_messages: list[dict[str, Any]] = []
@@ -2415,7 +2353,6 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                             if self._mode == "websocket":
                                                 response = await self._create_response_websocket_stream(
                                                     context=context,
-                                                    room=room,
                                                     openai=openai,
                                                     create_kwargs=create_kwargs,
                                                     extra_headers=extra_headers,
@@ -2603,8 +2540,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                                     in callbacks
                                                                 ):
                                                                     tool_context = ToolContext(
-                                                                        room=room,
-                                                                        caller=room.local_participant,
+                                                                        caller=caller,
                                                                         caller_context=context.to_tool_caller_context(),
                                                                         event_handler=event_handler,
                                                                     )
@@ -2762,48 +2698,30 @@ class OpenAIResponsesTool(BaseTool):
         return {}
 
 
-class ImageGenerationConfig(ToolkitConfig):
-    name: Literal["image_generation"] = "image_generation"
-    background: Literal["transparent", "opaque", "auto"] = None
-    input_image_mask_url: Optional[str] = None
-    model: Optional[str] = None
-    moderation: Optional[str] = None
-    output_compression: Optional[int] = None
-    output_format: Optional[Literal["png", "webp", "jpeg"]] = None
-    partial_images: Optional[int] = None
-    quality: Optional[Literal["auto", "low", "medium", "high"]] = None
-    size: Optional[Literal["1024x1024", "1024x1536", "1536x1024", "auto"]] = None
-
-
-class ImageGenerationToolkitBuilder(ToolkitBuilder):
-    def __init__(self):
-        super().__init__(name="image_generation", type=ImageGenerationConfig)
-
-    async def make(self, *, model: str, config: ImageGenerationConfig):
-        del model
-        return Toolkit(
-            name="image_generation", tools=[ImageGenerationTool(config=config)]
-        )
-
-
 class ImageGenerationTool(OpenAIResponsesTool):
     def __init__(
         self,
         *,
-        config: ImageGenerationConfig,
+        background: Literal["transparent", "opaque", "auto"] | None = None,
+        input_image_mask_url: str | None = None,
+        model: str | None = None,
+        moderation: str | None = None,
+        output_compression: int | None = None,
+        output_format: Literal["png", "webp", "jpeg"] | None = None,
+        partial_images: int | None = 1,
+        quality: Literal["auto", "low", "medium", "high"] | None = None,
+        size: Literal["1024x1024", "1024x1536", "1536x1024", "auto"] | None = None,
     ):
         super().__init__(name="image_generation")
-        self.background = config.background
-        self.input_image_mask_url = config.input_image_mask_url
-        self.model = config.model
-        self.moderation = config.moderation
-        self.output_compression = config.output_compression
-        self.output_format = config.output_format
-        self.partial_images = (
-            config.partial_images if config.partial_images is not None else 1
-        )
-        self.quality = config.quality
-        self.size = config.size
+        self.background = background
+        self.input_image_mask_url = input_image_mask_url
+        self.model = model
+        self.moderation = moderation
+        self.output_compression = output_compression
+        self.output_format = output_format
+        self.partial_images = partial_images if partial_images is not None else 1
+        self.quality = quality
+        self.size = size
 
     def get_open_ai_tool_definitions(self):
         opts = {"type": "image_generation"}
@@ -2949,23 +2867,6 @@ class ImageGenerationTool(OpenAIResponsesTool):
             )
 
 
-class LocalShellConfig(ToolkitConfig):
-    name: Literal["local_shell"] = "local_shell"
-
-
-class LocalShellToolkitBuilder(ToolkitBuilder):
-    def __init__(self, *, working_dir: Optional[str] = None):
-        super().__init__(name="local_shell", type=LocalShellConfig)
-        self.working_dir = working_dir
-
-    async def make(self, *, model: str, config: LocalShellConfig):
-        del model
-        return Toolkit(
-            name="local_shell",
-            tools=[LocalShellTool(config=config, working_dir=self.working_dir)],
-        )
-
-
 MAX_SHELL_OUTPUT_SIZE = 1024 * 100
 MAX_SHELL_LOG_LINE_LENGTH = DEFAULT_MAX_LOG_LINE_LENGTH
 
@@ -3000,190 +2901,41 @@ async def _await_output_tasks(*tasks: asyncio.Task[None]) -> None:
             logger.debug("shell output stream task failed", exc_info=result)
 
 
-class LocalShellTool(OpenAIResponsesTool):
-    def __init__(
-        self,
-        *,
-        config: Optional[LocalShellConfig] = None,
-        working_dir: Optional[str] = None,
-    ):
-        super().__init__(name="local_shell")
-        if config is None:
-            config = LocalShellConfig(name="local_shell")
-
-        self.working_dir = working_dir
-
-    def get_open_ai_tool_definitions(self):
-        return [{"type": "local_shell"}]
-
-    def get_open_ai_output_handlers(self):
-        return {"local_shell_call": self.handle_local_shell_call}
-
-    async def execute_shell_command(
-        self,
-        context: ToolContext,
-        *,
-        command: list[str],
-        env: dict,
-        type: str,
-        item_id: str,
-        timeout_ms: int | None = None,
-        user: str | None = None,
-        working_dir: str | None = None,
-    ):
-        merged_env = {**os.environ, **(env or {})}
-        encoding = os.device_encoding(1) or "utf-8"
-        timeout = float(timeout_ms) / 1000.0 if timeout_ms else 60.0
-        stdout = StreamOutputAccumulator(
-            context=context,
-            item_id=item_id,
-            source="stdout",
-            encoding=encoding,
-            max_length=MAX_SHELL_OUTPUT_SIZE,
-            max_log_line_length=MAX_SHELL_LOG_LINE_LENGTH,
-        )
-        stderr = StreamOutputAccumulator(
-            context=context,
-            item_id=item_id,
-            source="stderr",
-            encoding=encoding,
-            max_length=MAX_SHELL_OUTPUT_SIZE,
-            max_log_line_length=MAX_SHELL_LOG_LINE_LENGTH,
-        )
-        proc: asyncio.subprocess.Process | None = None
-        stdout_task: asyncio.Task[None] | None = None
-        stderr_task: asyncio.Task[None] | None = None
-
-        try:
-            # Spawn the process
-            proc = await asyncio.create_subprocess_exec(
-                *(command if isinstance(command, (list, tuple)) else [command]),
-                cwd=working_dir or self.working_dir or os.getcwd(),
-                env=merged_env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
-            logger.info(f"executing command {command} with timeout: {timeout}s")
-            stdout_task = asyncio.create_task(
-                _collect_shell_output_stream(
-                    stream=_stream_reader_chunks(proc.stdout),
-                    accumulator=stdout,
-                )
-            )
-            stderr_task = asyncio.create_task(
-                _collect_shell_output_stream(
-                    stream=_stream_reader_chunks(proc.stderr),
-                    accumulator=stderr,
-                )
-            )
-
-            await asyncio.wait_for(proc.wait(), timeout=timeout)
-            await _await_output_tasks(stdout_task, stderr_task)
-        except asyncio.TimeoutError:
-            if proc is not None:
-                proc.kill()  # send SIGKILL / TerminateProcess
-            logger.warning(f"The command timed out after {timeout}s")
-            if proc is not None:
-                await proc.wait()
-            if stdout_task is not None and stderr_task is not None:
-                await _await_output_tasks(stdout_task, stderr_task)
-            return f"The command timed out after {timeout}s"
-            # re-raise so caller sees the timeout
-        except Exception as ex:
-            return f"The command failed: {ex}"
-
-        return stdout.finish() + stderr.finish()
-
-    async def handle_local_shell_call(
-        self,
-        context,
-        *,
-        id: str,
-        action: dict,
-        call_id: str,
-        status: str,
-        type: str,
-        **extra,
-    ):
-        result = await self.execute_shell_command(context, item_id=id, **action)
-
-        output_item = {
-            "type": "local_shell_call_output",
-            "call_id": call_id,
-            "output": result,
-        }
-
-        return output_item
-
-
-class ShellConfig(ToolkitConfig):
-    name: Literal["shell"] = "shell"
-
-
-class ShellToolkitBuilder(ToolkitBuilder):
-    def __init__(
-        self,
-        *,
-        working_dir: Optional[str] = None,
-        image: Optional[str] = "python:3.13",
-        mounts: Optional[ContainerMountSpec] = DEFAULT_CONTAINER_MOUNT_SPEC,
-        env: Optional[dict[str, str]] = None,
-    ):
-        super().__init__(name="shell", type=ShellConfig)
-        self.working_dir = working_dir
-        self.image = image
-        self.mounts = mounts
-        self.env = env
-
-    async def make(self, *, model: str, config: ShellConfig):
-        del model
-        return Toolkit(
-            name="shell",
-            tools=[
-                ShellTool(
-                    config=config,
-                    working_dir=self.working_dir,
-                    image=self.image,
-                    mounts=self.mounts,
-                    env=self.env,
-                )
-            ],
-        )
-
-
 class ShellTool(OpenAIResponsesTool):
     def __init__(
         self,
         *,
-        config: Optional[ShellConfig] = None,
+        room: RoomClient | None = None,
+        name: str = "shell",
         working_dir: Optional[str] = None,
         image: Optional[str] = "python:3.13",
         mounts: Optional[ContainerMountSpec] = DEFAULT_CONTAINER_MOUNT_SPEC,
         env: Optional[dict[str, str]] = None,
     ):
-        super().__init__(name="shell")
-        if config is None:
-            config = ShellConfig(name="shell")
+        super().__init__(name=name)
+        self._room = room
         self.working_dir = working_dir
         self.image = image
         self.mounts = mounts
         self.env = env
-        self._provider: ContainerShellTool | ProcessShellTool
+        self._provider: ContainerShellTool | ProcessShellTool | None
         if image is None:
             self._provider = ProcessShellTool(
-                name="shell",
+                name=name,
                 working_dir=working_dir,
                 env=env,
             )
-        else:
+        elif room is not None:
             self._provider = ContainerShellTool(
-                name="shell",
+                room=room,
+                name=name,
                 working_dir=working_dir,
                 image=image,
                 mounts=mounts,
                 env=env,
             )
+        else:
+            self._provider = None
 
     def get_open_ai_tool_definitions(self):
         return [{"type": "shell"}]
@@ -3200,12 +2952,18 @@ class ShellTool(OpenAIResponsesTool):
         caller_context = dict(context.caller_context or {})
         caller_context["item_id"] = item_id
         return ToolContext(
-            room=context.room,
             caller=context.caller,
             on_behalf_of=context.on_behalf_of,
             caller_context=caller_context,
             event_handler=context.emit,
         )
+
+    def _require_provider(self) -> ContainerShellTool | ProcessShellTool:
+        if self._provider is None:
+            raise RuntimeError(
+                "ShellTool requires room when configured with a container image"
+            )
+        return self._provider
 
     async def execute_shell_command(
         self,
@@ -3221,7 +2979,7 @@ class ShellTool(OpenAIResponsesTool):
             if max_output_length is not None
             else MAX_SHELL_OUTPUT_SIZE
         )
-        result = await self._provider.execute(
+        result = await self._require_provider().execute(
             self._provider_context(context, item_id=item_id),
             commands=commands,
             max_output_length=effective_max_output_length,
@@ -3386,24 +3144,10 @@ class MCPServer(BaseModel):
         return normalized
 
 
-class MCPConfig(ToolkitConfig):
-    name: Literal["mcp"] = "mcp"
-    servers: list[MCPServer]
-
-
-class MCPToolkitBuilder(ToolkitBuilder):
-    def __init__(self):
-        super().__init__(name="mcp", type=MCPConfig)
-
-    async def make(self, *, model: str, config: MCPConfig):
-        del model
-        return Toolkit(name="mcp", tools=[MCPTool(config=config)])
-
-
 class MCPTool(OpenAIResponsesTool):
-    def __init__(self, *, config: MCPConfig):
-        super().__init__(name="mcp")
-        self.servers = config.servers
+    def __init__(self, *, servers: list[MCPServer], name: str = "mcp"):
+        super().__init__(name=name)
+        self.servers = servers
 
     def get_open_ai_tool_definitions(self):
         defs = []
@@ -3783,24 +3527,9 @@ class ReasoningTool(OpenAIResponsesTool):
 # TODO: computer tool call
 
 
-class WebSearchConfig(ToolkitConfig):
-    name: Literal["web_search"] = "web_search"
-
-
-class WebSearchToolkitBuilder(ToolkitBuilder):
-    def __init__(self):
-        super().__init__(name="web_search", type=WebSearchConfig)
-
-    async def make(self, *, model: str, config: WebSearchConfig):
-        del model
-        return Toolkit(name="web_search", tools=[WebSearchTool(config=config)])
-
-
 class WebSearchTool(OpenAIResponsesTool):
-    def __init__(self, *, config: Optional[WebSearchConfig] = None):
-        if config is None:
-            config = WebSearchConfig(name="web_search")
-        super().__init__(name="web_search")
+    def __init__(self, *, name: str = "web_search"):
+        super().__init__(name=name)
 
     def get_open_ai_tool_definitions(self) -> list[dict]:
         return [{"type": "web_search"}]
@@ -3976,19 +3705,6 @@ class FileSearchTool(OpenAIResponsesTool):
         )
 
 
-class ApplyPatchConfig(ToolkitConfig):
-    name: Literal["apply_patch"] = "apply_patch"
-
-
-class ApplyPatchToolkitBuilder(ToolkitBuilder):
-    def __init__(self):
-        super().__init__(name="apply_patch", type=ApplyPatchConfig)
-
-    async def make(self, *, model: str, config: ApplyPatchConfig):
-        del model
-        return Toolkit(name="apply_patch", tools=[ApplyPatchTool(config=config)])
-
-
 class ApplyPatchTool(OpenAIResponsesTool):
     """
     Wrapper for the built-in `apply_patch` tool.
@@ -4004,8 +3720,9 @@ class ApplyPatchTool(OpenAIResponsesTool):
       * `on_apply_patch_call_output` – called when the tool emits a log/output item
     """
 
-    def __init__(self, *, config: ApplyPatchConfig):
-        super().__init__(name="apply_patch")
+    def __init__(self, *, storage: StorageToolkit, name: str = "apply_patch"):
+        super().__init__(name=name)
+        self._storage = storage
 
     # FunctionTool definition advertised to OpenAI
     def get_open_ai_tool_definitions(self) -> list[dict]:
@@ -4100,7 +3817,7 @@ class ApplyPatchTool(OpenAIResponsesTool):
         if operation["type"] == "delete_file":
             path = operation["path"]
             logger.info(f"applying patch: deleting file {path}")
-            await context.room.storage.delete(path=path)
+            await self._storage.delete(context=context, path=path)
             log = f"Deleted file: {path}"
             logger.info(log)
             return {"status": "completed", "output": log}
@@ -4113,10 +3830,11 @@ class ApplyPatchTool(OpenAIResponsesTool):
                 patched = apply_diff("", diff, "create")
             except Exception as ex:
                 return {"status": "failed", "output": f"{ex}"}
-            await context.room.storage.upload(
+            await self._storage.write_text(
+                context=context,
                 path=path,
-                data=patched.encode(),
                 overwrite=False,
+                text=patched,
             )
 
             log = f"Created file: {path} ({len(patched)} bytes)"
@@ -4125,7 +3843,7 @@ class ApplyPatchTool(OpenAIResponsesTool):
 
         elif operation["type"] == "update_file":
             path = operation["path"]
-            content = await context.room.storage.download(path=path)
+            content = await self._storage.read_file(context=context, path=path)
             text = content.data.decode()
             diff = operation["diff"]
 
@@ -4136,10 +3854,11 @@ class ApplyPatchTool(OpenAIResponsesTool):
             except Exception as ex:
                 return {"status": "failed", "output": f"{ex}"}
 
-            await context.room.storage.upload(
+            await self._storage.write_text(
+                context=context,
                 path=path,
-                data=patched.encode(),
                 overwrite=True,
+                text=patched,
             )
 
             log = f"Updated file: {path} ({len(text)} -> {len(patched)} bytes)"

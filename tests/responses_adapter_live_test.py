@@ -121,7 +121,6 @@ class _RecordingOpenAIResponsesAdapter(OpenAIResponsesAdapter):
         self,
         *,
         context,
-        room,
         openai,
         create_kwargs: dict,
         extra_headers: dict[str, str],
@@ -129,7 +128,6 @@ class _RecordingOpenAIResponsesAdapter(OpenAIResponsesAdapter):
         self.recorded_create_kwargs.append(copy.deepcopy(create_kwargs))
         return await super()._create_response_websocket_stream(
             context=context,
-            room=room,
             openai=openai,
             create_kwargs=create_kwargs,
             extra_headers=extra_headers,
@@ -357,7 +355,7 @@ async def test_openai_gpt_54_adapter_uses_native_computer_tool():
     toolkit = ComputerToolkit(
         computer=computer,
         operator=Operator(),
-        room=room,
+        caller=room.local_participant,
         render_screen=None,
     )
     adapter = OpenAIResponsesAdapter(
@@ -375,7 +373,7 @@ async def test_openai_gpt_54_adapter_uses_native_computer_tool():
         result = await asyncio.wait_for(
             adapter.next(
                 context=context,
-                room=room,
+                caller=room.local_participant,
                 toolkits=[toolkit],
             ),
             timeout=30.0,
@@ -466,7 +464,7 @@ async def test_live_openai_responses_inserts_steer_immediately_after_tool_bounda
     task = asyncio.create_task(
         adapter.next(
             context=context,
-            room=room,
+            caller=room.local_participant,
             toolkits=[Toolkit(name="test", tools=[tool])],
             event_handler=lambda event: None,
             steering_callback=_steer,
@@ -535,7 +533,7 @@ async def test_live_openai_websocket_inserts_steer_immediately_after_tool_bounda
     task = asyncio.create_task(
         adapter.next(
             context=context,
-            room=room,
+            caller=room.local_participant,
             toolkits=[Toolkit(name="test", tools=[tool])],
             event_handler=lambda event: None,
             steering_callback=_steer,
@@ -608,7 +606,7 @@ async def test_live_openai_request_inserts_steer_after_first_completed_tool_when
     task = asyncio.create_task(
         adapter.next(
             context=context,
-            room=room,
+            caller=room.local_participant,
             toolkits=[Toolkit(name="test", tools=[alpha_tool, beta_tool])],
             event_handler=lambda event: None,
             steering_callback=_steer,

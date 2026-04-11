@@ -1,4 +1,11 @@
-from meshagent.tools import ToolContext, FunctionTool, Toolkit, JsonContent, TextContent
+from meshagent.tools import (
+    ToolContext,
+    LocalRoomTool,
+    Toolkit,
+    JsonContent,
+    TextContent,
+)
+from meshagent.api import RoomClient
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 from meshagent.openai.proxy import get_client
@@ -37,14 +44,16 @@ async def _transcribe(
     return JsonContent(json=transcript.model_dump(mode="json"))
 
 
-class OpenAIAudioFileSTT(FunctionTool):
+class OpenAIAudioFileSTT(LocalRoomTool):
     def __init__(
         self,
         *,
+        room: RoomClient,
         client: Optional[AsyncOpenAI] = None,
         base_url: Optional[str] = None,
     ):
         super().__init__(
+            room=room,
             name="openai-file-stt",
             input_schema={
                 "type": "object",
@@ -105,7 +114,8 @@ class OpenAIAudioFileSTT(FunctionTool):
         response_format: str,
         timestamp_granularities: list,
     ):
-        file_data = await context.room.storage.download(path=path)
+        del context
+        file_data = await self.room.storage.download(path=path)
         client = self.client
         if client is None:
             client = get_client(base_url=self.base_url)
@@ -121,9 +131,15 @@ class OpenAIAudioFileSTT(FunctionTool):
 
 
 class OpenAISTTToolkit(Toolkit):
-    def __init__(self, *, base_url: Optional[str] = None):
+    def __init__(
+        self,
+        *,
+        room: RoomClient,
+        base_url: Optional[str] = None,
+    ):
         super().__init__(
             name="openai-stt",
             description="tools for speech to text using openai",
-            tools=[OpenAIAudioFileSTT(base_url=base_url)],
+            room=room,
+            tools=[OpenAIAudioFileSTT(room=room, base_url=base_url)],
         )

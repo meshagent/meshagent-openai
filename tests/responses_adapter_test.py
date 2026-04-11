@@ -6,7 +6,6 @@ import httpx
 import logging
 import aiohttp
 import pytest
-import sys
 from aiohttp.client_reqrep import RequestInfo
 from multidict import CIMultiDict, CIMultiDictProxy
 from openai._models import BaseModel as OpenAIBaseModel
@@ -43,9 +42,8 @@ from meshagent.computers.agent import ComputerToolkit
 from meshagent.computers.operator import Operator
 import meshagent.openai.tools.responses_adapter as responses_adapter_module
 from meshagent.openai.tools.responses_adapter import (
-    MCPConfig,
+    MCPServer,
     MCPTool,
-    LocalShellTool,
     OpenAIResponsesAdapter,
     OpenAIResponsesToolResponseAdapter,
     OpenAIResponsesSessionContext,
@@ -382,25 +380,20 @@ def test_openai_responses_adapter_passes_through_tool_truncation_limits() -> Non
 
 
 def test_openai_mcp_tool_coerces_headers_dict_to_strict_header_entries() -> None:
-    config = MCPConfig.model_validate(
+    server = MCPServer.model_validate(
         {
-            "name": "mcp",
-            "servers": [
-                {
-                    "server_label": "docs",
-                    "server_url": "https://example.com/mcp",
-                    "headers": {"Authorization": "Bearer token"},
-                }
-            ],
+            "server_label": "docs",
+            "server_url": "https://example.com/mcp",
+            "headers": {"Authorization": "Bearer token"},
         }
     )
 
-    assert config.servers[0].headers is not None
-    assert [header.model_dump(mode="json") for header in config.servers[0].headers] == [
+    assert server.headers is not None
+    assert [header.model_dump(mode="json") for header in server.headers] == [
         {"name": "Authorization", "value": "Bearer token"}
     ]
 
-    tool = MCPTool(config=config)
+    tool = MCPTool(servers=[server])
     definitions = tool.get_open_ai_tool_definitions()
     assert definitions[0]["headers"] == {"Authorization": "Bearer token"}
 
@@ -872,7 +865,7 @@ async def test_next_uses_websocket_path_when_mode_is_websocket(monkeypatch):
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[],
     )
 
@@ -909,7 +902,7 @@ async def test_next_tracks_usage_for_non_streaming_request_mode():
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[],
     )
 
@@ -958,7 +951,7 @@ async def test_next_continues_until_final_answer_when_phase_is_present():
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[],
     )
 
@@ -1020,7 +1013,7 @@ async def test_next_handles_openai_54_computer_output_items():
 
     result = await adapter.next(
         context=context,
-        room=room,
+        caller=room.local_participant,
         toolkits=[toolkit],
     )
 
@@ -1066,7 +1059,7 @@ async def test_next_tracks_usage_for_streaming_request_mode():
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[],
         event_handler=events.append,
     )
@@ -1126,7 +1119,7 @@ async def test_next_stream_continues_until_final_answer_when_phase_is_present():
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[],
         event_handler=events.append,
     )
@@ -1173,7 +1166,7 @@ async def test_next_uses_auto_compaction_context_management_when_compaction_thre
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[],
     )
 
@@ -1215,7 +1208,7 @@ async def test_next_disables_auto_compaction_by_default_for_unknown_model(monkey
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[],
     )
 
@@ -1268,7 +1261,7 @@ async def test_next_disables_auto_compaction_when_computer_use_tool_present(
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[],
     )
 
@@ -1307,7 +1300,7 @@ async def test_next_uses_auto_compaction_by_default(monkeypatch):
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[],
     )
 
@@ -1347,7 +1340,7 @@ async def test_next_uses_manual_compaction_in_standalone_mode(monkeypatch):
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[],
     )
 
@@ -1387,7 +1380,7 @@ async def test_next_disables_compaction_when_context_management_none(monkeypatch
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[],
     )
 
@@ -1435,7 +1428,6 @@ async def test_websocket_mode_logs_request_and_response_payload_when_enabled(
 
     stream = await adapter._create_response_websocket_stream(
         context=context,
-        room=_FakeRoom(),
         openai=SimpleNamespace(
             base_url="https://example.com/openai/v1",
             default_headers={"Authorization": "Bearer test-token"},
@@ -1490,7 +1482,6 @@ async def test_create_response_websocket_stream_converts_raw_handshake_errors(
     ) as exc_info:
         await adapter._create_response_websocket_stream(
             context=context,
-            room=_FakeRoom(),
             openai=SimpleNamespace(
                 base_url="https://example.com/openai/v1",
                 default_headers={"Authorization": "Bearer test-token"},
@@ -1582,7 +1573,7 @@ async def test_next_serializes_websocket_requests_per_session(monkeypatch):
     monkeypatch.setattr(
         adapter,
         "get_openai_client",
-        lambda *, room: SimpleNamespace(
+        lambda: SimpleNamespace(
             base_url="https://example.com/openai/v1",
             default_headers={"Authorization": "Bearer test-token"},
         ),
@@ -1605,7 +1596,7 @@ async def test_next_serializes_websocket_requests_per_session(monkeypatch):
     first_task = asyncio.create_task(
         adapter.next(
             context=context,
-            room=_FakeRoom(),
+            caller=_FakeRoom().local_participant,
             toolkits=[],
         )
     )
@@ -1614,7 +1605,7 @@ async def test_next_serializes_websocket_requests_per_session(monkeypatch):
     second_task = asyncio.create_task(
         adapter.next(
             context=context,
-            room=_FakeRoom(),
+            caller=_FakeRoom().local_participant,
             toolkits=[],
         )
     )
@@ -1651,7 +1642,7 @@ async def test_cancelled_request_closes_websocket_and_next_request_reconnects(
     monkeypatch.setattr(
         adapter,
         "get_openai_client",
-        lambda *, room: SimpleNamespace(
+        lambda: SimpleNamespace(
             base_url="https://example.com/openai/v1",
             default_headers={"Authorization": "Bearer test-token"},
         ),
@@ -1674,7 +1665,7 @@ async def test_cancelled_request_closes_websocket_and_next_request_reconnects(
     first_task = asyncio.create_task(
         adapter.next(
             context=context,
-            room=_FakeRoom(),
+            caller=_FakeRoom().local_participant,
             toolkits=[],
         )
     )
@@ -1686,7 +1677,7 @@ async def test_cancelled_request_closes_websocket_and_next_request_reconnects(
         second_task = asyncio.create_task(
             adapter.next(
                 context=context,
-                room=_FakeRoom(),
+                caller=_FakeRoom().local_participant,
                 toolkits=[],
             )
         )
@@ -1859,7 +1850,7 @@ async def test_next_inserts_steering_messages_after_tool_results() -> None:
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[Toolkit(name="storage", tools=[_AnyArgsTool("write_file")])],
         steering_callback=_steer,
     )
@@ -1932,7 +1923,7 @@ async def test_next_drops_post_tool_response_items_before_steering_in_request_mo
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[Toolkit(name="storage", tools=[_AnyArgsTool("write_file")])],
         steering_callback=_steer,
     )
@@ -2003,7 +1994,7 @@ async def test_next_passes_thread_and_turn_ids_in_tool_caller_context() -> None:
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[Toolkit(name="tools", tools=[tool])],
     )
 
@@ -2069,7 +2060,7 @@ async def test_next_drops_post_tool_stream_items_before_steering() -> None:
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[Toolkit(name="storage", tools=[_AnyArgsTool("write_file")])],
         event_handler=published_events.append,
         steering_callback=_steer,
@@ -2175,7 +2166,7 @@ async def test_next_restarts_after_first_completed_tool_call_before_later_tool_c
     task = asyncio.create_task(
         adapter.next(
             context=context,
-            room=_FakeRoom(),
+            caller=_FakeRoom().local_participant,
             toolkits=[Toolkit(name="test", tools=[tool_a, tool_b])],
             event_handler=lambda event: None,
             steering_callback=_steer,
@@ -2242,7 +2233,7 @@ async def test_request_mode_cancellation_restores_context_during_tool_call() -> 
     task = asyncio.create_task(
         adapter.next(
             context=context,
-            room=_FakeRoom(),
+            caller=_FakeRoom().local_participant,
             toolkits=[Toolkit(name="storage", tools=[blocking_tool])],
         )
     )
@@ -2332,7 +2323,7 @@ async def test_next_retries_after_openai_api_error(monkeypatch):
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[],
     )
 
@@ -2371,7 +2362,7 @@ async def test_next_retries_after_stream_iterator_api_error(monkeypatch):
 
     result = await adapter.next(
         context=context,
-        room=_FakeRoom(),
+        caller=_FakeRoom().local_participant,
         toolkits=[],
         event_handler=stream_events.append,
     )
@@ -2442,12 +2433,12 @@ async def test_next_retries_after_shell_tool_room_exception(monkeypatch):
         ),
     )
 
+    shell_tool = ShellTool(room=room, image="meshagent/python:default")
+
     result = await adapter.next(
         context=context,
-        room=room,
-        toolkits=[
-            Toolkit(name="openai", tools=[ShellTool(image="meshagent/python:default")])
-        ],
+        caller=room.local_participant,
+        toolkits=[Toolkit(name="openai", tools=[shell_tool])],
         event_handler=stream_events.append,
     )
 
@@ -2586,7 +2577,7 @@ async def test_next_retries_after_websocket_close(monkeypatch):
     monkeypatch.setattr(
         adapter,
         "get_openai_client",
-        lambda *, room: SimpleNamespace(
+        lambda: SimpleNamespace(
             base_url="https://example.com/openai/v1",
             default_headers={"Authorization": "Bearer test-token"},
         ),
@@ -2608,7 +2599,7 @@ async def test_next_retries_after_websocket_close(monkeypatch):
     try:
         result = await adapter.next(
             context=context,
-            room=_FakeRoom(),
+            caller=_FakeRoom().local_participant,
             toolkits=[],
             event_handler=stream_events.append,
         )
@@ -2655,7 +2646,7 @@ async def test_next_raises_after_retry_budget_is_exhausted(monkeypatch):
     with pytest.raises(RoomException, match="Error from OpenAI"):
         await adapter.next(
             context=context,
-            room=_FakeRoom(),
+            caller=_FakeRoom().local_participant,
             toolkits=[],
         )
 
@@ -3621,90 +3612,7 @@ def test_make_agent_event_publisher_emits_tool_log_delta() -> None:
 
 
 @pytest.mark.asyncio
-async def test_local_shell_tool_execute_shell_command_emits_live_output_events() -> (
-    None
-):
-    tool = LocalShellTool()
-    emitted_events: list[dict[str, object]] = []
-    context = ToolContext(
-        room=_FakeRoom(),
-        caller=_FakeParticipant(),
-        event_handler=emitted_events.append,
-    )
-
-    result = await tool.execute_shell_command(
-        context,
-        command=[
-            sys.executable,
-            "-c",
-            "import sys; print('one'); print('two', file=sys.stderr)",
-        ],
-        env={},
-        type="local_shell_call",
-        item_id="local-shell-1",
-        timeout_ms=5000,
-    )
-
-    assert "one" in result
-    assert "two" in result
-    assert len(emitted_events) == 2
-    assert {
-        (
-            event["item_id"],
-            tuple(
-                (line["source"], line["text"])
-                for line in event["lines"]  # type: ignore[index]
-            ),
-        )
-        for event in emitted_events
-    } == {
-        ("local-shell-1", (("stdout", "one"),)),
-        ("local-shell-1", (("stderr", "two"),)),
-    }
-
-
-@pytest.mark.asyncio
-async def test_local_shell_tool_execute_shell_command_truncates_success_output(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(responses_adapter_module, "MAX_SHELL_OUTPUT_SIZE", 8)
-
-    tool = LocalShellTool()
-    emitted_events: list[dict[str, object]] = []
-    context = ToolContext(
-        room=_FakeRoom(),
-        caller=_FakeParticipant(),
-        event_handler=emitted_events.append,
-    )
-
-    result = await tool.execute_shell_command(
-        context,
-        command=[sys.executable, "-c", "print('abcdefghijk', end='')"],
-        env={},
-        type="local_shell_call",
-        item_id="local-shell-1",
-        timeout_ms=5000,
-    )
-
-    assert result == "abcdefgh\n\n[output truncated after 8 characters]"
-    assert emitted_events == [
-        {
-            "type": "meshagent.handler.output",
-            "item_id": "local-shell-1",
-            "lines": [
-                {"source": "stdout", "text": "abcdefgh"},
-                {
-                    "source": "stdout",
-                    "text": "[output truncated after 8 characters]",
-                },
-            ],
-        }
-    ]
-
-
-@pytest.mark.asyncio
 async def test_shell_tool_container_exec_emits_live_output_events() -> None:
-    tool = ShellTool(image="meshagent/python:default")
     room = _FakeContainerRoom(
         exec_factory=lambda: _FakeContainerExec(
             stdout_chunks=[b"one\n", b"three\n"],
@@ -3712,9 +3620,9 @@ async def test_shell_tool_container_exec_emits_live_output_events() -> None:
             exit_code=0,
         )
     )
+    tool = ShellTool(room=room, image="meshagent/python:default")
     emitted_events: list[dict[str, object]] = []
     context = ToolContext(
-        room=room,
         caller=_FakeParticipant(),
         event_handler=emitted_events.append,
     )
@@ -3760,7 +3668,6 @@ async def test_shell_tool_container_exec_truncates_success_output(
 ) -> None:
     monkeypatch.setattr(responses_adapter_module, "MAX_SHELL_OUTPUT_SIZE", 8)
 
-    tool = ShellTool(image="meshagent/python:default")
     room = _FakeContainerRoom(
         exec_factory=lambda: _FakeContainerExec(
             stdout_chunks=[b"abcdefghijk"],
@@ -3768,9 +3675,9 @@ async def test_shell_tool_container_exec_truncates_success_output(
             exit_code=0,
         )
     )
+    tool = ShellTool(room=room, image="meshagent/python:default")
     emitted_events: list[dict[str, object]] = []
     context = ToolContext(
-        room=room,
         caller=_FakeParticipant(),
         event_handler=emitted_events.append,
     )
@@ -3806,7 +3713,6 @@ async def test_shell_tool_container_exec_truncates_success_output(
 
 @pytest.mark.asyncio
 async def test_shell_tool_container_exec_uses_configured_working_dir() -> None:
-    tool = ShellTool(image="meshagent/python:default", working_dir="/workspace")
     room = _FakeContainerRoom(
         exec_factory=lambda: _FakeContainerExec(
             stdout_chunks=[b"/workspace\n"],
@@ -3814,8 +3720,12 @@ async def test_shell_tool_container_exec_uses_configured_working_dir() -> None:
             exit_code=0,
         )
     )
-    context = ToolContext(
+    tool = ShellTool(
         room=room,
+        image="meshagent/python:default",
+        working_dir="/workspace",
+    )
+    context = ToolContext(
         caller=_FakeParticipant(),
         event_handler=lambda event: None,
     )
@@ -3850,7 +3760,6 @@ async def test_shell_tool_local_exec_truncates_success_output(
     tool = ShellTool(image=None)
     emitted_events: list[dict[str, object]] = []
     context = ToolContext(
-        room=_FakeRoom(),
         caller=_FakeParticipant(),
         event_handler=emitted_events.append,
     )
@@ -3889,7 +3798,6 @@ async def test_shell_tool_local_exec_uses_configured_env() -> None:
     tool = ShellTool(image=None, env={"EXAMPLE_VAR": "hello"})
     emitted_events: list[dict[str, object]] = []
     context = ToolContext(
-        room=_FakeRoom(),
         caller=_FakeParticipant(),
         event_handler=emitted_events.append,
     )

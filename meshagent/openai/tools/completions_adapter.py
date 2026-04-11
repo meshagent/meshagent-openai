@@ -1,5 +1,5 @@
 from meshagent.agents.agent import AgentSessionContext
-from meshagent.api import RoomClient, RoomException, RemoteParticipant
+from meshagent.api import Participant, RoomException
 from meshagent.tools import Toolkit, ToolContext
 from meshagent.api.messaging import (
     Content,
@@ -342,12 +342,12 @@ class OpenAICompletionsAdapter(LLMAdapter):
         *,
         model: Optional[str] = None,
         context: AgentSessionContext,
-        room: RoomClient,
+        caller: Participant,
         toolkits: list[Toolkit],
         output_schema: Optional[dict] = None,
         event_handler: Optional[Callable[[dict], None]] = None,
         steering_callback: SteeringCallback | None = None,
-        on_behalf_of: Optional[RemoteParticipant] = None,
+        on_behalf_of: Optional[Participant] = None,
         options: Optional[dict] = None,
     ):
         del model
@@ -413,17 +413,6 @@ class OpenAICompletionsAdapter(LLMAdapter):
                     model=self._model,
                 )
                 message = response.choices[0].message
-                room.developer.log_nowait(
-                    type="llm.message",
-                    data={
-                        "context": context.id,
-                        "participant_id": room.local_participant.id,
-                        "participant_name": room.local_participant.get_attribute(
-                            "name"
-                        ),
-                        "message": message.to_dict(),
-                    },
-                )
 
                 if message.tool_calls is not None:
                     tasks = []
@@ -436,8 +425,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
                                 else None
                             )
                             tool_context = ToolContext(
-                                room=room,
-                                caller=room.local_participant,
+                                caller=caller,
                                 on_behalf_of=on_behalf_of,
                                 caller_context=caller_context,
                                 event_handler=event_handler,
@@ -452,7 +440,6 @@ class OpenAICompletionsAdapter(LLMAdapter):
                                 )
                             else:
                                 tool_response = ensure_content(tool_response)
-                            logger.info(f"tool response {tool_response}")
                             return await tool_adapter.create_messages(
                                 context=context,
                                 tool_call=tool_call,
@@ -462,16 +449,6 @@ class OpenAICompletionsAdapter(LLMAdapter):
                         except Exception as e:
                             logger.error(
                                 f"unable to complete tool call {tool_call}", exc_info=e
-                            )
-                            room.developer.log_nowait(
-                                type="llm.error",
-                                data={
-                                    "participant_id": room.local_participant.id,
-                                    "participant_name": room.local_participant.get_attribute(
-                                        "name"
-                                    ),
-                                    "error": f"{e}",
-                                },
                             )
 
                             return [
@@ -495,17 +472,6 @@ class OpenAICompletionsAdapter(LLMAdapter):
                         if result is not None:
                             outputs = result if isinstance(result, list) else [result]
                             for output in outputs:
-                                room.developer.log_nowait(
-                                    type="llm.message",
-                                    data={
-                                        "context": context.id,
-                                        "participant_id": room.local_participant.id,
-                                        "participant_name": room.local_participant.get_attribute(
-                                            "name"
-                                        ),
-                                        "message": output,
-                                    },
-                                )
                                 next_messages.append(output)
                                 appended_outputs = True
 
@@ -525,7 +491,6 @@ class OpenAICompletionsAdapter(LLMAdapter):
                     iteration_committed = True
                     content = message.content
 
-                    logger.info("RESPONSE FROM OPENAI %s", content)
                     if response_schema is None:
                         return content
 
@@ -554,17 +519,6 @@ class OpenAICompletionsAdapter(LLMAdapter):
                                             error=e
                                         ),
                                     }
-                                    room.developer.log_nowait(
-                                        type="llm.message",
-                                        data={
-                                            "context": context.id,
-                                            "participant_id": room.local_participant.id,
-                                            "participant_name": room.local_participant.get_attribute(
-                                                "name"
-                                            ),
-                                            "message": error,
-                                        },
-                                    )
                                     context.messages.append(error)
                                     continue
 
