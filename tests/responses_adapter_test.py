@@ -800,7 +800,10 @@ async def test_create_session_returns_openai_responses_session_context():
 
 @pytest.mark.asyncio
 async def test_get_openai_client_passes_optional_session(monkeypatch):
-    adapter = OpenAIResponsesAdapter(base_url="https://example.test/v1")
+    adapter = OpenAIResponsesAdapter(
+        base_url="https://example.test/v1",
+        api_key="test-token",
+    )
     client_session = httpx.AsyncClient()
     fake_client = object()
     call_args: dict[str, object] = {}
@@ -828,7 +831,7 @@ async def test_get_openai_client_passes_optional_session(monkeypatch):
     assert call_args["base_url"] == "https://example.test/v1"
     assert call_args["http_client"] is call_args["session"]
     assert call_args["session"] is client_session
-    assert call_args["api_key"] is None
+    assert call_args["api_key"] == "test-token"
 
 
 @pytest.mark.asyncio

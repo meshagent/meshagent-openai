@@ -1,3 +1,8 @@
-from .proxy import get_client, get_logging_httpx_client
+from .proxy import (
+    get_client,
+    get_logging_httpx_client,
+    resolve_api_key,
+    resolve_base_url,
+)
 
-__all__ = [get_client, get_logging_httpx_client]
+__all__ = [get_client, get_logging_httpx_client, resolve_base_url, resolve_api_key]

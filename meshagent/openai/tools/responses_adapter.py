@@ -48,7 +48,12 @@ from meshagent.api.error_codes import ErrorCode
 import json
 from collections.abc import AsyncIterable, Awaitable, Mapping
 from typing import Any, List, Literal, cast
-from meshagent.openai.proxy import get_client, get_logging_httpx_client
+from meshagent.openai.proxy import (
+    get_client,
+    get_logging_httpx_client,
+    resolve_api_key,
+    resolve_base_url,
+)
 from openai import AsyncOpenAI, NOT_GIVEN, APIError, APIStatusError
 from openai._models import construct_type
 from openai.types.responses import ResponseFunctionToolCall, ResponseStreamEvent
@@ -853,6 +858,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         compaction_threshold: Optional[int | float] = None,
         *,
         base_url: str | None = None,
+        api_key: str | None = None,
         max_tool_call_length: int = DEFAULT_MAX_TOOL_CALL_LENGTH,
         max_tool_call_lines: int = DEFAULT_MAX_TOOL_CALL_LINES,
     ):
@@ -891,11 +897,8 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         self._model = model
         self._parallel_tool_calls = parallel_tool_calls
         self._client = client
-        if base_url is None:
-            base_url = os.getenv("OPENAI_BASE_URL")
-        if base_url is not None:
-            base_url = base_url.strip() or None
-        self._base_url = base_url
+        self._base_url = resolve_base_url(base_url)
+        self._api_key = resolve_api_key(api_key)
         self._response_options = response_options
         self._provider = provider
         self._reasoning_effort = reasoning_effort
@@ -1249,6 +1252,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             http_client = get_logging_httpx_client()
         return get_client(
             base_url=self._base_url,
+            api_key=self._api_key,
             http_client=http_client,
             session=session,
         )

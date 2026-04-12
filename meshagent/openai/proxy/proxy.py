@@ -4,6 +4,7 @@ import json
 import httpx
 import os
 from typing import Optional
+from meshagent.api.urls import meshagent_base_url
 
 logger = logging.getLogger("openai.client")
 
@@ -50,6 +51,29 @@ def get_logging_httpx_client() -> httpx.AsyncClient:
     )
 
 
+def resolve_base_url(base_url: str | None = None) -> str:
+    resolved = base_url
+    if resolved is None:
+        resolved = os.getenv("OPENAI_BASE_URL")
+    if resolved is not None:
+        resolved = resolved.strip() or None
+    if resolved is not None:
+        return resolved
+    return f"{meshagent_base_url().rstrip('/')}/openai/v1"
+
+
+def resolve_api_key(api_key: str | None = None) -> str | None:
+    resolved = api_key
+    if resolved is None:
+        resolved = os.getenv("OPENAI_API_KEY")
+    if resolved is None or resolved.strip() == "":
+        resolved = os.getenv("MESHAGENT_TOKEN")
+    if resolved is None:
+        return None
+    resolved = resolved.strip()
+    return resolved or None
+
+
 def get_client(
     *,
     base_url: str | None = None,
@@ -58,15 +82,12 @@ def get_client(
     api_key: str | None = None,
 ) -> AsyncOpenAI:
     resolved_http_client = http_client if http_client is not None else session
-    if base_url is None:
-        base_url = os.getenv("OPENAI_BASE_URL")
-    if base_url is not None:
-        base_url = base_url.strip() or None
+    resolved_base_url = resolve_base_url(base_url)
+    resolved_api_key = resolve_api_key(api_key)
     kwargs: dict[str, object] = {}
     if resolved_http_client is not None:
         kwargs["http_client"] = resolved_http_client
-    if base_url is not None:
-        kwargs["base_url"] = base_url
-    if api_key is not None:
-        kwargs["api_key"] = api_key
+    kwargs["base_url"] = resolved_base_url
+    if resolved_api_key is not None:
+        kwargs["api_key"] = resolved_api_key
     return AsyncOpenAI(**kwargs)

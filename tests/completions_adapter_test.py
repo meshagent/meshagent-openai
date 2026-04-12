@@ -229,6 +229,7 @@ async def test_openai_completions_adapter_passes_base_url_to_get_client(monkeypa
     adapter = OpenAICompletionsAdapter(
         model="gpt-4o-mini",
         base_url="https://example.test/v1",
+        api_key="test-token",
     )
     context = adapter.create_session()
     context.append_user_message("hello")
@@ -243,7 +244,7 @@ async def test_openai_completions_adapter_passes_base_url_to_get_client(monkeypa
     assert call_args["base_url"] == "https://example.test/v1"
     assert call_args["http_client"] is None
     assert call_args["session"] is None
-    assert call_args["api_key"] is None
+    assert call_args["api_key"] == "test-token"
 
 
 def test_openai_completions_adapter_reads_base_url_from_environment(monkeypatch):
