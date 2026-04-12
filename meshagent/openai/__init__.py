@@ -3,6 +3,7 @@ from .tools import (
     OpenAIResponsesAdapter,
     OpenAICompletionsToolResponseAdapter,
     OpenAIResponsesToolResponseAdapter,
+    OpenAIResponsesMCPToolkit,
 )
 from .version import __version__
 
@@ -13,4 +14,5 @@ __all__ = [
     OpenAIResponsesAdapter,
     OpenAICompletionsToolResponseAdapter,
     OpenAIResponsesToolResponseAdapter,
+    OpenAIResponsesMCPToolkit,
 ]

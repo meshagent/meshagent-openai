@@ -4,7 +4,8 @@ from meshagent.agents.event_publisher import (
     _OpenAIAgentEventPublisher,
     make_openai_agent_event_publisher,
 )
-from meshagent.agents.messages import AgentMessage
+from meshagent.agents.messages import AgentMessage, ToolChoice
+from meshagent.agents.mcp import MCPServerConfig, MCPToolkitClientOptions
 from meshagent.tools import (
     Toolkit,
     ToolContext,
@@ -556,7 +557,12 @@ def safe_tool_name(name: str):
 
 # Collects a group of tool proxies and manages execution of openai tool calls
 class ResponsesToolBundle:
-    def __init__(self, toolkits: List[Toolkit]):
+    def __init__(
+        self,
+        toolkits: List[Toolkit],
+        *,
+        tool_call_approval_handler: ToolCallApprovalHandler | None = None,
+    ):
         self._toolkits = toolkits
         self._executors = dict[str, Toolkit]()
         self._safe_names = {}
@@ -565,7 +571,13 @@ class ResponsesToolBundle:
         open_ai_tools = []
 
         for toolkit in toolkits:
-            for v in toolkit.tools:
+            for tool in toolkit.tools:
+                if isinstance(tool, MCPTool):
+                    tool = tool.with_tool_call_approval_handler(
+                        tool_call_approval_handler
+                    )
+
+                v = tool
                 k = v.name
 
                 name = safe_tool_name(k)
@@ -1171,6 +1183,60 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
 
         return None
 
+    def _resolve_tool_choice(
+        self,
+        *,
+        toolkits: list[Toolkit],
+        tool_choice: ToolChoice | None,
+    ) -> Any:
+        if tool_choice is None:
+            return NOT_GIVEN
+
+        selected_toolkit = next(
+            (
+                toolkit
+                for toolkit in toolkits
+                if toolkit.name == tool_choice.toolkit_name
+            ),
+            None,
+        )
+        if selected_toolkit is None:
+            raise RoomException(
+                f"unknown toolkit in tool_choice: {tool_choice.toolkit_name}"
+            )
+
+        selected_tool = next(
+            (
+                tool
+                for tool in selected_toolkit.tools
+                if tool.name == tool_choice.tool_name
+            ),
+            None,
+        )
+        if selected_tool is None:
+            raise RoomException(
+                f"unknown tool in tool_choice: {tool_choice.toolkit_name}.{tool_choice.tool_name}"
+            )
+
+        if isinstance(selected_tool, FunctionTool):
+            return {
+                "type": "function",
+                "name": safe_tool_name(selected_tool.name),
+            }
+        if isinstance(selected_tool, MCPTool):
+            return {
+                "type": "mcp",
+                "server_label": selected_tool.name,
+            }
+        if isinstance(selected_tool, ShellTool):
+            return {"type": "shell"}
+        if isinstance(selected_tool, ApplyPatchTool):
+            return {"type": "apply_patch"}
+
+        raise RoomException(
+            f"tool_choice is not supported for {type(selected_tool).__name__}"
+        )
+
     def get_openai_client(
         self,
         *,
@@ -1758,6 +1824,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         event_handler: Optional[Callable[[dict[str, Any]], None]] = None,
         steering_callback: SteeringCallback | None = None,
         on_behalf_of: Optional[Participant] = None,
+        tool_choice: ToolChoice | None = None,
         options: Optional[dict] = None,
     ):
         if model is None:
@@ -1820,7 +1887,8 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                             tool_bundle = ResponsesToolBundle(
                                 toolkits=[
                                     *toolkits,
-                                ]
+                                ],
+                                tool_call_approval_handler=self._tool_call_approval_handler,
                             )
                             self._set_function_tool_name_resolver(
                                 event_handler=event_handler,
@@ -1901,6 +1969,10 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                 "model": model,
                                 "input": context.messages,
                                 "tools": open_ai_tools,
+                                "tool_choice": self._resolve_tool_choice(
+                                    toolkits=toolkits,
+                                    tool_choice=tool_choice,
+                                ),
                                 "text": text,
                                 "previous_response_id": previous_response_id,
                                 "instructions": instructions or NOT_GIVEN,
@@ -3145,9 +3217,25 @@ class MCPServer(BaseModel):
 
 
 class MCPTool(OpenAIResponsesTool):
-    def __init__(self, *, servers: list[MCPServer], name: str = "mcp"):
+    def __init__(
+        self,
+        *,
+        servers: list[MCPServer],
+        name: str = "mcp",
+        tool_call_approval_handler: ToolCallApprovalHandler | None = None,
+    ):
         super().__init__(name=name)
         self.servers = servers
+        self._tool_call_approval_handler = tool_call_approval_handler
+
+    def with_tool_call_approval_handler(
+        self, handler: ToolCallApprovalHandler | None
+    ) -> "MCPTool":
+        return MCPTool(
+            name=self.name,
+            servers=[*self.servers],
+            tool_call_approval_handler=handler,
+        )
 
     def get_open_ai_tool_definitions(self):
         defs = []
@@ -3419,6 +3507,59 @@ class MCPTool(OpenAIResponsesTool):
                 "approve": False,
                 "approval_request_id": id,
             }
+
+
+def _merge_mcp_server_configs(
+    *,
+    static_servers: list[MCPServerConfig],
+    client_options: dict | None,
+) -> list[MCPServerConfig]:
+    merged_by_label: dict[str, MCPServerConfig] = {
+        server.server_label: server for server in static_servers
+    }
+    if client_options is None:
+        return list(merged_by_label.values())
+
+    options = MCPToolkitClientOptions.model_validate(client_options)
+    for server in options.servers:
+        merged_by_label[server.server_label] = server
+    return list(merged_by_label.values())
+
+
+class OpenAIResponsesMCPToolkit(Toolkit):
+    def __init__(
+        self,
+        *,
+        servers: list[MCPServerConfig] | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        hidden: bool = False,
+    ) -> None:
+        super().__init__(
+            name="mcp",
+            title=title,
+            description=description,
+            tools=[],
+            client_options=MCPToolkitClientOptions.model_json_schema(),
+            hidden=hidden,
+        )
+        self._servers = [*(servers or [])]
+
+    def get_tools(self, *, client_options: Optional[dict] = None) -> list[BaseTool]:
+        servers = _merge_mcp_server_configs(
+            static_servers=self._servers,
+            client_options=client_options,
+        )
+        if len(servers) == 0:
+            return []
+
+        return [
+            MCPTool(
+                name=server.server_label,
+                servers=[MCPServer.model_validate(server.model_dump(mode="json"))],
+            )
+            for server in servers
+        ]
 
 
 class ReasoningTool(OpenAIResponsesTool):

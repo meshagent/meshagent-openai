@@ -1,6 +1,6 @@
 from meshagent.agents.agent import AgentSessionContext
 from meshagent.api import Participant, RoomException
-from meshagent.tools import Toolkit, ToolContext
+from meshagent.tools import Toolkit, ToolContext, FunctionTool
 from meshagent.api.messaging import (
     Content,
     LinkContent,
@@ -18,6 +18,7 @@ from meshagent.agents.adapter import (
     LLMAdapter,
     SteeringCallback,
 )
+from meshagent.agents.messages import ToolChoice
 import json
 from typing import List
 
@@ -335,6 +336,50 @@ class OpenAICompletionsAdapter(LLMAdapter):
             return self._client
         return get_client(base_url=self._base_url)
 
+    def _resolve_tool_choice(
+        self,
+        *,
+        toolkits: list[Toolkit],
+        tool_choice: ToolChoice | None,
+    ) -> dict[str, Any] | None:
+        if tool_choice is None:
+            return None
+
+        selected_toolkit = next(
+            (
+                toolkit
+                for toolkit in toolkits
+                if toolkit.name == tool_choice.toolkit_name
+            ),
+            None,
+        )
+        if selected_toolkit is None:
+            raise RoomException(
+                f"unknown toolkit in tool_choice: {tool_choice.toolkit_name}"
+            )
+
+        selected_tool = next(
+            (
+                tool
+                for tool in selected_toolkit.tools
+                if tool.name == tool_choice.tool_name
+            ),
+            None,
+        )
+        if selected_tool is None:
+            raise RoomException(
+                f"unknown tool in tool_choice: {tool_choice.toolkit_name}.{tool_choice.tool_name}"
+            )
+        if not isinstance(selected_tool, FunctionTool):
+            raise RoomException(
+                f"tool_choice is not supported for {type(selected_tool).__name__}"
+            )
+
+        return {
+            "type": "function",
+            "function": {"name": safe_tool_name(selected_tool.name)},
+        }
+
     # Takes the current chat context, executes a completion request and processes the response.
     # If a tool calls are requested, invokes the tools, processes the tool calls results, and appends the tool call results to the context
     async def next(
@@ -348,10 +393,10 @@ class OpenAICompletionsAdapter(LLMAdapter):
         event_handler: Optional[Callable[[dict], None]] = None,
         steering_callback: SteeringCallback | None = None,
         on_behalf_of: Optional[Participant] = None,
+        tool_choice: ToolChoice | None = None,
         options: Optional[dict] = None,
     ):
         del model
-        del options
 
         context.turn_count += 1
         tool_adapter = self._make_tool_response_adapter()
@@ -405,7 +450,12 @@ class OpenAICompletionsAdapter(LLMAdapter):
                     model=self._model,
                     messages=context.messages,
                     tools=open_ai_tools,
+                    tool_choice=self._resolve_tool_choice(
+                        toolkits=toolkits,
+                        tool_choice=tool_choice,
+                    ),
                     **extra,
+                    **(options or {}),
                 )
                 self._store_usage(
                     context=context,

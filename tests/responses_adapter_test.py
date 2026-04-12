@@ -20,6 +20,7 @@ from openai.types.responses.response_output_message import ResponseOutputMessage
 from openai.types.responses.response_output_text import ResponseOutputText
 from yarl import URL
 
+from meshagent.agents.adapter import ToolCallApprovalRequest
 from meshagent.agents.messages import (
     AgentFileContentDelta,
     AgentFileContentEnded,
@@ -396,6 +397,52 @@ def test_openai_mcp_tool_coerces_headers_dict_to_strict_header_entries() -> None
     tool = MCPTool(servers=[server])
     definitions = tool.get_open_ai_tool_definitions()
     assert definitions[0]["headers"] == {"Authorization": "Bearer token"}
+
+
+@pytest.mark.asyncio
+async def test_openai_mcp_tool_bundle_threads_tool_call_approval_handler() -> None:
+    server = MCPServer.model_validate(
+        {
+            "server_label": "docs",
+            "server_url": "https://example.com/mcp",
+        }
+    )
+    requests = []
+
+    async def handle_approval(
+        context: ToolContext, request: ToolCallApprovalRequest
+    ) -> bool:
+        requests.append((context, request))
+        return False
+
+    bundle = ResponsesToolBundle(
+        toolkits=[Toolkit(name="mcp", tools=[MCPTool(name="docs", servers=[server])])],
+        tool_call_approval_handler=handle_approval,
+    )
+    tool = bundle.get_tool("docs")
+    assert isinstance(tool, MCPTool)
+
+    context = ToolContext(caller=_FakeParticipant())
+    response = await tool.handle_mcp_approval_request(
+        context,
+        arguments='{"path":"/data"}',
+        id="approval-1",
+        name="read_wiki_structure",
+        server_label="docs",
+        type="mcp_approval_request",
+    )
+
+    assert response == {
+        "type": "mcp_approval_response",
+        "approve": False,
+        "approval_request_id": "approval-1",
+    }
+    assert len(requests) == 1
+    _, request = requests[0]
+    assert request.item_id == "approval-1"
+    assert request.toolkit == "docs"
+    assert request.tool == "read_wiki_structure"
+    assert request.arguments == {"path": "/data"}
 
 
 class _FakeCompletedEvent:
