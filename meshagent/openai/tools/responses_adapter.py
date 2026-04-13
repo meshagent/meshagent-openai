@@ -3962,7 +3962,7 @@ class ApplyPatchTool(OpenAIResponsesTool):
         if operation["type"] == "delete_file":
             path = operation["path"]
             logger.info(f"applying patch: deleting file {path}")
-            await self._storage.delete(context=context, path=path)
+            await self._storage.delete(path=path)
             log = f"Deleted file: {path}"
             logger.info(log)
             return {"status": "completed", "output": log}
@@ -3976,7 +3976,6 @@ class ApplyPatchTool(OpenAIResponsesTool):
             except Exception as ex:
                 return {"status": "failed", "output": f"{ex}"}
             await self._storage.write_text(
-                context=context,
                 path=path,
                 overwrite=False,
                 text=patched,
@@ -3988,7 +3987,7 @@ class ApplyPatchTool(OpenAIResponsesTool):
 
         elif operation["type"] == "update_file":
             path = operation["path"]
-            content = await self._storage.read_file(context=context, path=path)
+            content = await self._storage.read_file(path=path)
             text = content.data.decode()
             diff = operation["diff"]
 
@@ -4000,7 +3999,6 @@ class ApplyPatchTool(OpenAIResponsesTool):
                 return {"status": "failed", "output": f"{ex}"}
 
             await self._storage.write_text(
-                context=context,
                 path=path,
                 overwrite=True,
                 text=patched,
