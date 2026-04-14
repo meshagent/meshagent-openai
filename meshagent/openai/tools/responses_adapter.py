@@ -957,6 +957,19 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             max_tool_call_lines=self._max_tool_call_lines,
         )
 
+    def _compose_instructions(self, *, context: AgentSessionContext) -> str | None:
+        instruction_parts = [
+            part
+            for part in (
+                context.get_system_instructions(),
+                self.get_additional_instructions(),
+            )
+            if isinstance(part, str) and part.strip() != ""
+        ]
+        if len(instruction_parts) == 0:
+            return None
+        return "\n\n".join(instruction_parts)
+
     def context_window_size(self, model: str) -> float:
         model_key = model.lower()
         for prefix, size in self._context_window_sizes.items():
@@ -1057,7 +1070,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             model = self.default_model()
         if not context.messages and not context.previous_messages:
             return
-        instructions = context.instructions
+        instructions = self._compose_instructions(context=context)
         previous_response_id = (
             context.previous_response_id
             if context.previous_response_id is not None
@@ -1150,7 +1163,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
 
         response = await openai.responses.input_tokens.count(
             tools=open_ai_tools,
-            instructions=context.instructions,
+            instructions=self._compose_instructions(context=context),
             input=context.messages,
             text=text,
             previous_response_id=context.previous_response_id,
@@ -1926,7 +1939,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                 span.set_attribute("response_format", "text")
 
                             previous_response_id = NOT_GIVEN
-                            instructions = context.get_system_instructions()
+                            instructions = self._compose_instructions(context=context)
                             if context.previous_response_id is not None:
                                 previous_response_id = context.previous_response_id
 

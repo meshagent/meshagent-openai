@@ -330,6 +330,11 @@ class _FakeResponse:
         }
 
 
+class _InstructionalOpenAIResponsesAdapter(OpenAIResponsesAdapter):
+    def get_additional_instructions(self) -> str | None:
+        return "extra adapter instructions"
+
+
 @pytest.mark.asyncio
 async def test_openai_responses_tool_response_adapter_truncates_text_output() -> None:
     adapter = OpenAIResponsesToolResponseAdapter(
@@ -1266,6 +1271,32 @@ async def test_next_disables_auto_compaction_by_default_for_unknown_model(monkey
     assert len(client.responses.create_kwargs) == 1
     create_kwargs = client.responses.create_kwargs[0]
     assert "context_management" not in create_kwargs
+
+
+@pytest.mark.asyncio
+async def test_next_combines_context_and_adapter_instructions() -> None:
+    client = _FakeOpenAIClient(
+        outcomes=[_FakeResponse(response_id="resp_combined_instructions")]
+    )
+    adapter = _InstructionalOpenAIResponsesAdapter(
+        client=client,
+        mode="request",
+        model="gpt-5.2",
+    )
+    context = adapter.create_session()
+    context.instructions = "base context instructions"
+    context.append_user_message("hello")
+
+    result = await adapter.next(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        toolkits=[],
+    )
+
+    assert result == ""
+    assert client.responses.create_kwargs[0]["instructions"] == (
+        "base context instructions\n\nextra adapter instructions"
+    )
 
 
 @pytest.mark.asyncio
