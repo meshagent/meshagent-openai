@@ -14,9 +14,9 @@ dependencies = [
   "pytest~=8.4",
   "pytest-asyncio~=0.26",
   "openai~=2.25.0",
-  "meshagent-api~=0.36.3",
-  "meshagent-agents~=0.36.3",
-  "meshagent-tools~=0.36.3",
+  "meshagent-api~=0.37.0",
+  "meshagent-agents~=0.37.0",
+  "meshagent-tools~=0.37.0",
   "html-to-markdown~=2.24.3",
 ]
 

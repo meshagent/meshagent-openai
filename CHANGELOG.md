@@ -1,3 +1,13 @@
+## [0.37.0]
+- Breaking: Database API now supports `json`, `uuid`, `list`, and `struct` types with typed wrappers (DatabaseJson/DatabaseStruct/DatabaseExpression/DatabaseDate/Uuid), and query results/params use structured encoding instead of JSON strings.
+- Breaking: Containers build now streams build contexts (start/data chunks) with `mount_path`/`chunks` and removes `start_build`.
+- Breaking: Toolkit/hosting refactor removes toolkit config/builders and `supports_context`, introduces room-bound `Toolkit` with public/hidden/client options, and adds LocalRoomTool plus new hosted-toolkit start/stop flow.
+- Storage and skills updates: storage toolkits now require explicit mounts (with delete support) and skills prompt generation reads skills through storage mounts.
+- Added MCP toolkit support and tool-choice selection across agents and OpenAI/Anthropic adapters, including MCP authorization handling.
+- Added agent packaging build/run/deploy workflow with new CLI commands.
+- Breaking: Participant tokens now require an LLM grant, include role-based default scopes (LLM/secrets), and preserve extra payload fields.
+- Dependency updates across SDK packages: added `aiofiles~=24.1`, `pyyaml~=6.0.2`, and `pathspec>=1.0.3,<2`.
+
 ## [0.36.3]
 - Breaking: `OpenAIResponsesAdapter`/`OpenAICompletionsAdapter` now take `base_url` in the constructor, default it from `OPENAI_BASE_URL`, and no longer derive provider clients from a `RoomClient`; `meshagent.openai.proxy.get_client` also dropped its `room` parameter.
 - Storage client now supports move operations and emits `file.moved` events.
