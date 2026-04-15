@@ -1,3 +1,10 @@
+## [0.37.1]
+- Transcript schema and livekit transcript logging now include a `participant_role` field for each segment.
+- Meshagent CLI join subcommands now preserve storage mount flags and deprecated option aliases when lazy-loaded.
+- Scheduled task list/update commands now default the room to `MESHAGENT_ROOM`.
+- Harbor environments now fall back to the `meshagent/shell-codex:default` image when no Dockerfile or prebuilt image is provided.
+- Harbor environments can delegate the room token into container env and now prefer API-key auth over ambient room tokens.
+
 ## [0.37.0]
 - Breaking: Database API now supports `json`, `uuid`, `list`, and `struct` types with typed wrappers (DatabaseJson/DatabaseStruct/DatabaseExpression/DatabaseDate/Uuid), and query results/params use structured encoding instead of JSON strings.
 - Breaking: Containers build now streams build contexts (start/data chunks) with `mount_path`/`chunks` and removes `start_build`.
