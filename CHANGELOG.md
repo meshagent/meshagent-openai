@@ -1,3 +1,6 @@
+## [0.37.2]
+- MailBot and Worker now build room-bound toolkits at startup and cleanly stop/clear hosted toolkits on startup failures and shutdown.
+
 ## [0.37.1]
 - Transcript schema and livekit transcript logging now include a `participant_role` field for each segment.
 - Meshagent CLI join subcommands now preserve storage mount flags and deprecated option aliases when lazy-loaded.
