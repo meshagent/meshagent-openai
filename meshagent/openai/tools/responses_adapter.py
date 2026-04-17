@@ -2344,9 +2344,19 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
 
                                                             return [], False
 
-                                            logger.warning(
-                                                f"OpenAI response handler was not registered for {message.type}"
-                                            )
+                                            if message.type == "reasoning":
+                                                logger.debug(
+                                                    "OpenAI response handler was not "
+                                                    "registered for reasoning; "
+                                                    "reasoning content is handled "
+                                                    "through stream callbacks"
+                                                )
+                                            else:
+                                                logger.warning(
+                                                    "OpenAI response handler was "
+                                                    "not registered for "
+                                                    f"{message.type}"
+                                                )
 
                                     return [], False
 
