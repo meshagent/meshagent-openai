@@ -1,3 +1,7 @@
+## [0.38.0]
+- Added deployment config models and a `get_config()` API call to retrieve MeshAgent domain/registry settings.
+- CLI image build/pack/deploy now validates and targets the configured registry host (from deployment config, with default fallback) instead of a hard‑coded registry host, and uses that registry for credential resolution.
+
 ## [0.37.2]
 - MailBot and Worker now build room-bound toolkits at startup and cleanly stop/clear hosted toolkits on startup failures and shutdown.
 
