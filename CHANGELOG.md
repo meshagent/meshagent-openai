@@ -1,3 +1,10 @@
+## [0.38.2]
+- Image generation tool events now emit binary image results, persist them with metadata to the images database, and redact inline image payloads in event data.
+- OpenAI image generation now defaults to `gpt-image-2`, and the pricing catalog adds `gpt-image-2` plus text-embedding-3/ada token rates.
+- OpenAI and Anthropic adapters now normalize extra headers and only send `Meshagent-On-Behalf-Of` when a valid name is present.
+- Room container models now include a `ports` list in container responses.
+- Breaking change: CLI runtime containers no longer inherit Dockerfile `ENV`; environment variables must be provided explicitly.
+
 ## [0.38.1]
 - Added profile-aware CLI settings with multi-account support, per-profile API URLs, and new `auth switch`/`auth login --api-url` flows, with migration from legacy local state.
 - Breaking: `meshagent image` has been replaced by top-level `meshagent build` and `meshagent deploy`, and build/deploy now take the build context as a positional PATH instead of `--pack`.
