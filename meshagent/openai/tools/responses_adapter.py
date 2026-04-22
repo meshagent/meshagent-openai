@@ -1,5 +1,6 @@
 from meshagent.agents.agent import AgentSessionContext
 from meshagent.api import Participant, RoomClient, RoomException
+from meshagent.api.http import normalize_extra_headers
 from meshagent.agents.event_publisher import (
     _OpenAIAgentEventPublisher,
     make_openai_agent_event_publisher,
@@ -1975,9 +1976,10 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                     caller_name,
                                     on_behalf_of_name,
                                 )
-                                extra_headers["Meshagent-On-Behalf-Of"] = (
-                                    on_behalf_of_name
-                                )
+                                if isinstance(on_behalf_of_name, str):
+                                    extra_headers["Meshagent-On-Behalf-Of"] = (
+                                        on_behalf_of_name
+                                    )
 
                             openai = self.get_openai_client()
                             create_kwargs = {
@@ -1997,6 +1999,10 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                 **response_options,
                                 **(options or {}),
                             }
+                            normalized_extra_headers = normalize_extra_headers(
+                                create_kwargs.get("extra_headers")
+                            )
+                            create_kwargs["extra_headers"] = normalized_extra_headers
                             self._add_auto_compaction_entry(create_kwargs=create_kwargs)
                             response: Content | None = None
                             if not stream:
@@ -2006,7 +2012,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                             context=context,
                                             openai=openai,
                                             create_kwargs=create_kwargs,
-                                            extra_headers=extra_headers,
+                                            extra_headers=normalized_extra_headers,
                                         )
                                     )
                                 else:

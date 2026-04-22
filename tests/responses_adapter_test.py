@@ -73,6 +73,15 @@ class _FakeParticipant:
         return None
 
 
+class _NamelessParticipant:
+    def __init__(self):
+        self.id = "participant_2"
+
+    def get_attribute(self, key: str):
+        del key
+        return None
+
+
 class _FakeRoom:
     def __init__(self):
         self.local_participant = _FakeParticipant()
@@ -2460,6 +2469,33 @@ async def test_next_retries_after_stream_iterator_api_error(monkeypatch):
     assert stream_events[0]["headline"] == "Retrying the LLM request (retry 1/3)"
     assert stream_events[1]["state"] == "completed"
     assert stream_events[1]["headline"] == "LLM request retry succeeded"
+
+
+@pytest.mark.asyncio
+async def test_next_omits_on_behalf_of_header_when_name_is_missing() -> None:
+    client = _FakeOpenAIClient(
+        outcomes=[
+            _FakeResponse(
+                response_id="resp_done",
+                output=[_make_output_message(message_id="msg_done", text="done")],
+            )
+        ]
+    )
+
+    adapter = OpenAIResponsesAdapter(client=client, max_retries=3, mode="request")
+    context = adapter.create_session()
+    context.append_user_message("hello")
+
+    result = await adapter.next(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        on_behalf_of=_NamelessParticipant(),
+        toolkits=[],
+    )
+
+    assert result == "done"
+    assert len(client.responses.create_kwargs) == 1
+    assert client.responses.create_kwargs[0]["extra_headers"] == {}
 
 
 @pytest.mark.asyncio
