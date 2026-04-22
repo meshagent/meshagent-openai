@@ -2803,6 +2803,9 @@ class OpenAIResponsesTool(BaseTool):
         return {}
 
 
+DEFAULT_IMAGE_GENERATION_MODEL = "gpt-image-2"
+
+
 class ImageGenerationTool(OpenAIResponsesTool):
     def __init__(
         self,
@@ -2820,7 +2823,8 @@ class ImageGenerationTool(OpenAIResponsesTool):
         super().__init__(name="image_generation")
         self.background = background
         self.input_image_mask_url = input_image_mask_url
-        self.model = model
+        normalized_model = model.strip() if isinstance(model, str) else None
+        self.model = normalized_model or DEFAULT_IMAGE_GENERATION_MODEL
         self.moderation = moderation
         self.output_compression = output_compression
         self.output_format = output_format

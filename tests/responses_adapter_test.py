@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import contextlib
 import copy
 import json
@@ -38,11 +39,13 @@ from meshagent.agents.messages import (
 )
 from meshagent.api import RoomException
 from meshagent.api.error_codes import ErrorCode
-from meshagent.api.messaging import FileContent, JsonContent, TextContent
+from meshagent.api.messaging import BinaryContent, FileContent, JsonContent, TextContent
 from meshagent.computers.agent import ComputerToolkit
 from meshagent.computers.operator import Operator
 import meshagent.openai.tools.responses_adapter as responses_adapter_module
 from meshagent.openai.tools.responses_adapter import (
+    DEFAULT_IMAGE_GENERATION_MODEL,
+    ImageGenerationTool,
     MCPServer,
     MCPTool,
     OpenAIResponsesAdapter,
@@ -411,6 +414,19 @@ def test_openai_mcp_tool_coerces_headers_dict_to_strict_header_entries() -> None
     tool = MCPTool(servers=[server])
     definitions = tool.get_open_ai_tool_definitions()
     assert definitions[0]["headers"] == {"Authorization": "Bearer token"}
+
+
+def test_image_generation_tool_defaults_to_gpt_image_2() -> None:
+    tool = ImageGenerationTool()
+
+    assert tool.model == DEFAULT_IMAGE_GENERATION_MODEL
+    assert tool.get_open_ai_tool_definitions() == [
+        {
+            "type": "image_generation",
+            "model": DEFAULT_IMAGE_GENERATION_MODEL,
+            "partial_images": 1,
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -2981,6 +2997,68 @@ def test_make_agent_event_publisher_forwards_custom_events() -> None:
             "headline": "Retrying the LLM request",
         }
     ]
+
+
+def test_make_agent_event_publisher_emits_binary_image_generation_results() -> None:
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    encoded = base64.b64encode(b"fake-image-bytes").decode("ascii")
+
+    publisher(
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "image_generation_call",
+                "id": "ig_1",
+                "status": "in_progress",
+                "output_format": "png",
+                "quality": "high",
+                "size": "1024x1024",
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "image_generation_call",
+                "id": "ig_1",
+                "status": "completed",
+                "output_format": "png",
+                "quality": "high",
+                "size": "1024x1024",
+                "result": encoded,
+            },
+        }
+    )
+
+    assert [type(event) for event in published] == [
+        AgentToolCallStarted,
+        AgentToolCallEnded,
+    ]
+
+    ended = published[1]
+    assert isinstance(ended, AgentToolCallEnded)
+    assert isinstance(ended.result, BinaryContent)
+    assert ended.result.get_data() == b"fake-image-bytes"
+    assert ended.result.headers == {
+        "mime_type": "image/png",
+        "output_format": "png",
+        "quality": "high",
+        "size": "1024x1024",
+        "status": "completed",
+    }
 
 
 def test_make_agent_event_publisher_preserves_text_delta_whitespace() -> None:
