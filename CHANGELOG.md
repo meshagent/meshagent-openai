@@ -1,3 +1,10 @@
+## [0.38.3]
+- Breaking: `Image` now uses `references`/`preferred_ref` with optional metadata (timestamps/media type) instead of `tags`/`size`, and `inspect_image` returns manifests/layers/content size.
+- `Meshagent.get_usage` now supports filters (users/room/provider/model/usage_type) and adds `can_use_llm_proxy`.
+- CLI adds `auth token` for printing the current access token.
+- CLI adds `launch` commands for Codex/Claude plus configuration helpers for proxy profiles/settings; setup wizard now handles LLM proxy access and tool setup.
+- CLI container tooling now renders image lists as tables by default and adds `images inspect` with detailed metadata output.
+
 ## [0.38.2]
 - Image generation tool events now emit binary image results, persist them with metadata to the images database, and redact inline image payloads in event data.
 - OpenAI image generation now defaults to `gpt-image-2`, and the pricing catalog adds `gpt-image-2` plus text-embedding-3/ada token rates.
