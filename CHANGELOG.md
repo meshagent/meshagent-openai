@@ -1,3 +1,10 @@
+## [0.38.4]
+- On Windows, meshagent-cli now uses `subprocess.list2cmdline` to correctly pass arguments when launching the Claude integration.
+- `meshagent image deploy` now supports `--wait/--no-wait` (wait enabled by default) to wait for deployment readiness, stream container logs, and verify route liveness when `--domain` is provided.
+- meshagent-llm-proxy pricing now filters out zero-usage token values and returns no pricing when all usage values are zero.
+- meshagent-cli setup wizard now only reuses an authenticated session when the requested API URL matches the active API URL.
+- meshagent-cli `all` extra now includes `meshagent-otel==0.38.3`.
+
 ## [0.38.3]
 - Breaking: `Image` now uses `references`/`preferred_ref` with optional metadata (timestamps/media type) instead of `tags`/`size`, and `inspect_image` returns manifests/layers/content size.
 - `Meshagent.get_usage` now supports filters (users/room/provider/model/usage_type) and adds `can_use_llm_proxy`.
