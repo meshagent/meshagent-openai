@@ -892,6 +892,42 @@ def test_openai_responses_adapter_reads_base_url_from_environment(monkeypatch):
     assert adapter._base_url == "https://env.example.test/v1"
 
 
+def test_openai_responses_adapter_with_runtime_api_key_returns_bound_clone(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "env-token")
+    adapter = OpenAIResponsesAdapter(
+        model="gpt-4o",
+        response_options={"metadata": {"tag": "original"}},
+    )
+    approval_handler = lambda request: request  # noqa: E731
+    adapter.set_tool_call_approval_handler(approval_handler)
+
+    bound = adapter.with_runtime_api_key(api_key="runtime-token")
+
+    assert bound is not adapter
+    assert bound._api_key == "runtime-token"
+    assert bound._response_options == {"metadata": {"tag": "original"}}
+    assert bound._response_options is not adapter._response_options
+    assert bound._tool_call_approval_handler is approval_handler
+
+    assert bound._response_options is not None
+    bound._response_options["metadata"]["tag"] = "updated"
+    assert adapter._response_options == {"metadata": {"tag": "original"}}
+
+
+def test_openai_responses_adapter_with_runtime_api_key_keeps_explicit_api_key() -> None:
+    adapter = OpenAIResponsesAdapter(api_key="configured-token")
+
+    assert adapter.with_runtime_api_key(api_key="runtime-token") is adapter
+
+
+def test_openai_responses_adapter_with_runtime_api_key_keeps_explicit_client() -> None:
+    adapter = OpenAIResponsesAdapter(client=object())
+
+    assert adapter.with_runtime_api_key(api_key="runtime-token") is adapter
+
+
 def test_constructor_rejects_invalid_compaction_threshold():
     with pytest.raises(ValueError, match="compaction_threshold must be greater than 0"):
         OpenAIResponsesAdapter(compaction_threshold=0)

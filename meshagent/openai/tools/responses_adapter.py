@@ -48,6 +48,7 @@ from meshagent.api.specs.service import ContainerMountSpec
 from meshagent.api.error_codes import ErrorCode
 import json
 from collections.abc import AsyncIterable, Awaitable, Mapping
+import copy
 from typing import Any, List, Literal, cast
 from meshagent.openai.proxy import (
     get_client,
@@ -69,7 +70,6 @@ import aiohttp
 import math
 import httpx
 from pydantic import BaseModel, model_validator
-import copy
 from opentelemetry import trace
 from html_to_markdown import convert
 from urllib.parse import urlparse, urlunparse
@@ -899,6 +899,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         self._parallel_tool_calls = parallel_tool_calls
         self._client = client
         self._base_url = resolve_base_url(base_url)
+        self._has_explicit_api_key = isinstance(api_key, str) and api_key.strip() != ""
         self._api_key = resolve_api_key(api_key)
         self._response_options = response_options
         self._provider = provider
@@ -921,6 +922,42 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         self, handler: ToolCallApprovalHandler | None
     ) -> None:
         self._tool_call_approval_handler = handler
+
+    def with_runtime_api_key(self, *, api_key: str | None) -> "OpenAIResponsesAdapter":
+        resolved_api_key = resolve_api_key(api_key)
+        if (
+            self._client is not None
+            or self._has_explicit_api_key
+            or resolved_api_key is None
+        ):
+            return self
+
+        clone = type(self)(
+            model=self._model,
+            parallel_tool_calls=self._parallel_tool_calls,
+            response_options=self._response_options,
+            reasoning_effort=self._reasoning_effort,
+            provider=self._provider,
+            log_requests=self._log_requests,
+            max_output_tokens=self.max_output_tokens,
+            max_retries=self._max_retries,
+            mode=self._mode,
+            websocket_timeout=self._websocket_timeout,
+            context_management=self._context_management_mode,
+            compaction_threshold=(
+                self._compaction_threshold
+                if self._compaction_threshold is not None
+                else float("inf")
+            ),
+            base_url=self._base_url,
+            api_key=resolved_api_key,
+            max_tool_call_length=self._max_tool_call_length,
+            max_tool_call_lines=self._max_tool_call_lines,
+        )
+        clone._compaction_threshold = self._compaction_threshold
+        clone._tool_call_approval_handler = self._tool_call_approval_handler
+        clone._response_options = copy.deepcopy(self._response_options)
+        return clone
 
     def make_agent_event_publisher(
         self,

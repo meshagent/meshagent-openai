@@ -1,6 +1,6 @@
 import asyncio
-import json
 import copy
+import json
 from typing import Any
 
 import pytest
@@ -253,6 +253,43 @@ def test_openai_completions_adapter_reads_base_url_from_environment(monkeypatch)
     adapter = OpenAICompletionsAdapter(model="gpt-4o-mini")
 
     assert adapter._base_url == "https://env.example.test/v1"
+
+
+def test_openai_completions_adapter_with_runtime_api_key_returns_bound_clone(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "env-token")
+    adapter = OpenAICompletionsAdapter(
+        model="gpt-4o-mini",
+        max_tool_call_length=123,
+        max_tool_call_lines=7,
+    )
+
+    bound = adapter.with_runtime_api_key(api_key="runtime-token")
+
+    assert bound is not adapter
+    assert bound._api_key == "runtime-token"
+    assert bound._max_tool_call_length == 123
+    assert bound._max_tool_call_lines == 7
+
+
+def test_openai_completions_adapter_with_runtime_api_key_keeps_explicit_api_key() -> (
+    None
+):
+    adapter = OpenAICompletionsAdapter(
+        model="gpt-4o-mini",
+        api_key="configured-token",
+    )
+
+    assert adapter.with_runtime_api_key(api_key="runtime-token") is adapter
+
+
+def test_openai_completions_adapter_with_runtime_api_key_keeps_explicit_client() -> (
+    None
+):
+    adapter = OpenAICompletionsAdapter(model="gpt-4o-mini", client=object())
+
+    assert adapter.with_runtime_api_key(api_key="runtime-token") is adapter
 
 
 @pytest.mark.asyncio

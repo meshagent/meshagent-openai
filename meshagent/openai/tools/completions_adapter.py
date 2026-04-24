@@ -291,9 +291,30 @@ class OpenAICompletionsAdapter(LLMAdapter):
         self._parallel_tool_calls = parallel_tool_calls
         self._client = client
         self._base_url = resolve_base_url(base_url)
+        self._has_explicit_api_key = isinstance(api_key, str) and api_key.strip() != ""
         self._api_key = resolve_api_key(api_key)
         self._max_tool_call_length = max_tool_call_length
         self._max_tool_call_lines = max_tool_call_lines
+
+    def with_runtime_api_key(
+        self, *, api_key: str | None
+    ) -> "OpenAICompletionsAdapter":
+        resolved_api_key = resolve_api_key(api_key)
+        if (
+            self._client is not None
+            or self._has_explicit_api_key
+            or resolved_api_key is None
+        ):
+            return self
+
+        return type(self)(
+            model=self._model,
+            parallel_tool_calls=self._parallel_tool_calls,
+            base_url=self._base_url,
+            api_key=resolved_api_key,
+            max_tool_call_length=self._max_tool_call_length,
+            max_tool_call_lines=self._max_tool_call_lines,
+        )
 
     def create_session(self):
         system_role = "system"
