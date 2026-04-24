@@ -55,6 +55,7 @@ from meshagent.openai.proxy import (
     get_logging_httpx_client,
     resolve_api_key,
     resolve_base_url,
+    resolve_user_agent,
 )
 from openai import AsyncOpenAI, NOT_GIVEN, APIError, APIStatusError
 from openai._models import construct_type
@@ -860,6 +861,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         *,
         base_url: str | None = None,
         api_key: str | None = None,
+        user_agent: str | None = None,
         max_tool_call_length: int = DEFAULT_MAX_TOOL_CALL_LENGTH,
         max_tool_call_lines: int = DEFAULT_MAX_TOOL_CALL_LINES,
     ):
@@ -901,6 +903,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         self._base_url = resolve_base_url(base_url)
         self._has_explicit_api_key = isinstance(api_key, str) and api_key.strip() != ""
         self._api_key = resolve_api_key(api_key)
+        self._user_agent = resolve_user_agent(user_agent)
         self._response_options = response_options
         self._provider = provider
         self._reasoning_effort = reasoning_effort
@@ -951,6 +954,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             ),
             base_url=self._base_url,
             api_key=resolved_api_key,
+            user_agent=self._user_agent,
             max_tool_call_length=self._max_tool_call_length,
             max_tool_call_lines=self._max_tool_call_lines,
         )
@@ -1304,6 +1308,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         return get_client(
             base_url=self._base_url,
             api_key=self._api_key,
+            user_agent=self._user_agent,
             http_client=http_client,
             session=session,
         )

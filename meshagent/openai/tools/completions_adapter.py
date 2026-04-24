@@ -34,7 +34,12 @@ import logging
 import re
 import asyncio
 
-from meshagent.openai.proxy import get_client, resolve_api_key, resolve_base_url
+from meshagent.openai.proxy import (
+    get_client,
+    resolve_api_key,
+    resolve_base_url,
+    resolve_user_agent,
+)
 from meshagent.openai.tools.usage import (
     add_usage_metrics,
     normalize_openai_usage,
@@ -284,6 +289,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
         *,
         base_url: str | None = None,
         api_key: str | None = None,
+        user_agent: str | None = None,
         max_tool_call_length: int = DEFAULT_MAX_TOOL_CALL_LENGTH,
         max_tool_call_lines: int = DEFAULT_MAX_TOOL_CALL_LINES,
     ):
@@ -293,6 +299,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
         self._base_url = resolve_base_url(base_url)
         self._has_explicit_api_key = isinstance(api_key, str) and api_key.strip() != ""
         self._api_key = resolve_api_key(api_key)
+        self._user_agent = resolve_user_agent(user_agent)
         self._max_tool_call_length = max_tool_call_length
         self._max_tool_call_lines = max_tool_call_lines
 
@@ -312,6 +319,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
             parallel_tool_calls=self._parallel_tool_calls,
             base_url=self._base_url,
             api_key=resolved_api_key,
+            user_agent=self._user_agent,
             max_tool_call_length=self._max_tool_call_length,
             max_tool_call_lines=self._max_tool_call_lines,
         )
@@ -353,7 +361,11 @@ class OpenAICompletionsAdapter(LLMAdapter):
     def get_openai_client(self) -> AsyncOpenAI:
         if self._client is not None:
             return self._client
-        return get_client(base_url=self._base_url, api_key=self._api_key)
+        return get_client(
+            base_url=self._base_url,
+            api_key=self._api_key,
+            user_agent=self._user_agent,
+        )
 
     def _resolve_tool_choice(
         self,

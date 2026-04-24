@@ -213,12 +213,13 @@ async def test_openai_completions_adapter_passes_base_url_to_get_client(monkeypa
     call_args: dict[str, object] = {}
 
     def _fake_get_client(
-        *, base_url=None, http_client=None, session=None, api_key=None
+        *, base_url=None, http_client=None, session=None, api_key=None, user_agent=None
     ):
         call_args["base_url"] = base_url
         call_args["http_client"] = http_client
         call_args["session"] = session
         call_args["api_key"] = api_key
+        call_args["user_agent"] = user_agent
         return fake_client
 
     monkeypatch.setattr(
@@ -230,6 +231,7 @@ async def test_openai_completions_adapter_passes_base_url_to_get_client(monkeypa
         model="gpt-4o-mini",
         base_url="https://example.test/v1",
         api_key="test-token",
+        user_agent="custom-app/1.0",
     )
     context = adapter.create_session()
     context.append_user_message("hello")
@@ -243,6 +245,7 @@ async def test_openai_completions_adapter_passes_base_url_to_get_client(monkeypa
     assert result == "done"
     assert call_args["base_url"] == "https://example.test/v1"
     assert call_args["http_client"] is None
+    assert call_args["user_agent"] == "custom-app/1.0"
     assert call_args["session"] is None
     assert call_args["api_key"] == "test-token"
 

@@ -15,6 +15,7 @@ def test_get_client_reads_base_url_from_environment(monkeypatch) -> None:
 
     assert isinstance(client, _FakeAsyncOpenAI)
     assert captured["base_url"] == "https://env.example.test/v1"
+    assert captured["default_headers"] == {"User-Agent": proxy.DEFAULT_USER_AGENT}
 
 
 def test_get_client_explicit_base_url_overrides_environment(monkeypatch) -> None:
@@ -31,6 +32,7 @@ def test_get_client_explicit_base_url_overrides_environment(monkeypatch) -> None
 
     assert isinstance(client, _FakeAsyncOpenAI)
     assert captured["base_url"] == "https://explicit.example.test/v1"
+    assert captured["default_headers"] == {"User-Agent": proxy.DEFAULT_USER_AGENT}
 
 
 def test_get_client_uses_meshagent_defaults_when_provider_env_missing(
@@ -53,3 +55,19 @@ def test_get_client_uses_meshagent_defaults_when_provider_env_missing(
     assert isinstance(client, _FakeAsyncOpenAI)
     assert captured["base_url"] == "https://api.example.test/openai/v1"
     assert captured["api_key"] == "meshagent-token"
+    assert captured["default_headers"] == {"User-Agent": proxy.DEFAULT_USER_AGENT}
+
+
+def test_get_client_uses_configured_user_agent(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class _FakeAsyncOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(proxy, "AsyncOpenAI", _FakeAsyncOpenAI)
+
+    client = proxy.get_client(user_agent=" custom-app/1.0 ")
+
+    assert isinstance(client, _FakeAsyncOpenAI)
+    assert captured["default_headers"] == {"User-Agent": "custom-app/1.0"}
