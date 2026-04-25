@@ -1,6 +1,10 @@
 from meshagent.agents.agent import AgentSessionContext
 from meshagent.api import Participant, RoomClient, RoomException
-from meshagent.api.http import normalize_extra_headers
+from meshagent.api.http import (
+    llm_annotation_headers,
+    normalize_extra_headers,
+    normalize_llm_annotations,
+)
 from meshagent.agents.event_publisher import (
     _OpenAIAgentEventPublisher,
     make_openai_agent_event_publisher,
@@ -863,6 +867,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         base_url: str | None = None,
         api_key: str | None = None,
         user_agent: str | None = None,
+        annotations: Mapping[str, object] | None = None,
         max_tool_call_length: int = DEFAULT_MAX_TOOL_CALL_LENGTH,
         max_tool_call_lines: int = DEFAULT_MAX_TOOL_CALL_LINES,
     ):
@@ -905,6 +910,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         self._has_explicit_api_key = isinstance(api_key, str) and api_key.strip() != ""
         self._api_key = resolve_api_key(api_key)
         self._user_agent = resolve_user_agent(user_agent)
+        self._annotations = normalize_llm_annotations(annotations)
         self._response_options = response_options
         self._provider = provider
         self._reasoning_effort = reasoning_effort
@@ -956,6 +962,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             base_url=self._base_url,
             api_key=resolved_api_key,
             user_agent=self._user_agent,
+            annotations=self._annotations,
             max_tool_call_length=self._max_tool_call_length,
             max_tool_call_lines=self._max_tool_call_lines,
         )
@@ -1156,6 +1163,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             model=model,
             provider="openai",
             tokens=flattened_usage,
+            annotations=self._annotations,
         )
 
     def _should_publish_stream_event(self, *, event: ResponseStreamEvent) -> bool:
@@ -2016,6 +2024,9 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                 }
 
                             extra_headers = {}
+                            extra_headers.update(
+                                llm_annotation_headers(self._annotations)
+                            )
                             if on_behalf_of is not None:
                                 on_behalf_of_name = on_behalf_of.get_attribute("name")
                                 caller_name = caller.get_attribute("name")
@@ -2047,8 +2058,13 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                 **response_options,
                                 **(options or {}),
                             }
-                            normalized_extra_headers = normalize_extra_headers(
-                                create_kwargs.get("extra_headers")
+                            normalized_extra_headers = llm_annotation_headers(
+                                self._annotations
+                            )
+                            normalized_extra_headers.update(
+                                normalize_extra_headers(
+                                    create_kwargs.get("extra_headers")
+                                )
                             )
                             create_kwargs["extra_headers"] = normalized_extra_headers
                             self._add_auto_compaction_entry(create_kwargs=create_kwargs)

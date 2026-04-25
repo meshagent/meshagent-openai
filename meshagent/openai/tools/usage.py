@@ -181,11 +181,18 @@ def _get_counter_meter(name: str):
 
 
 def track_otel_usage_metrics(
-    *, model: str, provider: str, tokens: dict[str, float]
+    *,
+    model: str,
+    provider: str,
+    tokens: dict[str, float],
+    annotations: dict[str, str] | None = None,
 ) -> None:
+    attributes = {"model": model, "provider": provider}
+    for name, value in (annotations or {}).items():
+        attributes[f"annotation.{name}"] = value
     for token_name, total in tokens.items():
         meter = _get_counter_meter(token_name)
-        meter.add(total, {"model": model, "provider": provider})
+        meter.add(total, attributes)
 
 
 # Backwards compatibility for older imports.

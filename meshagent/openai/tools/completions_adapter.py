@@ -19,6 +19,7 @@ from meshagent.agents.adapter import (
     SteeringCallback,
 )
 from meshagent.agents.messages import ToolChoice
+from meshagent.api.http import llm_annotation_headers, normalize_llm_annotations
 import json
 from typing import List
 
@@ -27,7 +28,7 @@ from openai.types.chat import ChatCompletion, ChatCompletionMessageToolCall
 
 import os
 from typing import Optional, Any, Callable
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Mapping
 import copy
 
 import logging
@@ -291,6 +292,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
         base_url: str | None = None,
         api_key: str | None = None,
         user_agent: str | None = None,
+        annotations: Mapping[str, object] | None = None,
         max_tool_call_length: int = DEFAULT_MAX_TOOL_CALL_LENGTH,
         max_tool_call_lines: int = DEFAULT_MAX_TOOL_CALL_LINES,
     ):
@@ -301,6 +303,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
         self._has_explicit_api_key = isinstance(api_key, str) and api_key.strip() != ""
         self._api_key = resolve_api_key(api_key)
         self._user_agent = resolve_user_agent(user_agent)
+        self._annotations = normalize_llm_annotations(annotations)
         self._max_tool_call_length = max_tool_call_length
         self._max_tool_call_lines = max_tool_call_lines
 
@@ -321,6 +324,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
             base_url=self._base_url,
             api_key=resolved_api_key,
             user_agent=self._user_agent,
+            annotations=self._annotations,
             max_tool_call_length=self._max_tool_call_length,
             max_tool_call_lines=self._max_tool_call_lines,
         )
@@ -356,6 +360,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
             model=model,
             provider="openai",
             tokens=flattened_usage,
+            annotations=self._annotations,
         )
 
     def _make_tool_response_adapter(self) -> OpenAICompletionsToolResponseAdapter:
@@ -482,6 +487,9 @@ class OpenAICompletionsAdapter(LLMAdapter):
                         },
                     }
 
+                request_options = dict(options or {})
+                extra_headers = llm_annotation_headers(self._annotations)
+                extra_headers.update(request_options.pop("extra_headers", None) or {})
                 response: ChatCompletion = await openai.chat.completions.create(
                     n=1,
                     model=self._model,
@@ -491,8 +499,9 @@ class OpenAICompletionsAdapter(LLMAdapter):
                         toolkits=toolkits,
                         tool_choice=tool_choice,
                     ),
+                    extra_headers=extra_headers,
                     **extra,
-                    **(options or {}),
+                    **request_options,
                 )
                 self._store_usage(
                     context=context,

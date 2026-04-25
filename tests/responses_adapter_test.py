@@ -89,16 +89,31 @@ def test_store_usage_publishes_otel_usage_metrics(monkeypatch: pytest.MonkeyPatc
     calls: list[dict[str, object]] = []
 
     def _fake_track_otel_usage_metrics(
-        *, model: str, provider: str, tokens: dict[str, float]
+        *,
+        model: str,
+        provider: str,
+        tokens: dict[str, float],
+        annotations: dict[str, str] | None = None,
     ) -> None:
-        calls.append({"model": model, "provider": provider, "tokens": tokens})
+        calls.append(
+            {
+                "model": model,
+                "provider": provider,
+                "tokens": tokens,
+                "annotations": annotations,
+            }
+        )
 
     monkeypatch.setattr(
         responses_adapter_module,
         "track_otel_usage_metrics",
         _fake_track_otel_usage_metrics,
     )
-    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    adapter = OpenAIResponsesAdapter(
+        model="gpt-5-mini",
+        client=object(),
+        annotations={"Env": "prod"},
+    )
     context = adapter.create_session()
 
     adapter._store_usage(
@@ -120,6 +135,7 @@ def test_store_usage_publishes_otel_usage_metrics(monkeypatch: pytest.MonkeyPatc
                 "output_tokens": 7.0,
                 "cached_tokens": 4.0,
             },
+            "annotations": {"env": "prod"},
         }
     ]
 
