@@ -85,6 +85,45 @@ class _NamelessParticipant:
         return None
 
 
+def test_store_usage_publishes_otel_usage_metrics(monkeypatch: pytest.MonkeyPatch):
+    calls: list[dict[str, object]] = []
+
+    def _fake_track_otel_usage_metrics(
+        *, model: str, provider: str, tokens: dict[str, float]
+    ) -> None:
+        calls.append({"model": model, "provider": provider, "tokens": tokens})
+
+    monkeypatch.setattr(
+        responses_adapter_module,
+        "track_otel_usage_metrics",
+        _fake_track_otel_usage_metrics,
+    )
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    context = adapter.create_session()
+
+    adapter._store_usage(
+        context=context,
+        usage={
+            "input_tokens": 11,
+            "output_tokens": 7,
+            "input_tokens_details": {"cached_tokens": 4},
+        },
+        model="gpt-5-mini",
+    )
+
+    assert calls == [
+        {
+            "model": "gpt-5-mini",
+            "provider": "openai",
+            "tokens": {
+                "input_tokens": 11.0,
+                "output_tokens": 7.0,
+                "cached_tokens": 4.0,
+            },
+        }
+    ]
+
+
 class _FakeRoom:
     def __init__(self):
         self.local_participant = _FakeParticipant()

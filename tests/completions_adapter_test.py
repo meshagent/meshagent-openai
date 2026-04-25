@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from meshagent.api.messaging import FileContent, JsonContent, TextContent
+import meshagent.openai.tools.completions_adapter as completions_adapter_module
 from meshagent.openai.tools.completions_adapter import (
     OpenAICompletionsAdapter,
     OpenAICompletionsToolResponseAdapter,
@@ -53,6 +54,37 @@ class _StreamingTool(FunctionTool):
             yield TextContent(text="tool-output")
 
         return _run()
+
+
+def test_store_usage_publishes_otel_usage_metrics(monkeypatch: pytest.MonkeyPatch):
+    calls: list[dict[str, object]] = []
+
+    def _fake_track_otel_usage_metrics(
+        *, model: str, provider: str, tokens: dict[str, float]
+    ) -> None:
+        calls.append({"model": model, "provider": provider, "tokens": tokens})
+
+    monkeypatch.setattr(
+        completions_adapter_module,
+        "track_otel_usage_metrics",
+        _fake_track_otel_usage_metrics,
+    )
+    adapter = OpenAICompletionsAdapter(model="gpt-4o-mini", client=object())
+    context = adapter.create_session()
+
+    adapter._store_usage(
+        context=context,
+        usage={"prompt_tokens": 6, "completion_tokens": 2},
+        model="gpt-4o-mini",
+    )
+
+    assert calls == [
+        {
+            "model": "gpt-4o-mini",
+            "provider": "openai",
+            "tokens": {"input_tokens": 6.0, "output_tokens": 2.0},
+        }
+    ]
 
 
 class _BlockingTool(FunctionTool):

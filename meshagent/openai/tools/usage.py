@@ -3,9 +3,11 @@ from __future__ import annotations
 from typing import Any
 import logging
 
+from opentelemetry import metrics
 from pydantic import BaseModel
 
 logger = logging.getLogger("openai_agent")
+_usage_meters: dict[str, object] = {}
 
 
 def _to_float(value: Any) -> float | None:
@@ -167,6 +169,23 @@ def preprocess_openai_usage(
 def add_usage_metrics(*, totals: dict[str, float], usage: dict[str, float]) -> None:
     for key, value in usage.items():
         totals[key] = float(totals.get(key, 0.0)) + float(value)
+
+
+def _get_counter_meter(name: str):
+    meter = _usage_meters.get(name)
+    if meter is None:
+        usage_meter = metrics.get_meter("meshagent.usage")
+        meter = usage_meter.create_counter(name, "tokens")
+        _usage_meters[name] = meter
+    return meter
+
+
+def track_otel_usage_metrics(
+    *, model: str, provider: str, tokens: dict[str, float]
+) -> None:
+    for token_name, total in tokens.items():
+        meter = _get_counter_meter(token_name)
+        meter.add(total, {"model": model, "provider": provider})
 
 
 # Backwards compatibility for older imports.

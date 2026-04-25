@@ -78,6 +78,7 @@ from meshagent.openai.tools.usage import (
     add_usage_metrics,
     normalize_openai_usage,
     preprocess_openai_usage,
+    track_otel_usage_metrics,
 )
 import contextlib
 
@@ -1151,6 +1152,11 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         if flattened_usage is None:
             return
         add_usage_metrics(totals=context.usage, usage=flattened_usage)
+        track_otel_usage_metrics(
+            model=model,
+            provider="openai",
+            tokens=flattened_usage,
+        )
 
     def _should_publish_stream_event(self, *, event: ResponseStreamEvent) -> bool:
         event_type = event.type
