@@ -2,6 +2,7 @@ from meshagent.agents.agent import AgentSessionContext
 from meshagent.api import Participant, RoomClient, RoomException
 from meshagent.api.http import (
     llm_annotation_headers,
+    new_client_session,
     normalize_extra_headers,
     normalize_llm_annotations,
 )
@@ -309,9 +310,7 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
             session = self._session
             close_session_on_failure = False
             if session is None:
-                session = aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=None)
-                )
+                session = new_client_session(timeout=aiohttp.ClientTimeout(total=None))
                 if self._owns_session:
                     self._session = session
                 else:
@@ -375,7 +374,7 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
     async def start(self) -> None:
         await super().start()
         if self._session is None and self._owns_session:
-            self._session = aiohttp.ClientSession(
+            self._session = new_client_session(
                 timeout=aiohttp.ClientTimeout(total=None)
             )
 
