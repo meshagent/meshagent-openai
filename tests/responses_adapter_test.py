@@ -1677,9 +1677,7 @@ async def test_create_response_websocket_stream_converts_raw_handshake_errors(
 
     monkeypatch.setattr(context, "ensure_websocket", _failing_ensure_websocket)
 
-    with pytest.raises(
-        RoomException, match="Your account is out of credits. Add credits to continue."
-    ) as exc_info:
+    with pytest.raises(RoomException, match="account dashboard") as exc_info:
         await adapter._create_response_websocket_stream(
             context=context,
             openai=SimpleNamespace(
@@ -1702,14 +1700,14 @@ async def test_session_context_reuses_websocket_and_closes_after_timeout(monkeyp
     fake_websocket = _FakeWebSocket()
     fake_session = _FakeClientSession(fake_websocket)
 
-    def _fake_client_session(*args, **kwargs):
+    def _fake_new_client_session(*args, **kwargs):
         del args
         del kwargs
         return fake_session
 
     monkeypatch.setattr(
-        "meshagent.openai.tools.responses_adapter.aiohttp.ClientSession",
-        _fake_client_session,
+        "meshagent.openai.tools.responses_adapter.new_client_session",
+        _fake_new_client_session,
     )
 
     context = OpenAIResponsesSessionContext(
@@ -1914,13 +1912,13 @@ async def test_session_context_closes_created_session_on_close(monkeypatch):
     fake_websocket = _FakeWebSocket()
     fake_session = _FakeClientSession(fake_websocket)
 
-    def _fake_client_session(*args, **kwargs):
+    def _fake_new_client_session(*args, **kwargs):
         del args, kwargs
         return fake_session
 
     monkeypatch.setattr(
-        "meshagent.openai.tools.responses_adapter.aiohttp.ClientSession",
-        _fake_client_session,
+        "meshagent.openai.tools.responses_adapter.new_client_session",
+        _fake_new_client_session,
     )
 
     context = OpenAIResponsesSessionContext(system_role=None)
@@ -1948,20 +1946,18 @@ async def test_session_context_converts_websocket_handshake_errors_to_room_excep
     )
     fake_session = _FailingHandshakeClientSession(error=handshake_error)
 
-    def _fake_client_session(*args, **kwargs):
+    def _fake_new_client_session(*args, **kwargs):
         del args, kwargs
         return fake_session
 
     monkeypatch.setattr(
-        "meshagent.openai.tools.responses_adapter.aiohttp.ClientSession",
-        _fake_client_session,
+        "meshagent.openai.tools.responses_adapter.new_client_session",
+        _fake_new_client_session,
     )
 
     context = OpenAIResponsesSessionContext(system_role=None)
 
-    with pytest.raises(
-        RoomException, match="Your account is out of credits. Add credits to continue."
-    ) as exc_info:
+    with pytest.raises(RoomException, match="account dashboard") as exc_info:
         await context.ensure_websocket(
             url="ws://localhost:8080/openai/v1/responses",
             headers={"Authorization": "Bearer test-token"},
@@ -1975,14 +1971,14 @@ async def test_session_context_converts_websocket_handshake_errors_to_room_excep
 async def test_session_context_closes_session_when_ws_connect_fails(monkeypatch):
     fake_session = _FailingConnectClientSession()
 
-    def _fake_client_session(*args, **kwargs):
+    def _fake_new_client_session(*args, **kwargs):
         del args
         del kwargs
         return fake_session
 
     monkeypatch.setattr(
-        "meshagent.openai.tools.responses_adapter.aiohttp.ClientSession",
-        _fake_client_session,
+        "meshagent.openai.tools.responses_adapter.new_client_session",
+        _fake_new_client_session,
     )
 
     context = OpenAIResponsesSessionContext(system_role=None)
@@ -2772,6 +2768,53 @@ async def test_receive_websocket_payload_logs_request_body_for_4xx_error_event(
 
 
 @pytest.mark.asyncio
+async def test_receive_websocket_payload_does_not_log_request_body_for_out_of_credits(
+    caplog,
+):
+    adapter = OpenAIResponsesAdapter(mode="websocket")
+    websocket = _FakeLoggingWebSocket(
+        messages=[
+            _FakeLoggingWsMessage(
+                type=aiohttp.WSMsgType.TEXT,
+                data=json.dumps(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "insufficient_quota",
+                            "code": "insufficient_quota",
+                            "message": "Your account is out of credits. Add credits to continue.",
+                        },
+                        "status": 402,
+                    }
+                ),
+            )
+        ]
+    )
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.5",
+        "input": [{"role": "user", "content": "hello"}],
+    }
+
+    caplog.set_level(logging.ERROR, logger="openai_agent")
+
+    with pytest.raises(RoomException) as exc_info:
+        await adapter._receive_websocket_payload(
+            websocket=websocket,
+            request_payload=request_payload,
+        )
+
+    assert exc_info.value.status_code == 402
+    assert "account dashboard" in str(exc_info.value)
+    assert "auto reload" in str(exc_info.value)
+    logged_messages = [record.message for record in caplog.records]
+    assert not any(
+        message.startswith("OpenAI websocket error request body=")
+        for message in logged_messages
+    )
+
+
+@pytest.mark.asyncio
 async def test_next_retries_after_websocket_close(monkeypatch):
     adapter = OpenAIResponsesAdapter(mode="websocket", max_retries=2)
     first_websocket = _QueuedLoggingWebSocket(
@@ -2843,6 +2886,68 @@ async def test_next_retries_after_websocket_close(monkeypatch):
         assert stream_events[0]["headline"] == "Reconnecting to the LLM (retry 1/2)"
         assert stream_events[1]["state"] == "completed"
         assert stream_events[1]["headline"] == "Reconnected to the LLM"
+    finally:
+        await context.close()
+
+
+@pytest.mark.asyncio
+async def test_next_does_not_retry_after_websocket_out_of_credits(monkeypatch):
+    sleep_calls: list[float] = []
+
+    async def _fake_sleep(delay: float):
+        sleep_calls.append(delay)
+
+    monkeypatch.setattr(
+        "meshagent.openai.tools.responses_adapter.asyncio.sleep",
+        _fake_sleep,
+    )
+
+    adapter = OpenAIResponsesAdapter(mode="websocket", max_retries=2)
+    websocket = _QueuedLoggingWebSocket()
+    websocket.queue_json(
+        {
+            "type": "error",
+            "error": {
+                "type": "insufficient_quota",
+                "code": "insufficient_quota",
+                "message": "Your account is out of credits. Add credits to continue.",
+            },
+            "status": 402,
+        }
+    )
+    client_session = _SequentialClientSession([websocket])
+    context = OpenAIResponsesSessionContext(
+        system_role=None,
+        session=client_session,
+        websocket_ping_interval_seconds=3600,
+        websocket_timeout=3600,
+    )
+    context.append_user_message("hello")
+    stream_events: list[dict] = []
+
+    monkeypatch.setattr(
+        adapter,
+        "get_openai_client",
+        lambda: SimpleNamespace(
+            base_url="https://example.com/openai/v1",
+            default_headers={"Authorization": "Bearer test-token"},
+        ),
+    )
+
+    try:
+        with pytest.raises(RoomException) as exc_info:
+            await adapter.next(
+                context=context,
+                caller=_FakeRoom().local_participant,
+                toolkits=[],
+                event_handler=stream_events.append,
+            )
+
+        assert exc_info.value.status_code == 402
+        assert "account dashboard" in str(exc_info.value)
+        assert client_session.connect_calls == 1
+        assert sleep_calls == []
+        assert stream_events == []
     finally:
         await context.close()
 

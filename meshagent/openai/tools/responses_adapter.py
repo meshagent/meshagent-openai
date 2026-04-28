@@ -91,6 +91,14 @@ logger = logging.getLogger("openai_agent")
 tracer = trace.get_tracer("openai.llm.responses")
 _MAX_LOGGED_WEBSOCKET_PAYLOAD_CHARS = 128000
 _MESHAGENT_ERROR_MESSAGE_HEADER = "x-meshagent-error-message"
+_OPENAI_OUT_OF_CREDITS_MESSAGE = (
+    "Your account is out of credits. Add credits from the account dashboard "
+    "or set up auto reload to continue."
+)
+
+
+def _is_openai_out_of_credits_message(message: str) -> bool:
+    return "out of credits" in message.lower()
 
 
 def _redact_log_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -182,7 +190,7 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
     @staticmethod
     def _fallback_handshake_error_message(status: int) -> str:
         if status == 402:
-            return "Your account is out of credits. Add credits to continue."
+            return _OPENAI_OUT_OF_CREDITS_MESSAGE
         if status in {401, 403}:
             return "You are not authorized to use this OpenAI endpoint."
         if status == 429:
@@ -201,10 +209,14 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
     ) -> str:
         header_message = cls._header_value(headers, _MESHAGENT_ERROR_MESSAGE_HEADER)
         if header_message is not None:
+            if status == 402 and _is_openai_out_of_credits_message(header_message):
+                return _OPENAI_OUT_OF_CREDITS_MESSAGE
             return header_message
 
         if message is not None and message.strip() != "":
             stripped_message = message.strip()
+            if status == 402 and _is_openai_out_of_credits_message(stripped_message):
+                return _OPENAI_OUT_OF_CREDITS_MESSAGE
             if stripped_message.lower() != "invalid response status":
                 return stripped_message
 
@@ -1345,8 +1357,36 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             error
         ).startswith("OpenAI websocket")
 
+    @staticmethod
+    def _is_openai_out_of_credits_message(message: str) -> bool:
+        return _is_openai_out_of_credits_message(message)
+
+    @classmethod
+    def _is_openai_out_of_credits_payload(cls, payload: dict[str, Any]) -> bool:
+        status = payload.get("status")
+        if status != 402:
+            return False
+
+        message = cls._websocket_error_payload_message(payload=payload)
+        if message is not None and cls._is_openai_out_of_credits_message(message):
+            return True
+
+        error = payload.get("error")
+        if not isinstance(error, dict):
+            return False
+
+        code = error.get("code")
+        return code == "insufficient_quota"
+
+    @classmethod
+    def _is_openai_out_of_credits_error(cls, *, error: RoomException) -> bool:
+        return error.status_code == 402 and cls._is_openai_out_of_credits_message(
+            str(error)
+        )
+
     def _is_retryable_room_error(self, *, error: RoomException) -> bool:
-        del error
+        if self._is_openai_out_of_credits_error(error=error):
+            return False
         return True
 
     @staticmethod
@@ -1675,6 +1715,21 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             code=ErrorCode.OPERATION_FAILED,
         )
 
+    @staticmethod
+    def _websocket_error_payload_message(*, payload: dict[str, Any]) -> str | None:
+        message = payload.get("message")
+        if isinstance(message, str):
+            return message
+
+        error = payload.get("error")
+        if not isinstance(error, dict):
+            return None
+
+        nested_message = error.get("message")
+        if isinstance(nested_message, str):
+            return nested_message
+        return None
+
     async def _receive_websocket_payload(
         self,
         *,
@@ -1700,8 +1755,10 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
 
                 if payload_type == "error":
                     status = payload.get("status")
-                    should_log_request_payload = self._log_requests or (
-                        isinstance(status, int)
+                    is_out_of_credits = self._is_openai_out_of_credits_payload(payload)
+                    should_log_request_payload = not is_out_of_credits and (
+                        self._log_requests
+                        or isinstance(status, int)
                         and not isinstance(status, bool)
                         and 400 <= status < 500
                     )
@@ -1711,14 +1768,14 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                             _safe_json_for_log(request_payload),
                         )
 
-                    message = payload.get("message")
-                    if not isinstance(message, str):
-                        error = payload.get("error")
-                        if isinstance(error, dict):
-                            nested_message = error.get("message")
-                            if isinstance(nested_message, str):
-                                message = nested_message
-                    if isinstance(message, str):
+                    message = self._websocket_error_payload_message(payload=payload)
+                    if is_out_of_credits:
+                        raise RoomException(
+                            _OPENAI_OUT_OF_CREDITS_MESSAGE,
+                            status_code=402,
+                            code=ErrorCode.INVALID_REQUEST,
+                        )
+                    if message is not None:
                         raise RoomException(f"Error from OpenAI websocket: {message}")
                     raise RoomException(
                         f"Error from OpenAI websocket: {json.dumps(payload)}"
