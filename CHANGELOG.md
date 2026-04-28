@@ -1,3 +1,9 @@
+## [0.39.1]
+- Added paged response models and `*_page` methods to the Python Meshagent client for users/rooms/mailboxes/routes/feeds/OAuth clients/scheduled tasks (each supporting `count`/`offset`/`filter` and returning `total`).
+- Updated existing Python list/get methods to use paged requests by default (default page-size behavior changed) and to accept paging/filter parameters.
+- Updated Python CLI list commands (feeds, mailboxes, rooms, routes, scheduled tasks) to add `--filter`, `--count`, and `--offset` flags and to pass them through to the new paged API methods.
+- Updated room-list CLI option handling to use `--count` for paging (with the previous `--limit` behavior adjusted/hidden).
+
 ## [0.39.0]
 - Updated Python CLI networking to use certifi-backed shared client sessions for consistent TLS behavior during fetches.
 - Updated WebSocket/response adapter HTTP session handling to use meshagent’s shared `new_client_session` instead of ad-hoc aiohttp sessions.
