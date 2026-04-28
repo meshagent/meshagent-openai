@@ -1,3 +1,15 @@
+## [0.39.0]
+- Updated Python CLI networking to use certifi-backed shared client sessions for consistent TLS behavior during fetches.
+- Updated WebSocket/response adapter HTTP session handling to use meshagent’s shared `new_client_session` instead of ad-hoc aiohttp sessions.
+- Added dataset SQL cancellation support to the dataset toolkit execution flow (including cancel status/results).
+- Expanded dataset index management capabilities (index configuration/remapping and index metadata support) end-to-end in Python tooling/clients.
+- Applied “database” -> “datasets” terminology and dataset refactor updates across Python dataset/tooling clients (breaking for prior database-named usage).
+- Added usage export and usage annotation plumbing for cost/billing reporting, including ClickHouse usage annotation/projection support and LLM tool usage instrumentation.
+- Extended LLM proxy support with “pipes” plus custom LLM usage tracking and pricing updates (including gpt-5.5 pricing).
+- Fixed async OAuth token exchange path in the Python CLI auth flow.
+- Added mailbox and route domain validation helpers to harden routing/mailbox configuration.
+- Added LLM agent turn lifecycle tracing instrumentation to improve observability/debugging.
+
 ## [0.38.4]
 - On Windows, meshagent-cli now uses `subprocess.list2cmdline` to correctly pass arguments when launching the Claude integration.
 - `meshagent image deploy` now supports `--wait/--no-wait` (wait enabled by default) to wait for deployment readiness, stream container logs, and verify route liveness when `--domain` is provided.
