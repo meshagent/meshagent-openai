@@ -1,3 +1,6 @@
+## [0.39.2]
+- Aligned meshagent-sdk Python package dependency pins to internal `meshagent-*` packages `0.39.1` (from `0.39.0`) including `meshagent-api`, `meshagent-agents`, `meshagent-tools`, `meshagent-openai`, `meshagent-anthropic`, `meshagent-llm-proxy`, and related components.
+
 ## [0.39.1]
 - Added paged response models and `*_page` methods to the Python Meshagent client for users/rooms/mailboxes/routes/feeds/OAuth clients/scheduled tasks (each supporting `count`/`offset`/`filter` and returning `total`).
 - Updated existing Python list/get methods to use paged requests by default (default page-size behavior changed) and to accept paging/filter parameters.
