@@ -23,6 +23,8 @@ from yarl import URL
 
 from meshagent.agents.adapter import ToolCallApprovalRequest
 from meshagent.agents.messages import (
+    AgentImageGenerationCompleted,
+    AgentImageGenerationStarted,
     AgentFileContentDelta,
     AgentFileContentEnded,
     AgentFileContentStarted,
@@ -39,7 +41,7 @@ from meshagent.agents.messages import (
 )
 from meshagent.api import RoomException
 from meshagent.api.error_codes import ErrorCode
-from meshagent.api.messaging import BinaryContent, FileContent, JsonContent, TextContent
+from meshagent.api.messaging import FileContent, JsonContent, TextContent
 from meshagent.computers.agent import ComputerToolkit
 from meshagent.computers.operator import Operator
 import meshagent.openai.tools.responses_adapter as responses_adapter_module
@@ -74,6 +76,20 @@ class _FakeParticipant:
         if key == "name":
             return "assistant"
         return None
+
+
+class _FakeImagesDataset:
+    def __init__(self):
+        self.save_calls: list[dict[str, object]] = []
+
+    async def save(self, **kwargs):
+        self.save_calls.append(kwargs)
+        return SimpleNamespace(
+            id="image-1",
+            mime_type=kwargs["mime_type"],
+            created_at="2026-05-05T00:00:00Z",
+            created_by=kwargs["created_by"],
+        )
 
 
 class _NamelessParticipant:
@@ -3198,7 +3214,7 @@ def test_make_agent_event_publisher_forwards_custom_events() -> None:
     ]
 
 
-def test_make_agent_event_publisher_emits_binary_image_generation_results() -> None:
+def test_make_agent_event_publisher_emits_image_generation_events() -> None:
     adapter = OpenAIResponsesAdapter(
         client=_FakeOpenAIClient(outcomes=[]),
         mode="request",
@@ -3243,21 +3259,113 @@ def test_make_agent_event_publisher_emits_binary_image_generation_results() -> N
     )
 
     assert [type(event) for event in published] == [
-        AgentToolCallStarted,
-        AgentToolCallEnded,
+        AgentImageGenerationStarted,
+        AgentImageGenerationCompleted,
     ]
 
-    ended = published[1]
-    assert isinstance(ended, AgentToolCallEnded)
-    assert isinstance(ended.result, BinaryContent)
-    assert ended.result.get_data() == b"fake-image-bytes"
-    assert ended.result.headers == {
-        "mime_type": "image/png",
+    started = published[0]
+    assert isinstance(started, AgentImageGenerationStarted)
+    assert started.item_id == "ig_1"
+    assert started.toolkit == "openai"
+    assert started.tool == "image_generation"
+    assert started.arguments == {
         "output_format": "png",
         "quality": "high",
         "size": "1024x1024",
-        "status": "completed",
     }
+
+    completed = published[1]
+    assert isinstance(completed, AgentImageGenerationCompleted)
+    assert completed.item_id == "ig_1"
+    assert completed.toolkit == "openai"
+    assert completed.tool == "image_generation"
+    assert completed.images[0].uri == f"data:image/png;base64,{encoded}"
+    assert completed.images[0].mime_type == "image/png"
+    assert completed.images[0].width == 1024
+    assert completed.images[0].height == 1024
+
+
+def test_make_agent_event_publisher_emits_persisted_image_generation_result() -> None:
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    publisher(
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "image_generation_call",
+                "id": "ig_1",
+                "status": "completed",
+                "output_format": "png",
+                "quality": "high",
+                "size": "1024x1024",
+                "images": [
+                    {
+                        "uri": "dataset://images?id=image-1",
+                        "mime_type": "image/png",
+                        "created_at": "2026-05-05T00:00:00Z",
+                        "created_by": "assistant",
+                        "width": 1024,
+                        "height": 1024,
+                        "status": "completed",
+                        "status_detail": "Image saved",
+                    }
+                ],
+            },
+        }
+    )
+
+    assert [type(event) for event in published] == [AgentImageGenerationCompleted]
+    completed = published[0]
+    assert isinstance(completed, AgentImageGenerationCompleted)
+    assert completed.item_id == "ig_1"
+    assert completed.images[0].uri == "dataset://images?id=image-1"
+    assert completed.images[0].width == 1024
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_adapter_persists_image_before_publishing_done_event() -> (
+    None
+):
+    images_dataset = _FakeImagesDataset()
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+        images_dataset=images_dataset,  # type: ignore[arg-type]
+    )
+    context = OpenAIResponsesSessionContext()
+    context.metadata["thread_id"] = "dataset://threads/main"
+    context.metadata["turn_id"] = "turn-1"
+    encoded = base64.b64encode(b"fake-image-bytes").decode("ascii")
+
+    payload = await adapter._persist_image_generation_output_item(
+        context=context,
+        caller=_FakeParticipant(),
+        item={
+            "type": "image_generation_call",
+            "id": "ig_1",
+            "status": "completed",
+            "output_format": "png",
+            "quality": "high",
+            "size": "1024x1024",
+            "result": encoded,
+        },
+    )
+
+    assert len(images_dataset.save_calls) == 1
+    assert images_dataset.save_calls[0]["data"] == b"fake-image-bytes"
+    assert "result" not in payload
+    assert payload["images"][0]["uri"] == "dataset://images?id=image-1"
+    assert payload["images"][0]["width"] == 1024
 
 
 def test_make_agent_event_publisher_preserves_text_delta_whitespace() -> None:
@@ -3638,12 +3746,16 @@ def test_make_agent_event_publisher_emits_web_search_tool_events() -> None:
     ]
     started = published[0]
     assert isinstance(started, AgentToolCallStarted)
+    assert started.namespace == "openai.responses"
+    assert started.call_id is None
     assert started.toolkit == "openai"
     assert started.tool == "web_search"
     assert started.arguments == {"queries": ["meshagent"]}
 
     ended = published[1]
     assert isinstance(ended, AgentToolCallEnded)
+    assert ended.namespace == "openai.responses"
+    assert ended.call_id is None
     assert isinstance(ended.result, JsonContent)
     assert ended.result.json == {"results": [{"title": "MeshAgent"}]}
 
@@ -3756,18 +3868,24 @@ def test_make_agent_event_publisher_emits_shell_tool_events() -> None:
 
     shell_pending = published[0]
     assert isinstance(shell_pending, AgentToolCallPending)
+    assert shell_pending.namespace == "openai.responses"
+    assert shell_pending.call_id == "call_1"
     assert shell_pending.toolkit == "openai"
     assert shell_pending.tool == "shell"
     assert shell_pending.arguments == {"action": {"command": ["echo", "hi"]}}
 
     shell_started = published[1]
     assert isinstance(shell_started, AgentToolCallStarted)
+    assert shell_started.namespace == "openai.responses"
+    assert shell_started.call_id == "call_1"
     assert shell_started.toolkit == "openai"
     assert shell_started.tool == "shell"
     assert shell_started.arguments == {"action": {"command": ["echo", "hi"]}}
 
     shell_ended = published[2]
     assert isinstance(shell_ended, AgentToolCallEnded)
+    assert shell_ended.namespace == "openai.responses"
+    assert shell_ended.call_id == "call_1"
     assert isinstance(shell_ended.result, JsonContent)
     assert shell_ended.result.json == {
         "output": [
@@ -3781,18 +3899,24 @@ def test_make_agent_event_publisher_emits_shell_tool_events() -> None:
 
     local_shell_pending = published[3]
     assert isinstance(local_shell_pending, AgentToolCallPending)
+    assert local_shell_pending.namespace == "openai.responses"
+    assert local_shell_pending.call_id == "call_2"
     assert local_shell_pending.toolkit == "openai"
     assert local_shell_pending.tool == "local_shell"
     assert local_shell_pending.arguments == {"action": {"command": "echo hi"}}
 
     local_shell_started = published[4]
     assert isinstance(local_shell_started, AgentToolCallStarted)
+    assert local_shell_started.namespace == "openai.responses"
+    assert local_shell_started.call_id == "call_2"
     assert local_shell_started.toolkit == "openai"
     assert local_shell_started.tool == "local_shell"
     assert local_shell_started.arguments == {"action": {"command": "echo hi"}}
 
     local_shell_ended = published[5]
     assert isinstance(local_shell_ended, AgentToolCallEnded)
+    assert local_shell_ended.namespace == "openai.responses"
+    assert local_shell_ended.call_id == "call_2"
     assert isinstance(local_shell_ended.result, TextContent)
     assert local_shell_ended.result.text == "hi\n"
 

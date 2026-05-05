@@ -10,6 +10,7 @@ from meshagent.agents.event_publisher import (
     _OpenAIAgentEventPublisher,
     make_openai_agent_event_publisher,
 )
+from meshagent.agents.images_dataset import ImagesDataset
 from meshagent.agents.messages import AgentMessage, ToolChoice
 from meshagent.agents.mcp import MCPServerConfig, MCPToolkitClientOptions
 from meshagent.tools import (
@@ -879,6 +880,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         api_key: str | None = None,
         user_agent: str | None = None,
         annotations: Mapping[str, object] | None = None,
+        images_dataset: ImagesDataset | None = None,
         max_tool_call_length: int = DEFAULT_MAX_TOOL_CALL_LENGTH,
         max_tool_call_lines: int = DEFAULT_MAX_TOOL_CALL_LINES,
     ):
@@ -934,10 +936,14 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         self._websocket_timeout = websocket_timeout
         self._max_tool_call_length = max_tool_call_length
         self._max_tool_call_lines = max_tool_call_lines
+        self._images_dataset = images_dataset
         self._tool_call_approval_handler: ToolCallApprovalHandler | None = None
 
     def default_model(self) -> str:
         return self._model
+
+    def set_images_dataset(self, images_dataset: ImagesDataset | None) -> None:
+        self._images_dataset = images_dataset
 
     def set_tool_call_approval_handler(
         self, handler: ToolCallApprovalHandler | None
@@ -974,6 +980,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             api_key=resolved_api_key,
             user_agent=self._user_agent,
             annotations=self._annotations,
+            images_dataset=self._images_dataset,
             max_tool_call_length=self._max_tool_call_length,
             max_tool_call_lines=self._max_tool_call_lines,
         )
@@ -1406,6 +1413,110 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         if turn_id is None:
             return "llm.retry"
         return f"llm.retry:{turn_id}"
+
+    @staticmethod
+    def _image_dimensions_from_size(size: object) -> tuple[int | None, int | None]:
+        if not isinstance(size, str):
+            return None, None
+        match = re.fullmatch(r"\s*(\d+)\s*x\s*(\d+)\s*", size)
+        if match is None:
+            return None, None
+        return int(match.group(1)), int(match.group(2))
+
+    @staticmethod
+    def _participant_name(participant: Participant) -> str:
+        name = participant.get_attribute("name")
+        if isinstance(name, str):
+            return name
+        return ""
+
+    async def _persist_image_generation_output_item(
+        self,
+        *,
+        context: AgentSessionContext,
+        caller: Participant,
+        item: dict[str, Any],
+    ) -> dict[str, Any]:
+        images_dataset = self._images_dataset
+        if images_dataset is None:
+            return item
+        if item.get("type") != "image_generation_call":
+            return item
+        result = item.get("result")
+        if not isinstance(result, str) or result.strip() == "":
+            return item
+
+        try:
+            image_bytes = base64.b64decode(result)
+        except Exception:
+            return item
+
+        output_format = item.get("output_format")
+        mime_type = (
+            f"image/{output_format.strip().lower()}"
+            if isinstance(output_format, str) and output_format.strip() != ""
+            else "image/png"
+        )
+        if mime_type == "image/jpg":
+            mime_type = "image/jpeg"
+
+        item_id = item.get("id")
+        annotations: dict[str, str] = {"source": "openai.responses"}
+        for key in ("background", "output_format", "quality", "size", "status"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip() != "":
+                annotations[key] = value.strip()
+        if isinstance(item_id, str) and item_id.strip() != "":
+            annotations["item_id"] = item_id.strip()
+        thread_id = self._session_metadata_string(context=context, key="thread_id")
+        if thread_id is not None:
+            annotations["thread_id"] = thread_id
+        turn_id = self._session_metadata_string(context=context, key="turn_id")
+        if turn_id is not None:
+            annotations["turn_id"] = turn_id
+
+        saved_image = await images_dataset.save(
+            data=image_bytes,
+            mime_type=mime_type,
+            created_by=self._participant_name(caller),
+            annotations=annotations,
+        )
+        width, height = self._image_dimensions_from_size(item.get("size"))
+        persisted_item = dict(item)
+        persisted_item.pop("result", None)
+        persisted_item["images"] = [
+            {
+                "uri": f"dataset://{ImagesDataset.TABLE_NAME}?id={saved_image.id}",
+                "mime_type": saved_image.mime_type,
+                "created_at": saved_image.created_at,
+                "created_by": saved_image.created_by,
+                "width": width,
+                "height": height,
+                "status": "completed",
+                "status_detail": "Image saved",
+            }
+        ]
+        return persisted_item
+
+    async def _prepare_stream_event_for_publish(
+        self,
+        *,
+        context: AgentSessionContext,
+        caller: Participant,
+        event: ResponseStreamEvent,
+    ) -> dict[str, Any]:
+        payload = event.model_dump(mode="json")
+        if event.type != "response.output_item.done":
+            return payload
+        item = payload.get("item")
+        if not isinstance(item, dict):
+            return payload
+        payload["item"] = await self._persist_image_generation_output_item(
+            context=context,
+            caller=caller,
+            item=item,
+        )
+        return payload
 
     def _retry_headline(
         self,
@@ -2378,9 +2489,14 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                             )
 
                                                             try:
+                                                                publish_handler_events = (
+                                                                    message.type
+                                                                    != "image_generation_call"
+                                                                )
                                                                 if (
                                                                     event_handler
                                                                     is not None
+                                                                    and publish_handler_events
                                                                 ):
                                                                     event_handler(
                                                                         {
@@ -2444,6 +2560,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                             if (
                                                                 event_handler
                                                                 is not None
+                                                                and publish_handler_events
                                                             ):
                                                                 done_item = result
                                                                 if isinstance(
@@ -2633,9 +2750,12 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                     )
                                                     and event_handler is not None
                                                 ):
-                                                    event_handler(
-                                                        event.model_dump(mode="json")
+                                                    event_payload = await self._prepare_stream_event_for_publish(
+                                                        context=context,
+                                                        caller=caller,
+                                                        event=event,
                                                     )
+                                                    event_handler(event_payload)
 
                                                 if event.type == "response.completed":
                                                     if restart_after_tool_boundary:
