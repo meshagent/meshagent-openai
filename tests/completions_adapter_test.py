@@ -101,6 +101,44 @@ def test_store_usage_publishes_otel_usage_metrics(monkeypatch: pytest.MonkeyPatc
             "annotations": {"env": "prod"},
         }
     ]
+    assert context.metadata["last_response_flattened_usage"] == {
+        "input_tokens": 6.0,
+        "output_tokens": 2.0,
+    }
+    assert context.metadata["last_response_context_used_tokens"] == 8
+
+
+def test_store_usage_splits_cached_prompt_tokens() -> None:
+    adapter = OpenAICompletionsAdapter(
+        model="gpt-4o-mini",
+        client=object(),
+    )
+    context = adapter.create_session()
+
+    adapter._store_usage(
+        context=context,
+        usage={
+            "prompt_tokens": 5084,
+            "prompt_tokens_details": {"cached_tokens": 4864},
+            "completion_tokens": 2,
+            "total_tokens": 5086,
+        },
+        model="gpt-4o-mini",
+    )
+
+    assert context.metadata["last_response_flattened_usage"] == {
+        "cached_tokens": 4864.0,
+        "input_tokens": 220.0,
+        "output_tokens": 2.0,
+        "total_tokens": 5086.0,
+    }
+    assert context.metadata["last_response_context_used_tokens"] == 5086
+    assert context.usage == {
+        "cached_tokens": 4864.0,
+        "input_tokens": 220.0,
+        "output_tokens": 2.0,
+        "total_tokens": 5086.0,
+    }
 
 
 class _BlockingTool(FunctionTool):
@@ -420,6 +458,67 @@ async def test_next_consumes_streaming_tool_events_and_uses_final_item_result():
     assert context.turn_count == 1
     assert context.usage == {"input_tokens": 7.0, "output_tokens": 4.0}
     assert events == [{"type": "agent.event", "headline": "working"}]
+
+
+@pytest.mark.asyncio
+async def test_next_accumulates_cached_usage_across_tool_loop_calls() -> None:
+    adapter = OpenAICompletionsAdapter(
+        model="gpt-4o-mini",
+        client=_FakeOpenAIClient(
+            responses=[
+                _FakeChatCompletion(
+                    message=_FakeMessage(
+                        tool_calls=[
+                            _FakeToolCall(
+                                tool_call_id="call_1",
+                                name="stream_tool",
+                                arguments={},
+                            )
+                        ],
+                        content=None,
+                    ),
+                    usage={
+                        "prompt_tokens": 5084,
+                        "prompt_tokens_details": {"cached_tokens": 4864},
+                        "completion_tokens": 2,
+                        "total_tokens": 5086,
+                    },
+                ),
+                _FakeChatCompletion(
+                    message=_FakeMessage(tool_calls=None, content="done"),
+                    usage={
+                        "prompt_tokens": 120,
+                        "prompt_tokens_details": {"cached_tokens": 64},
+                        "completion_tokens": 3,
+                        "total_tokens": 123,
+                    },
+                ),
+            ]
+        ),
+    )
+    context = adapter.create_session()
+    context.append_user_message("run tool")
+
+    result = await adapter.next(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        toolkits=[Toolkit(name="tools", tools=[_StreamingTool()])],
+    )
+
+    assert result == "done"
+    assert context.usage == {
+        "cached_tokens": 4928.0,
+        "input_tokens": 276.0,
+        "output_tokens": 5.0,
+        "total_tokens": 5209.0,
+    }
+    assert context.metadata["last_response_flattened_usage"] == {
+        "cached_tokens": 64.0,
+        "input_tokens": 56.0,
+        "output_tokens": 3.0,
+        "total_tokens": 123.0,
+    }
+    assert context.metadata["last_response_context_used_tokens"] == 123
 
 
 @pytest.mark.asyncio

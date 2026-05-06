@@ -65,7 +65,11 @@ from meshagent.openai.proxy import (
 )
 from openai import AsyncOpenAI, NOT_GIVEN, APIError, APIStatusError
 from openai._models import construct_type
-from openai.types.responses import ResponseFunctionToolCall, ResponseStreamEvent
+from openai.types.responses import (
+    Response,
+    ResponseFunctionToolCall,
+    ResponseStreamEvent,
+)
 import os
 from typing import Optional, Callable
 import base64
@@ -850,7 +854,8 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
     _context_window_sizes = {
         "gpt-4.1": 128000,
         "gpt-4o": 128000,
-        "gpt-5": 128000,
+        "gpt-5.4": 272000,
+        "gpt-5": 400000,
         "o1": 200000,
         "o3": 200000,
         "o4": 200000,
@@ -1045,31 +1050,37 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                 return size
         return float("inf")
 
+    def context_management_mode(self) -> str | None:
+        return self._context_management_mode
+
+    def compaction_threshold(self, model: str) -> int | None:
+        return self._effective_compaction_threshold(model=model)
+
     def needs_compaction(self, *, context: AgentSessionContext) -> bool:
         if self._context_management_mode != "standalone":
             return False
-        if self._compaction_threshold is None:
-            return False
-        usage = context.metadata.get("last_response_usage")
-        if not usage:
+        context_used_tokens = context.metadata.get("last_response_context_used_tokens")
+        if not isinstance(context_used_tokens, int | float) or not math.isfinite(
+            context_used_tokens
+        ):
             return False
 
-        threshold = self._compaction_threshold
         model = context.metadata.get("last_response_model", self.default_model())
+        threshold = self._effective_compaction_threshold(model=model)
+        if threshold is None:
+            return False
+
+        return int(context_used_tokens) > threshold
+
+    def _effective_compaction_threshold(self, *, model: str) -> int | None:
+        threshold = self._compaction_threshold
+        if threshold is None:
+            return None
         context_window = self.context_window_size(model)
         if context_window != float("inf") and self.max_output_tokens is not None:
             usable = int(context_window - self.max_output_tokens)
-            if usable <= 0:
-                return True
-            threshold = min(threshold, usable)
-
-        input_tokens = int(usage.get("input_tokens", 0) or 0)
-        cached_tokens = int(
-            usage.get("input_tokens_details", {}).get("cached_tokens", 0) or 0
-        )
-        output_tokens = int(usage.get("output_tokens", 0) or 0)
-        total = input_tokens + cached_tokens + output_tokens
-        return total > threshold
+            threshold = min(threshold, max(0, usable))
+        return threshold
 
     def _create_kwargs_has_computer_tool(
         self, *, create_kwargs: dict[str, Any]
@@ -1087,10 +1098,13 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                 return True
         return False
 
-    def _add_auto_compaction_entry(self, *, create_kwargs: dict[str, Any]) -> None:
+    def _add_auto_compaction_entry(
+        self, *, create_kwargs: dict[str, Any], model: str
+    ) -> None:
         if self._context_management_mode != "auto":
             return
-        if self._compaction_threshold is None:
+        threshold = self._effective_compaction_threshold(model=model)
+        if threshold is None:
             return
         if self._create_kwargs_has_computer_tool(create_kwargs=create_kwargs):
             return
@@ -1098,7 +1112,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         context_management = create_kwargs.get("context_management")
         compaction_entry: dict[str, Any] = {
             "type": "compaction",
-            "compact_threshold": self._compaction_threshold,
+            "compact_threshold": threshold,
         }
 
         if context_management in (None, NOT_GIVEN):
@@ -1116,7 +1130,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             if isinstance(entry, dict) and entry.get("type") == "compaction":
                 normalized_entry = {
                     **entry,
-                    "compact_threshold": self._compaction_threshold,
+                    "compact_threshold": threshold,
                 }
                 normalized_entries.append(normalized_entry)
                 has_compaction_entry = True
@@ -1127,6 +1141,13 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             normalized_entries.append(compaction_entry)
 
         create_kwargs["context_management"] = normalized_entries
+
+    @staticmethod
+    def _response_has_compaction_output(response: Response) -> bool:
+        for item in response.output:
+            if item.type == "compaction":
+                return True
+        return False
 
     async def compact(
         self,
@@ -1161,10 +1182,18 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         if usage is not None:
             context.metadata["last_compaction_usage"] = usage
         context.metadata.pop("last_response_usage", None)
+        context.metadata.pop("last_response_flattened_usage", None)
+        context.metadata.pop("last_response_context_used_tokens", None)
         context.metadata.pop("last_response_model", None)
 
     def _store_usage(
-        self, *, context: AgentSessionContext, usage: object, model: str
+        self,
+        *,
+        context: AgentSessionContext,
+        usage: object,
+        model: str,
+        compacted: bool = False,
+        compaction_threshold: int | None = None,
     ) -> None:
         usage_dict = normalize_openai_usage(usage)
         if usage_dict is None:
@@ -1172,16 +1201,37 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
 
         context.metadata["last_response_usage"] = usage_dict
         context.metadata["last_response_model"] = model
+        if compacted and compaction_threshold is not None:
+            context.metadata["last_response_compaction_threshold"] = (
+                compaction_threshold
+            )
+        else:
+            context.metadata.pop("last_response_compaction_threshold", None)
 
         flattened_usage = preprocess_openai_usage(model=model, usage=usage_dict)
         if flattened_usage is None:
             return
+        context.metadata["last_response_flattened_usage"] = dict(flattened_usage)
+        context.metadata["last_response_context_used_tokens"] = (
+            self._context_used_tokens_from_usage(flattened_usage)
+        )
         add_usage_metrics(totals=context.usage, usage=flattened_usage)
         track_otel_usage_metrics(
             model=model,
             provider="openai",
             tokens=flattened_usage,
             annotations=self._annotations,
+        )
+
+    @staticmethod
+    def _context_used_tokens_from_usage(usage: dict[str, float]) -> int:
+        return max(
+            0,
+            int(
+                usage.get("input_tokens", 0.0)
+                + usage.get("cached_tokens", 0.0)
+                + usage.get("output_tokens", 0.0)
+            ),
         )
 
     def _should_publish_stream_event(self, *, event: ResponseStreamEvent) -> bool:
@@ -1236,6 +1286,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             }
 
         response = await openai.responses.input_tokens.count(
+            model=model,
             tools=open_ai_tools,
             instructions=self._compose_instructions(context=context),
             input=context.messages,
@@ -2234,7 +2285,10 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                 )
                             )
                             create_kwargs["extra_headers"] = normalized_extra_headers
-                            self._add_auto_compaction_entry(create_kwargs=create_kwargs)
+                            self._add_auto_compaction_entry(
+                                create_kwargs=create_kwargs,
+                                model=model,
+                            )
                             response: Content | None = None
                             if not stream:
                                 if self._mode == "websocket":
@@ -2255,10 +2309,17 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                             if self._mode == "request" and not stream:
                                 if response is None:
                                     raise RuntimeError("response must be available")
+                                response_compacted = (
+                                    self._response_has_compaction_output(response)
+                                )
                                 self._store_usage(
                                     context=context,
                                     usage=response.usage,
                                     model=model,
+                                    compacted=response_compacted,
+                                    compaction_threshold=self._effective_compaction_threshold(
+                                        model=model
+                                    ),
                                 )
 
                             async def handle_message(message: BaseModel):
@@ -2587,12 +2648,15 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
 
                                                             return [], False
 
-                                            if message.type == "reasoning":
+                                            if message.type in {
+                                                "compaction",
+                                                "reasoning",
+                                            }:
                                                 logger.debug(
                                                     "OpenAI response handler was not "
-                                                    "registered for reasoning; "
-                                                    "reasoning content is handled "
-                                                    "through stream callbacks"
+                                                    "registered for %s; the item is "
+                                                    "handled through response state",
+                                                    message.type,
                                                 )
                                             else:
                                                 logger.warning(
@@ -2759,10 +2823,17 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
 
                                                 if event.type == "response.completed":
                                                     if restart_after_tool_boundary:
+                                                        response_compacted = self._response_has_compaction_output(
+                                                            event.response
+                                                        )
                                                         self._store_usage(
                                                             context=context,
                                                             usage=event.response.usage,
                                                             model=model,
+                                                            compacted=response_compacted,
+                                                            compaction_threshold=self._effective_compaction_threshold(
+                                                                model=model
+                                                            ),
                                                         )
                                                         break
                                                     context.track_response(
@@ -2774,10 +2845,17 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                             for output in event.response.output
                                                         ]
                                                     )
+                                                    response_compacted = self._response_has_compaction_output(
+                                                        event.response
+                                                    )
                                                     self._store_usage(
                                                         context=context,
                                                         usage=event.response.usage,
                                                         model=model,
+                                                        compacted=response_compacted,
+                                                        compaction_threshold=self._effective_compaction_threshold(
+                                                            model=model
+                                                        ),
                                                     )
 
                                                     context.messages.extend(all_outputs)
@@ -2899,6 +2977,32 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
 
                                                 if len(final_outputs) > 0:
                                                     return final_outputs[0]
+
+                                                if event.type == "response.incomplete":
+                                                    context.track_response(
+                                                        event.response.id
+                                                    )
+                                                    context.previous_messages.extend(
+                                                        [
+                                                            output.to_dict()
+                                                            for output in event.response.output
+                                                        ]
+                                                    )
+                                                    response_compacted = self._response_has_compaction_output(
+                                                        event.response
+                                                    )
+                                                    self._store_usage(
+                                                        context=context,
+                                                        usage=event.response.usage,
+                                                        model=model,
+                                                        compacted=response_compacted,
+                                                        compaction_threshold=self._effective_compaction_threshold(
+                                                            model=model
+                                                        ),
+                                                    )
+                                                    context.messages.extend(all_outputs)
+                                                    iteration_committed = True
+                                                    return ""
                                         if restart_after_tool_boundary:
                                             response = None
                                             continue

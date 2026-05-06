@@ -73,13 +73,17 @@ def preprocess_openai_usage(
     if not isinstance(input_details, dict):
         input_details = usage.get("input_tokens_details")
         if not isinstance(input_details, dict):
-            input_details = None
+            input_details = usage.get("prompt_tokens_details")
+            if not isinstance(input_details, dict):
+                input_details = None
 
     output_details = usage.get("output_token_details")
     if not isinstance(output_details, dict):
         output_details = usage.get("output_tokens_details")
         if not isinstance(output_details, dict):
-            output_details = None
+            output_details = usage.get("completion_tokens_details")
+            if not isinstance(output_details, dict):
+                output_details = None
 
     out: dict[str, float] = {}
     saw_modal_details = False
@@ -155,12 +159,26 @@ def preprocess_openai_usage(
 
         return out
 
+    aggregate_input = _to_float(usage.get("input_tokens"))
+    if aggregate_input is None:
+        aggregate_input = _to_float(usage.get("prompt_tokens"))
+    if input_details is not None:
+        cached_total = _to_float(input_details.get("cached_tokens"))
+        if cached_total is not None and cached_total > 0:
+            out["cached_tokens"] = cached_total
+            if aggregate_input is not None:
+                uncached_input = max(0.0, aggregate_input - cached_total)
+                if uncached_input > 0:
+                    out["input_tokens"] = uncached_input
+
     for key, value in flattened.items():
         normalized_key = key
         if normalized_key == "prompt_tokens":
             normalized_key = "input_tokens"
         if normalized_key == "completion_tokens":
             normalized_key = "output_tokens"
+        if normalized_key in out:
+            continue
         out[normalized_key] = float(value)
 
     return out

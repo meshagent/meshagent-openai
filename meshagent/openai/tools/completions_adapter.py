@@ -355,12 +355,27 @@ class OpenAICompletionsAdapter(LLMAdapter):
         flattened_usage = preprocess_openai_usage(model=model, usage=usage_dict)
         if flattened_usage is None:
             return
+        context.metadata["last_response_flattened_usage"] = dict(flattened_usage)
+        context.metadata["last_response_context_used_tokens"] = (
+            self._context_used_tokens_from_usage(flattened_usage)
+        )
         add_usage_metrics(totals=context.usage, usage=flattened_usage)
         track_otel_usage_metrics(
             model=model,
             provider="openai",
             tokens=flattened_usage,
             annotations=self._annotations,
+        )
+
+    @staticmethod
+    def _context_used_tokens_from_usage(usage: dict[str, float]) -> int:
+        return max(
+            0,
+            int(
+                usage.get("input_tokens", 0.0)
+                + usage.get("cached_tokens", 0.0)
+                + usage.get("output_tokens", 0.0)
+            ),
         )
 
     def _make_tool_response_adapter(self) -> OpenAICompletionsToolResponseAdapter:

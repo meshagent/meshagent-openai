@@ -23,6 +23,10 @@ from yarl import URL
 
 from meshagent.agents.adapter import ToolCallApprovalRequest
 from meshagent.agents.messages import (
+    AGENT_EVENT_CONTEXT_COMPACTED,
+    AGENT_EVENT_THREAD_EVENT,
+    AgentContextCompacted,
+    AgentThreadEvent,
     AgentImageGenerationCompleted,
     AgentImageGenerationStarted,
     AgentFileContentDelta,
@@ -147,13 +151,19 @@ def test_store_usage_publishes_otel_usage_metrics(monkeypatch: pytest.MonkeyPatc
             "model": "gpt-5-mini",
             "provider": "openai",
             "tokens": {
-                "input_tokens": 11.0,
+                "input_tokens": 7.0,
                 "output_tokens": 7.0,
                 "cached_tokens": 4.0,
             },
             "annotations": {"env": "prod"},
         }
     ]
+    assert context.metadata["last_response_flattened_usage"] == {
+        "input_tokens": 7.0,
+        "output_tokens": 7.0,
+        "cached_tokens": 4.0,
+    }
+    assert context.metadata["last_response_context_used_tokens"] == 18
 
 
 class _FakeRoom:
@@ -562,6 +572,36 @@ class _FakeCompletedEvent:
         return self.model_dump(mode="json")
 
 
+class _FakeIncompleteEvent:
+    def __init__(self, *, response: _FakeResponse):
+        self.type = "response.incomplete"
+        self.response = response
+
+    def model_dump(self, *, mode: str = "json") -> dict:
+        del mode
+        return {
+            "type": self.type,
+            "response": self.response.to_dict(),
+        }
+
+    def to_dict(self) -> dict:
+        return self.model_dump(mode="json")
+
+
+class _FakeOutputItem:
+    def __init__(self, **payload: object):
+        self._payload = payload
+        self.type = payload["type"]
+
+    def model_dump(self, *, mode: str = "json", **kwargs) -> dict:
+        del mode
+        del kwargs
+        return dict(self._payload)
+
+    def to_dict(self, *, mode: str = "json") -> dict:
+        return self.model_dump(mode=mode)
+
+
 class _FailingStream:
     def __init__(self, *, error: Exception):
         self._error = error
@@ -955,6 +995,7 @@ async def test_get_input_tokens_does_not_require_room() -> None:
 
     assert input_tokens == 42
     assert len(counter.calls) == 1
+    assert counter.calls[0]["model"] == "gpt-4o-mini"
     assert counter.calls[0]["input"] == context.messages
 
 
@@ -1012,6 +1053,15 @@ def test_constructor_disables_compaction_when_threshold_is_infinity():
     assert adapter._compaction_threshold is None
 
 
+def test_context_window_size_uses_specific_gpt_5_family_windows():
+    adapter = OpenAIResponsesAdapter()
+
+    assert adapter.context_window_size("gpt-5") == 400000
+    assert adapter.context_window_size("gpt-5.2") == 400000
+    assert adapter.context_window_size("gpt-5.5") == 400000
+    assert adapter.context_window_size("gpt-5.4") == 272000
+
+
 def test_constructor_rejects_invalid_context_management_mode():
     with pytest.raises(
         ValueError,
@@ -1042,6 +1092,7 @@ async def test_next_uses_websocket_path_when_mode_is_websocket(monkeypatch):
                         "input_tokens": 12,
                         "output_tokens": 4,
                         "input_tokens_details": {"cached_tokens": 3},
+                        "total_tokens": 16,
                     },
                 )
             )
@@ -1064,10 +1115,12 @@ async def test_next_uses_websocket_path_when_mode_is_websocket(monkeypatch):
     assert context.turn_count == 1
     assert context.metadata["last_response_usage"]["input_tokens"] == 12
     assert context.usage == {
-        "input_tokens": 12.0,
+        "input_tokens": 9.0,
         "output_tokens": 4.0,
         "cached_tokens": 3.0,
+        "total_tokens": 16.0,
     }
+    assert context.metadata["last_response_context_used_tokens"] == 16
 
 
 @pytest.mark.asyncio
@@ -1082,6 +1135,7 @@ async def test_next_tracks_usage_for_non_streaming_request_mode():
                         "input_tokens": 9,
                         "output_tokens": 2,
                         "input_tokens_details": {"cached_tokens": 5},
+                        "total_tokens": 11,
                     },
                 )
             ]
@@ -1100,10 +1154,12 @@ async def test_next_tracks_usage_for_non_streaming_request_mode():
     assert context.turn_count == 1
     assert context.metadata["last_response_usage"]["input_tokens"] == 9
     assert context.usage == {
-        "input_tokens": 9.0,
+        "input_tokens": 4.0,
         "output_tokens": 2.0,
         "cached_tokens": 5.0,
+        "total_tokens": 11.0,
     }
+    assert context.metadata["last_response_context_used_tokens"] == 11
 
 
 @pytest.mark.asyncio
@@ -1236,6 +1292,7 @@ async def test_next_tracks_usage_for_streaming_request_mode():
                                 "input_tokens": 11,
                                 "output_tokens": 7,
                                 "input_tokens_details": {"cached_tokens": 4},
+                                "total_tokens": 18,
                             },
                         )
                     )
@@ -1259,10 +1316,73 @@ async def test_next_tracks_usage_for_streaming_request_mode():
     assert events[0]["type"] == "response.completed"
     assert context.metadata["last_response_usage"]["output_tokens"] == 7
     assert context.usage == {
-        "input_tokens": 11.0,
+        "input_tokens": 7.0,
         "output_tokens": 7.0,
         "cached_tokens": 4.0,
+        "total_tokens": 18.0,
     }
+    assert context.metadata["last_response_context_used_tokens"] == 18
+
+
+@pytest.mark.asyncio
+async def test_next_commits_response_state_when_stream_ends_incomplete_after_compaction():
+    compaction_item = _FakeOutputItem(
+        type="compaction",
+        encrypted_content="opaque",
+        status="completed",
+    )
+    response = _FakeResponse(
+        response_id="resp_incomplete_compaction",
+        output=[compaction_item],
+        usage={
+            "input_tokens": 20,
+            "output_tokens": 3,
+            "input_tokens_details": {"cached_tokens": 2},
+        },
+    )
+    adapter = OpenAIResponsesAdapter(
+        mode="request",
+        client=_FakeOpenAIClient(
+            outcomes=[
+                _EventStream(
+                    events=[
+                        _FakeOutputItemDoneEvent(item=compaction_item),
+                        _FakeIncompleteEvent(response=response),
+                    ]
+                )
+            ]
+        ),
+    )
+    context = adapter.create_session()
+    context.append_user_message("hello")
+    events: list[dict] = []
+
+    result = await adapter.next(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        toolkits=[],
+        event_handler=events.append,
+    )
+
+    assert result == ""
+    assert context.previous_response_id == "resp_incomplete_compaction"
+    assert context.messages == []
+    assert context.previous_messages[-1] == {
+        "type": "compaction",
+        "encrypted_content": "opaque",
+        "status": "completed",
+    }
+    assert context.metadata["last_response_usage"]["input_tokens"] == 20
+    assert context.metadata["last_response_compaction_threshold"] == 200000
+    assert context.usage == {
+        "input_tokens": 18.0,
+        "output_tokens": 3.0,
+        "cached_tokens": 2.0,
+    }
+    assert [event["type"] for event in events] == [
+        "response.output_item.done",
+        "response.incomplete",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1366,6 +1486,49 @@ async def test_next_uses_auto_compaction_context_management_when_compaction_thre
     assert create_kwargs["context_management"] == [
         {"type": "compaction", "compact_threshold": 10000}
     ]
+
+
+@pytest.mark.asyncio
+async def test_next_marks_usage_when_response_contains_auto_compaction() -> None:
+    compaction_item = _FakeOutputItem(
+        type="compaction",
+        encrypted_content="opaque",
+        status="completed",
+    )
+    client = _FakeOpenAIClient(
+        outcomes=[
+            _FakeResponse(
+                response_id="resp_auto_compacted",
+                output=[compaction_item],
+                usage={"input_tokens": 20000, "output_tokens": 10},
+            )
+        ]
+    )
+    adapter = OpenAIResponsesAdapter(
+        client=client,
+        mode="request",
+        compaction_threshold=10000,
+        max_output_tokens=500,
+    )
+    context = adapter.create_session()
+    context.append_user_message("hello")
+
+    result = await adapter.next(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        toolkits=[],
+    )
+
+    assert result == ""
+    assert context.metadata["last_response_usage"] == {
+        "input_tokens": 20000,
+        "output_tokens": 10,
+    }
+    assert context.metadata["last_response_compaction_threshold"] == 10000
+    assert context.usage == {
+        "input_tokens": 20000.0,
+        "output_tokens": 10.0,
+    }
 
 
 @pytest.mark.asyncio
@@ -1528,6 +1691,36 @@ async def test_next_uses_auto_compaction_by_default(monkeypatch):
     ]
 
 
+def test_needs_compaction_uses_adapter_context_used_tokens():
+    adapter = OpenAIResponsesAdapter(
+        mode="request",
+        context_management="standalone",
+        compaction_threshold=200,
+    )
+    context = adapter.create_session()
+    context.metadata["last_response_context_used_tokens"] = 330
+    context.metadata["last_response_model"] = "gpt-5.2"
+
+    assert adapter.needs_compaction(context=context)
+
+
+def test_needs_compaction_ignores_raw_usage_without_flattened_usage():
+    adapter = OpenAIResponsesAdapter(
+        mode="request",
+        context_management="standalone",
+        compaction_threshold=200,
+    )
+    context = adapter.create_session()
+    context.metadata["last_response_usage"] = {
+        "input_tokens": 100,
+        "input_tokens_details": {"cached_tokens": 200},
+        "output_tokens": 30,
+    }
+    context.metadata["last_response_model"] = "gpt-5.2"
+
+    assert not adapter.needs_compaction(context=context)
+
+
 @pytest.mark.asyncio
 async def test_next_uses_manual_compaction_in_standalone_mode(monkeypatch):
     client = _FakeOpenAIClient(
@@ -1545,6 +1738,11 @@ async def test_next_uses_manual_compaction_in_standalone_mode(monkeypatch):
         "input_tokens_details": {"cached_tokens": 0},
         "output_tokens": 1000,
     }
+    context.metadata["last_response_flattened_usage"] = {
+        "input_tokens": 300000,
+        "output_tokens": 1000,
+    }
+    context.metadata["last_response_context_used_tokens"] = 301000
     context.metadata["last_response_model"] = "gpt-5.2"
     compact_call_count = {"count": 0}
 
@@ -3919,6 +4117,107 @@ def test_make_agent_event_publisher_emits_shell_tool_events() -> None:
     assert local_shell_ended.call_id == "call_2"
     assert isinstance(local_shell_ended.result, TextContent)
     assert local_shell_ended.result.text == "hi\n"
+
+
+def test_make_agent_event_publisher_emits_compaction_without_openai_item_id() -> None:
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    publisher(
+        {
+            "type": "response.output_item.added",
+            "response_id": "resp-1",
+            "sequence_number": 3,
+            "item": {
+                "type": "compaction",
+                "encrypted_content": "opaque",
+                "status": "in_progress",
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "response.output_item.done",
+            "response_id": "resp-1",
+            "sequence_number": 4,
+            "item": {
+                "type": "compaction",
+                "encrypted_content": "opaque",
+                "status": "completed",
+            },
+        }
+    )
+
+    assert isinstance(published[0], AgentThreadEvent)
+    assert published[0].type == AGENT_EVENT_THREAD_EVENT
+    assert published[0].event["headline"] == "Compacting context"
+    compacted = next(
+        message for message in published if isinstance(message, AgentContextCompacted)
+    )
+    assert compacted.type == AGENT_EVENT_CONTEXT_COMPACTED
+    assert compacted.checkpoint_id == "compaction:resp-1:4"
+    assert compacted.messages == [
+        {
+            "id": "compaction:resp-1:4",
+            "type": "compaction",
+            "encrypted_content": "opaque",
+            "status": "completed",
+        }
+    ]
+    assert isinstance(published[-1], AgentThreadEvent)
+    assert published[-1].event["state"] == "completed"
+
+
+def test_make_agent_event_publisher_emits_compaction_from_completed_response_snapshot() -> (
+    None
+):
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    publisher(
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp-1",
+                "output": [
+                    {
+                        "type": "compaction",
+                        "encrypted_content": "opaque",
+                        "status": "completed",
+                    }
+                ],
+            },
+        }
+    )
+
+    compacted = next(
+        message for message in published if isinstance(message, AgentContextCompacted)
+    )
+    assert compacted.type == AGENT_EVENT_CONTEXT_COMPACTED
+    assert compacted.messages == [
+        {
+            "id": "output:0",
+            "type": "compaction",
+            "encrypted_content": "opaque",
+            "status": "completed",
+        }
+    ]
 
 
 def test_make_agent_event_publisher_updates_shell_tool_arguments_before_handler_completion() -> (

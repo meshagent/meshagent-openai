@@ -105,6 +105,7 @@ class _RecordingOpenAIResponsesAdapter(OpenAIResponsesAdapter):
         super().__init__(**kwargs)
         self.recorded_create_kwargs: list[dict[str, object]] = []
         self.recorded_response_outputs: list[list[dict[str, object]]] = []
+        self.recorded_response_usages: list[dict[str, object] | None] = []
 
     async def _create_response_with_retries(self, *, openai, create_kwargs: dict):
         self.recorded_create_kwargs.append(copy.deepcopy(create_kwargs))
@@ -114,6 +115,9 @@ class _RecordingOpenAIResponsesAdapter(OpenAIResponsesAdapter):
         )
         self.recorded_response_outputs.append(
             [item.to_dict() for item in response.output]
+        )
+        self.recorded_response_usages.append(
+            response.usage.to_dict() if response.usage is not None else None
         )
         return response
 
@@ -194,6 +198,68 @@ class _LiveBrowserComputer:
 
     async def get_current_url(self) -> str:
         return "https://example.com"
+
+
+@pytest.mark.asyncio
+async def test_live_openai_auto_compaction_threshold_reports_compacted_next_call():
+    threshold = int(os.getenv("OPENAI_COMPACTION_TEST_THRESHOLD", "1000"))
+    model = os.getenv("OPENAI_COMPACTION_TEST_MODEL", "gpt-5.2")
+    adapter = _RecordingOpenAIResponsesAdapter(
+        model=model,
+        mode="request",
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        context_management="auto",
+        compaction_threshold=threshold,
+        max_output_tokens=2048,
+        max_retries=2,
+    )
+    context = adapter.create_session()
+    memory_block = (
+        "This is durable context used only for a compaction threshold probe. "
+        "Keep it in mind, but do not repeat it. "
+        + ("alpha bravo charlie delta echo foxtrot golf hotel india juliet " * 80)
+    )
+    context.append_user_message("Store the following synthetic notes.")
+    for index in range(20):
+        context.append_assistant_message(f"Note block {index}: {memory_block}")
+    context.append_user_message("Reply with OK only.")
+
+    first_result = await asyncio.wait_for(
+        adapter.next(
+            context=context,
+            caller=_FakeRoom().local_participant,
+            toolkits=[],
+        ),
+        timeout=180.0,
+    )
+
+    assert isinstance(first_result, str)
+    assert adapter.recorded_create_kwargs[0]["context_management"] == [
+        {"type": "compaction", "compact_threshold": threshold}
+    ]
+    compaction_response_index = next(
+        index
+        for index, outputs in enumerate(adapter.recorded_response_outputs)
+        if any(output.get("type") == "compaction" for output in outputs)
+    )
+    compaction_usage = adapter.recorded_response_usages[compaction_response_index]
+    assert compaction_usage is not None
+    assert context.metadata["last_response_compaction_threshold"] == threshold
+
+    context.append_user_message("Reply with OK only.")
+    second_result = await asyncio.wait_for(
+        adapter.next(
+            context=context,
+            caller=_FakeRoom().local_participant,
+            toolkits=[],
+        ),
+        timeout=180.0,
+    )
+
+    assert isinstance(second_result, str)
+    second_usage = context.metadata["last_response_usage"]
+    second_input_tokens = second_usage["input_tokens"]
+    assert second_input_tokens <= threshold
 
 
 async def _read_websocket_payload(
