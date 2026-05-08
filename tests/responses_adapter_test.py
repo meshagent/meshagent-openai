@@ -585,6 +585,17 @@ def test_openai_responses_adapter_passes_through_tool_truncation_limits() -> Non
     assert tool_adapter.max_tool_call_lines == 7
 
 
+def test_openai_responses_adapter_publishes_function_call_argument_deltas() -> None:
+    adapter = OpenAIResponsesAdapter(client=_FakeOpenAIClient(outcomes=[]))
+
+    assert adapter._should_publish_stream_event(  # noqa: SLF001
+        event=SimpleNamespace(type="response.function_call_arguments.delta")
+    )
+    assert not adapter._should_publish_stream_event(  # noqa: SLF001
+        event=SimpleNamespace(type="response.function_call_arguments.done")
+    )
+
+
 def test_openai_mcp_tool_coerces_headers_dict_to_strict_header_entries() -> None:
     server = MCPServer.model_validate(
         {

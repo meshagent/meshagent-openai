@@ -1301,6 +1301,9 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
 
         # Prefer response.output_item.added/done for tool items because those carry
         # richer payload details. Suppress duplicate tool lifecycle stream events.
+        if event_type == "response.function_call_arguments.delta":
+            return True
+
         if (
             event_type.startswith("response.mcp_call.")
             or event_type.startswith("response.mcp_list_tools.")
