@@ -558,9 +558,17 @@ class OpenAICompletionsAdapter(LLMAdapter):
                             )
 
                         except Exception as e:
-                            logger.error(
-                                f"unable to complete tool call {tool_call}", exc_info=e
-                            )
+                            if isinstance(e, RoomException):
+                                logger.debug(
+                                    "unable to complete tool call %s: %s",
+                                    tool_call,
+                                    e,
+                                )
+                            else:
+                                logger.error(
+                                    f"unable to complete tool call {tool_call}",
+                                    exc_info=e,
+                                )
 
                             return [
                                 {

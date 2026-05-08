@@ -100,6 +100,27 @@ class _SteeringProbeTool(FunctionTool):
         return {"ok": True, "note": note}
 
 
+def _event_type_summary(events: list[dict[str, object]]) -> list[str | None]:
+    return [
+        event.get("type") if isinstance(event.get("type"), str) else None
+        for event in events
+    ]
+
+
+def _message_text(item: dict[str, object]) -> str:
+    content = item.get("content")
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        text = part.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+    return "".join(parts)
+
+
 class _RecordingOpenAIResponsesAdapter(OpenAIResponsesAdapter):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -260,6 +281,72 @@ async def test_live_openai_auto_compaction_threshold_reports_compacted_next_call
     second_usage = context.metadata["last_response_usage"]
     second_input_tokens = second_usage["input_tokens"]
     assert second_input_tokens <= threshold
+
+
+@pytest.mark.asyncio
+async def test_live_openai_adapter_receives_tool_preamble_message():
+    room = _FakeRoom()
+    tool = _SteeringProbeTool(name="commentary_probe", wait_for_release=False)
+    events: list[dict[str, object]] = []
+    adapter = OpenAIResponsesAdapter(
+        model=os.getenv("OPENAI_PREAMBLE_TEST_MODEL", "gpt-5.2"),
+        mode="request",
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        reasoning_effort=os.getenv("OPENAI_PREAMBLE_TEST_REASONING_EFFORT", "none"),
+        max_output_tokens=2048,
+        max_retries=2,
+    )
+    context = adapter.create_session()
+    context.instructions = (
+        "Before you call a tool, explain why you are calling it. Keep the explanation "
+        "to one short sentence. Only the last user-facing answer should be final."
+    )
+    context.append_user_message(
+        "Call commentary_probe exactly once with note='live-commentary'. After the tool "
+        "returns, reply with exactly DONE and nothing else."
+    )
+
+    result = await asyncio.wait_for(
+        adapter.next(
+            context=context,
+            caller=room.local_participant,
+            toolkits=[Toolkit(name="test", tools=[tool])],
+            event_handler=events.append,
+        ),
+        timeout=120.0,
+    )
+
+    function_call_index = next(
+        (
+            index
+            for index, item in enumerate(context.previous_messages)
+            if item.get("type") == "function_call"
+        ),
+        None,
+    )
+    preamble = (
+        None
+        if function_call_index is None
+        else next(
+            (
+                item
+                for item in reversed(context.previous_messages[:function_call_index])
+                if item.get("type") == "message" and item.get("role") == "assistant"
+            ),
+            None,
+        )
+    )
+    assert len(tool.calls) == 1
+    assert isinstance(result, str)
+    assert result.strip() == "DONE"
+    assert preamble is not None, json.dumps(
+        {
+            "event_types": _event_type_summary(events),
+            "previous_messages": context.previous_messages,
+        },
+        default=str,
+    )
+    assert _message_text(preamble).strip() != ""
 
 
 async def _read_websocket_payload(
