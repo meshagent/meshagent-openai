@@ -166,6 +166,107 @@ def test_store_usage_publishes_otel_usage_metrics(monkeypatch: pytest.MonkeyPatc
     assert context.metadata["last_response_context_used_tokens"] == 18
 
 
+def test_store_usage_includes_image_generation_usage() -> None:
+    adapter = OpenAIResponsesAdapter(
+        model="gpt-5-mini",
+        client=object(),
+    )
+    context = adapter.create_session()
+    response = _FakeResponse(
+        response_id="resp_1",
+        output=[
+            _FakeImageGenerationOutputItem(
+                type="image_generation_call",
+                id="ig_1",
+                usage={
+                    "input_tokens": 120,
+                    "input_tokens_details": {
+                        "text_tokens": 30,
+                        "image_tokens": 90,
+                    },
+                    "output_tokens": 400,
+                    "total_tokens": 520,
+                },
+            )
+        ],
+        usage={
+            "input_tokens": 11,
+            "output_tokens": 7,
+            "input_tokens_details": {"cached_tokens": 4},
+            "total_tokens": 18,
+        },
+    )
+
+    adapter._store_image_generation_usage_from_response(
+        context=context,
+        response=response,  # type: ignore[arg-type]
+        model="gpt-5-mini",
+    )
+    adapter._store_usage(
+        context=context,
+        usage=response.usage,
+        model="gpt-5-mini",
+    )
+
+    assert context.metadata["last_response_flattened_usage"] == {
+        "input_tokens": 37.0,
+        "output_tokens": 7.0,
+        "cached_tokens": 4.0,
+        "total_tokens": 538.0,
+        "image_input_tokens": 90.0,
+        "image_output_tokens": 400.0,
+    }
+    assert context.metadata["last_response_context_used_tokens"] == 538
+    assert context.usage == context.metadata["last_response_flattened_usage"]
+
+
+def test_store_usage_keeps_image_generation_usage_without_response_usage() -> None:
+    adapter = OpenAIResponsesAdapter(
+        model="gpt-5-mini",
+        client=object(),
+    )
+    context = adapter.create_session()
+    response = _FakeResponse(
+        response_id="resp_1",
+        output=[
+            _FakeImageGenerationOutputItem(
+                type="image_generation_call",
+                id="ig_1",
+                usage={
+                    "input_tokens": 120,
+                    "input_tokens_details": {
+                        "text_tokens": 30,
+                        "image_tokens": 90,
+                    },
+                    "output_tokens": 400,
+                    "total_tokens": 520,
+                },
+            )
+        ],
+        usage=None,
+    )
+
+    adapter._store_image_generation_usage_from_response(
+        context=context,
+        response=response,  # type: ignore[arg-type]
+        model="gpt-5-mini",
+    )
+    adapter._store_usage(
+        context=context,
+        usage=response.usage,
+        model="gpt-5-mini",
+    )
+
+    assert context.metadata["last_response_flattened_usage"] == {
+        "input_tokens": 30.0,
+        "total_tokens": 520.0,
+        "image_input_tokens": 90.0,
+        "image_output_tokens": 400.0,
+    }
+    assert context.metadata["last_response_context_used_tokens"] == 520
+    assert context.usage == context.metadata["last_response_flattened_usage"]
+
+
 class _FakeRoom:
     def __init__(self):
         self.local_participant = _FakeParticipant()
@@ -421,6 +522,12 @@ class _FakeResponse:
             "id": self.id,
             "output": [output.to_dict(mode="json") for output in self.output],
         }
+
+
+class _FakeImageGenerationOutputItem(OpenAIBaseModel):
+    type: str
+    id: str
+    usage: dict
 
 
 class _InstructionalOpenAIResponsesAdapter(OpenAIResponsesAdapter):

@@ -184,6 +184,58 @@ def preprocess_openai_usage(
     return out
 
 
+def preprocess_openai_image_generation_usage(
+    *, model: str, usage: dict[str, Any]
+) -> dict[str, float] | None:
+    del model
+
+    if not isinstance(usage, dict):
+        return None
+
+    out: dict[str, float] = {}
+    input_details = usage.get("input_tokens_details")
+    if not isinstance(input_details, dict):
+        input_details = usage.get("input_token_details")
+        if not isinstance(input_details, dict):
+            input_details = None
+
+    if input_details is not None:
+        text_input = _to_float(input_details.get("text_tokens"))
+        image_input = _to_float(input_details.get("image_tokens"))
+        if text_input is not None and text_input > 0:
+            out["input_tokens"] = text_input
+        if image_input is not None and image_input > 0:
+            out["image_input_tokens"] = image_input
+    else:
+        aggregate_input = _to_float(usage.get("input_tokens"))
+        if aggregate_input is not None and aggregate_input > 0:
+            out["input_tokens"] = aggregate_input
+
+    output_details = usage.get("output_tokens_details")
+    if not isinstance(output_details, dict):
+        output_details = usage.get("output_token_details")
+        if not isinstance(output_details, dict):
+            output_details = None
+
+    if output_details is not None:
+        text_output = _to_float(output_details.get("text_tokens"))
+        image_output = _to_float(output_details.get("image_tokens"))
+        if text_output is not None and text_output > 0:
+            out["output_tokens"] = text_output
+        if image_output is not None and image_output > 0:
+            out["image_output_tokens"] = image_output
+    else:
+        image_output = _to_float(usage.get("output_tokens"))
+        if image_output is not None and image_output > 0:
+            out["image_output_tokens"] = image_output
+
+    total = _to_float(usage.get("total_tokens"))
+    if total is not None and total > 0:
+        out["total_tokens"] = total
+
+    return out if len(out) > 0 else None
+
+
 def add_usage_metrics(*, totals: dict[str, float], usage: dict[str, float]) -> None:
     for key, value in usage.items():
         totals[key] = float(totals.get(key, 0.0)) + float(value)

@@ -87,6 +87,7 @@ from urllib.parse import urlparse, urlunparse
 from meshagent.openai.tools.usage import (
     add_usage_metrics,
     normalize_openai_usage,
+    preprocess_openai_image_generation_usage,
     preprocess_openai_usage,
     track_otel_usage_metrics,
 )
@@ -96,6 +97,7 @@ logger = logging.getLogger("openai_agent")
 tracer = trace.get_tracer("openai.llm.responses")
 _MAX_LOGGED_WEBSOCKET_PAYLOAD_CHARS = 128000
 _MESHAGENT_ERROR_MESSAGE_HEADER = "x-meshagent-error-message"
+_LAST_RESPONSE_SUPPLEMENTAL_USAGE_KEY = "last_response_supplemental_usage"
 _OPENAI_OUT_OF_CREDITS_MESSAGE = (
     "Your account is out of credits. Add credits from the account dashboard "
     "or set up auto reload to continue."
@@ -947,6 +949,9 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
     def default_model(self) -> str:
         return self._model
 
+    def provider_name(self) -> str | None:
+        return self._provider
+
     def set_images_dataset(self, images_dataset: ImagesDataset | None) -> None:
         self._images_dataset = images_dataset
 
@@ -1185,6 +1190,47 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         context.metadata.pop("last_response_flattened_usage", None)
         context.metadata.pop("last_response_context_used_tokens", None)
         context.metadata.pop("last_response_model", None)
+        context.metadata.pop(_LAST_RESPONSE_SUPPLEMENTAL_USAGE_KEY, None)
+
+    def _store_image_generation_usage(
+        self,
+        *,
+        context: AgentSessionContext,
+        usage: object,
+        model: str,
+    ) -> None:
+        usage_dict = normalize_openai_usage(usage)
+        if usage_dict is None:
+            return
+        flattened_usage = preprocess_openai_image_generation_usage(
+            model=model,
+            usage=usage_dict,
+        )
+        if flattened_usage is None:
+            return
+
+        supplemental_usage = context.metadata.get(_LAST_RESPONSE_SUPPLEMENTAL_USAGE_KEY)
+        if not isinstance(supplemental_usage, dict):
+            supplemental_usage = {}
+            context.metadata[_LAST_RESPONSE_SUPPLEMENTAL_USAGE_KEY] = supplemental_usage
+        add_usage_metrics(totals=supplemental_usage, usage=flattened_usage)
+
+    def _store_image_generation_usage_from_response(
+        self,
+        *,
+        context: AgentSessionContext,
+        response: Response,
+        model: str,
+    ) -> None:
+        for output_item in response.output:
+            item = output_item.model_dump(mode="json")
+            if item.get("type") != "image_generation_call":
+                continue
+            self._store_image_generation_usage(
+                context=context,
+                usage=item.get("usage"),
+                model=model,
+            )
 
     def _store_usage(
         self,
@@ -1196,8 +1242,14 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         compaction_threshold: int | None = None,
     ) -> None:
         usage_dict = normalize_openai_usage(usage)
-        if usage_dict is None:
+        supplemental_usage = context.metadata.pop(
+            _LAST_RESPONSE_SUPPLEMENTAL_USAGE_KEY,
+            None,
+        )
+        if usage_dict is None and not isinstance(supplemental_usage, dict):
             return
+        if usage_dict is None:
+            usage_dict = {}
 
         context.metadata["last_response_usage"] = usage_dict
         context.metadata["last_response_model"] = model
@@ -1210,6 +1262,10 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
 
         flattened_usage = preprocess_openai_usage(model=model, usage=usage_dict)
         if flattened_usage is None:
+            flattened_usage = {}
+        if isinstance(supplemental_usage, dict):
+            add_usage_metrics(totals=flattened_usage, usage=supplemental_usage)
+        if len(flattened_usage) == 0:
             return
         context.metadata["last_response_flattened_usage"] = dict(flattened_usage)
         context.metadata["last_response_context_used_tokens"] = (
@@ -1231,6 +1287,12 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                 usage.get("input_tokens", 0.0)
                 + usage.get("cached_tokens", 0.0)
                 + usage.get("output_tokens", 0.0)
+                + usage.get("audio_input_tokens", 0.0)
+                + usage.get("audio_cached_tokens", 0.0)
+                + usage.get("audio_output_tokens", 0.0)
+                + usage.get("image_input_tokens", 0.0)
+                + usage.get("image_cached_tokens", 0.0)
+                + usage.get("image_output_tokens", 0.0)
             ),
         )
 
@@ -2312,6 +2374,11 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                 response_compacted = (
                                     self._response_has_compaction_output(response)
                                 )
+                                self._store_image_generation_usage_from_response(
+                                    context=context,
+                                    response=response,
+                                    model=model,
+                                )
                                 self._store_usage(
                                     context=context,
                                     usage=response.usage,
@@ -2826,6 +2893,11 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                         response_compacted = self._response_has_compaction_output(
                                                             event.response
                                                         )
+                                                        self._store_image_generation_usage_from_response(
+                                                            context=context,
+                                                            response=event.response,
+                                                            model=model,
+                                                        )
                                                         self._store_usage(
                                                             context=context,
                                                             usage=event.response.usage,
@@ -2847,6 +2919,11 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                     )
                                                     response_compacted = self._response_has_compaction_output(
                                                         event.response
+                                                    )
+                                                    self._store_image_generation_usage_from_response(
+                                                        context=context,
+                                                        response=event.response,
+                                                        model=model,
                                                     )
                                                     self._store_usage(
                                                         context=context,
@@ -2990,6 +3067,11 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                     )
                                                     response_compacted = self._response_has_compaction_output(
                                                         event.response
+                                                    )
+                                                    self._store_image_generation_usage_from_response(
+                                                        context=context,
+                                                        response=event.response,
+                                                        model=model,
                                                     )
                                                     self._store_usage(
                                                         context=context,
