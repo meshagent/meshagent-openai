@@ -404,7 +404,7 @@ async def test_live_openai_adapter_receives_tool_preamble_message():
 
 
 @pytest.mark.asyncio
-async def test_live_openai_process_publishes_shell_argument_snapshot_byte_status():
+async def test_live_openai_process_increments_preparing_command_byte_status():
     room = _FakeRoom()
     publisher = _RecordingThreadStatusPublisher()
     supervisor = _RecordingSupervisor()
@@ -415,7 +415,7 @@ async def test_live_openai_process_publishes_shell_argument_snapshot_byte_status
         reasoning_effort=os.getenv(
             "OPENAI_SHELL_COUNTER_TEST_REASONING_EFFORT", "none"
         ),
-        max_output_tokens=1024,
+        max_output_tokens=2048,
         max_retries=1,
     )
     process = LLMAgentProcess(
@@ -428,6 +428,14 @@ async def test_live_openai_process_publishes_shell_argument_snapshot_byte_status
 
     await process.start(supervisor)
     try:
+        literal_payload = "x" * 512
+        command = (
+            "python3 - <<'PY'\n"
+            "from pathlib import Path\n"
+            f"Path('/tmp/meshagent_live_counter_probe.txt').write_text('{literal_payload}')\n"
+            "print('DONE')\n"
+            "PY"
+        )
         process.send(
             Message(
                 data=TurnStart(
@@ -437,9 +445,8 @@ async def test_live_openai_process_publishes_shell_argument_snapshot_byte_status
                         {
                             "type": "text",
                             "text": (
-                                "Use the shell tool exactly once. Run a command that "
-                                "writes 256 x characters to "
-                                "/tmp/meshagent_live_counter_probe.txt and prints DONE. "
+                                "Use the shell tool exactly once with exactly this command:\n"
+                                f"{command}\n"
                                 "After the shell command finishes, reply with exactly DONE."
                             ),
                         }
@@ -450,13 +457,14 @@ async def test_live_openai_process_publishes_shell_argument_snapshot_byte_status
         )
 
         async def saw_shell_argument_byte_status() -> bool:
-            return any(
-                isinstance(status.get("status"), str)
+            totals = [
+                status["total_bytes"]
+                for status in publisher.statuses
+                if status.get("status") == "Preparing"
                 and status.get("pending_item_id") is not None
                 and isinstance(status.get("total_bytes"), int)
-                and status["total_bytes"] > 100
-                for status in publisher.statuses
-            )
+            ]
+            return len(totals) >= 2 and max(totals) > min(totals) and max(totals) > 100
 
         try:
             await asyncio.wait_for(

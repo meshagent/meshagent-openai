@@ -38,6 +38,7 @@ from meshagent.agents.messages import (
     AgentTextContentDelta,
     AgentTextContentEnded,
     AgentTextContentStarted,
+    AgentToolCallArgumentsDelta,
     AgentToolCallPending,
     AgentToolCallLogDelta,
     AgentToolCallEnded,
@@ -4189,6 +4190,8 @@ def test_make_agent_event_publisher_emits_shell_tool_events() -> None:
     assert shell_pending.toolkit == "openai"
     assert shell_pending.tool == "shell"
     assert shell_pending.arguments == {"action": {"command": ["echo", "hi"]}}
+    assert shell_pending.argument_bytes is not None
+    assert shell_pending.argument_bytes > 100
 
     shell_started = published[1]
     assert isinstance(shell_started, AgentToolCallStarted)
@@ -4235,6 +4238,63 @@ def test_make_agent_event_publisher_emits_shell_tool_events() -> None:
     assert local_shell_ended.call_id == "call_2"
     assert isinstance(local_shell_ended.result, TextContent)
     assert local_shell_ended.result.text == "hi\n"
+
+
+def test_make_agent_event_publisher_emits_shell_command_deltas() -> None:
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    published = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    publisher(
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "shell_call",
+                "id": "shell_1",
+                "call_id": "call_1",
+                "status": "in_progress",
+                "action": {
+                    "commands": [],
+                    "max_output_length": None,
+                    "timeout_ms": None,
+                },
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "response.shell_call_command.delta",
+            "output_index": 0,
+            "command_index": 0,
+            "delta": "python",
+            "sequence_number": 3,
+        }
+    )
+    publisher(
+        {
+            "type": "response.shell_call_command.delta",
+            "output_index": 0,
+            "command_index": 0,
+            "delta": " - <<'PY'",
+            "sequence_number": 4,
+        }
+    )
+
+    assert [type(event) for event in published] == [
+        AgentToolCallPending,
+        AgentToolCallArgumentsDelta,
+        AgentToolCallArgumentsDelta,
+    ]
+    assert [event.delta for event in published[1:]] == ["python", " - <<'PY'"]
+    assert all(event.item_id == "shell_1" for event in published[1:])
 
 
 def test_make_agent_event_publisher_emits_compaction_without_openai_item_id() -> None:
