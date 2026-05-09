@@ -11,9 +11,11 @@ import pytest
 from openai import AsyncOpenAI
 from openai.types.responses.response_computer_tool_call import ResponseComputerToolCall
 
+from meshagent.agents.messages import AGENT_MESSAGE_TURN_START, ToolChoice, TurnStart
+from meshagent.agents.process import AgentSupervisor, LLMAgentProcess, Message
 from meshagent.computers.agent import ComputerToolkit
 from meshagent.computers.operator import Operator
-from meshagent.openai.tools.responses_adapter import OpenAIResponsesAdapter
+from meshagent.openai.tools.responses_adapter import OpenAIResponsesAdapter, ShellTool
 from meshagent.tools import FunctionTool, Toolkit
 
 
@@ -72,6 +74,53 @@ class _FakeRoom:
     developer = _FakeDeveloper()
 
 
+class _RecordingSupervisor(AgentSupervisor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sent: list[Message] = []
+
+    def send(self, message: Message) -> None:
+        self.sent.append(message)
+
+
+class _RecordingThreadStatusPublisher:
+    def __init__(self) -> None:
+        self.turn_ids: list[str | None] = []
+        self.pending_messages: list[list[dict[str, object]]] = []
+        self.statuses: list[dict[str, object]] = []
+        self.clear_count = 0
+
+    async def set_thread_turn_id(self, *, turn_id: str | None) -> None:
+        self.turn_ids.append(turn_id)
+
+    async def set_pending_messages(
+        self,
+        *,
+        pending_messages: list[dict[str, object]],
+    ) -> None:
+        self.pending_messages.append(pending_messages)
+
+    async def set_thread_status(
+        self,
+        *,
+        status: str | None,
+        mode=None,
+        pending_item_id: str | None = None,
+        total_bytes: int | None = None,
+    ) -> None:
+        self.statuses.append(
+            {
+                "status": status,
+                "mode": mode,
+                "pending_item_id": pending_item_id,
+                "total_bytes": total_bytes,
+            }
+        )
+
+    async def clear_thread_status(self) -> None:
+        self.clear_count += 1
+
+
 class _SteeringProbeTool(FunctionTool):
     def __init__(self, *, name: str = "steering_probe", wait_for_release: bool = True):
         super().__init__(
@@ -119,6 +168,11 @@ def _message_text(item: dict[str, object]) -> str:
         if isinstance(text, str):
             parts.append(text)
     return "".join(parts)
+
+
+async def _wait_until(predicate, *, interval: float = 0.05) -> None:
+    while not await predicate():
+        await asyncio.sleep(interval)
 
 
 class _RecordingOpenAIResponsesAdapter(OpenAIResponsesAdapter):
@@ -347,6 +401,83 @@ async def test_live_openai_adapter_receives_tool_preamble_message():
         default=str,
     )
     assert _message_text(preamble).strip() != ""
+
+
+@pytest.mark.asyncio
+async def test_live_openai_process_publishes_shell_argument_snapshot_byte_status():
+    room = _FakeRoom()
+    publisher = _RecordingThreadStatusPublisher()
+    supervisor = _RecordingSupervisor()
+    adapter = OpenAIResponsesAdapter(
+        model=os.getenv("OPENAI_SHELL_COUNTER_TEST_MODEL", "gpt-5.5"),
+        mode=os.getenv("OPENAI_SHELL_COUNTER_TEST_MODE", "websocket"),
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        reasoning_effort=os.getenv(
+            "OPENAI_SHELL_COUNTER_TEST_REASONING_EFFORT", "none"
+        ),
+        max_output_tokens=1024,
+        max_retries=1,
+    )
+    process = LLMAgentProcess(
+        thread_id="thread-1",
+        participant=room.local_participant,
+        llm_adapter=adapter,
+        toolkits=[Toolkit(name="openai", tools=[ShellTool(image=None)])],
+        thread_status_publisher=publisher,
+    )
+
+    await process.start(supervisor)
+    try:
+        process.send(
+            Message(
+                data=TurnStart(
+                    type=AGENT_MESSAGE_TURN_START,
+                    thread_id="thread-1",
+                    content=[
+                        {
+                            "type": "text",
+                            "text": (
+                                "Use the shell tool exactly once. Run a command that "
+                                "writes 256 x characters to "
+                                "/tmp/meshagent_live_counter_probe.txt and prints DONE. "
+                                "After the shell command finishes, reply with exactly DONE."
+                            ),
+                        }
+                    ],
+                    tool_choice=ToolChoice(toolkit_name="openai", tool_name="shell"),
+                )
+            )
+        )
+
+        async def saw_shell_argument_byte_status() -> bool:
+            return any(
+                isinstance(status.get("status"), str)
+                and status.get("pending_item_id") is not None
+                and isinstance(status.get("total_bytes"), int)
+                and status["total_bytes"] > 100
+                for status in publisher.statuses
+            )
+
+        try:
+            await asyncio.wait_for(
+                _wait_until(saw_shell_argument_byte_status),
+                timeout=120.0,
+            )
+        except TimeoutError as exc:
+            raise AssertionError(
+                json.dumps(
+                    {
+                        "statuses": publisher.statuses,
+                        "sent_types": [
+                            message.data.type for message in supervisor.sent
+                        ],
+                    },
+                    default=str,
+                    indent=2,
+                )
+            ) from exc
+    finally:
+        await process.stop(supervisor)
 
 
 async def _read_websocket_payload(
