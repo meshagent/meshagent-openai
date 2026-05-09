@@ -11,12 +11,23 @@ import pytest
 from openai import AsyncOpenAI
 from openai.types.responses.response_computer_tool_call import ResponseComputerToolCall
 
-from meshagent.agents.messages import AGENT_MESSAGE_TURN_START, ToolChoice, TurnStart
+from meshagent.agents.messages import (
+    AGENT_MESSAGE_TURN_START,
+    AgentMessage,
+    AgentToolCallArgumentsDelta,
+    ToolChoice,
+    TurnStart,
+)
 from meshagent.agents.process import AgentSupervisor, LLMAgentProcess, Message
 from meshagent.computers.agent import ComputerToolkit
 from meshagent.computers.operator import Operator
-from meshagent.openai.tools.responses_adapter import OpenAIResponsesAdapter, ShellTool
+from meshagent.openai.tools.responses_adapter import (
+    ApplyPatchTool,
+    OpenAIResponsesAdapter,
+    ShellTool,
+)
 from meshagent.tools import FunctionTool, Toolkit
+from meshagent.tools.storage import StorageToolkit, StorageToolLocalMount
 
 
 def _should_run_live_openai_tests() -> bool:
@@ -107,6 +118,8 @@ class _RecordingThreadStatusPublisher:
         mode=None,
         pending_item_id: str | None = None,
         total_bytes: int | None = None,
+        lines_added: int | None = None,
+        lines_removed: int | None = None,
     ) -> None:
         self.statuses.append(
             {
@@ -114,6 +127,8 @@ class _RecordingThreadStatusPublisher:
                 "mode": mode,
                 "pending_item_id": pending_item_id,
                 "total_bytes": total_bytes,
+                "lines_added": lines_added,
+                "lines_removed": lines_removed,
             }
         )
 
@@ -173,6 +188,25 @@ def _message_text(item: dict[str, object]) -> str:
 async def _wait_until(predicate, *, interval: float = 0.05) -> None:
     while not await predicate():
         await asyncio.sleep(interval)
+
+
+def _is_apply_patch_delta_event(event: dict[str, object]) -> bool:
+    event_type = event.get("type")
+    return (
+        isinstance(event_type, str)
+        and (
+            event_type.startswith("response.apply_patch_call.")
+            or event_type.startswith("response.apply_patch_call_")
+        )
+        and event_type.endswith(".delta")
+    )
+
+
+def _is_apply_patch_done_event(event: dict[str, object]) -> bool:
+    if event.get("type") != "response.output_item.done":
+        return False
+    item = event.get("item")
+    return isinstance(item, dict) and item.get("type") == "apply_patch_call"
 
 
 class _RecordingOpenAIResponsesAdapter(OpenAIResponsesAdapter):
@@ -486,6 +520,168 @@ async def test_live_openai_process_increments_preparing_command_byte_status():
             ) from exc
     finally:
         await process.stop(supervisor)
+
+
+@pytest.mark.asyncio
+async def test_live_openai_apply_patch_streams_patch_deltas_before_done(tmp_path):
+    report_path = tmp_path / "report.py"
+    report_path.write_text(
+        "def main():\n    print('hello')\n\n\nif __name__ == '__main__':\n    main()\n",
+        encoding="utf-8",
+    )
+    storage = StorageToolkit(
+        mounts=[
+            StorageToolLocalMount(
+                path="/",
+                local_path=str(tmp_path),
+            )
+        ]
+    )
+    events: list[dict[str, object]] = []
+    agent_messages: list[AgentMessage] = []
+    adapter = OpenAIResponsesAdapter(
+        model=os.getenv("OPENAI_APPLY_PATCH_DELTA_TEST_MODEL", "gpt-5.5"),
+        mode=os.getenv("OPENAI_APPLY_PATCH_DELTA_TEST_MODE", "websocket"),
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        reasoning_effort=os.getenv(
+            "OPENAI_APPLY_PATCH_DELTA_TEST_REASONING_EFFORT", "none"
+        ),
+        max_output_tokens=2048,
+        max_retries=1,
+    )
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-live-apply-patch",
+        thread_id="thread-live-apply-patch",
+        callback=agent_messages.append,
+    )
+    context = adapter.create_session()
+    context.instructions = (
+        "Use the apply_patch tool exactly once when asked to edit files. "
+        "Do not call any other tools."
+    )
+    patch = (
+        "@@\n"
+        " def main():\n"
+        "+    # Keep the example output small for the live streaming probe.\n"
+        "     print('hello')\n"
+    )
+    context.append_user_message(
+        "Use the apply_patch tool exactly once to update report.py with this "
+        "exact operation, then reply DONE:\n"
+        "{"
+        '"type":"update_file",'
+        '"path":"report.py",'
+        f'"diff":{json.dumps(patch)}'
+        "}"
+    )
+
+    def record_event(event: dict[str, object]) -> None:
+        events.append(event)
+        publisher(event)
+
+    next_task = asyncio.create_task(
+        adapter.next(
+            context=context,
+            caller=_FakeRoom().local_participant,
+            toolkits=[Toolkit(name="openai", tools=[ApplyPatchTool(storage=storage)])],
+            tool_choice=ToolChoice(toolkit_name="openai", tool_name="apply_patch"),
+            event_handler=record_event,
+        )
+    )
+
+    async def saw_apply_patch_done() -> bool:
+        return any(_is_apply_patch_done_event(event) for event in events)
+
+    try:
+        try:
+            await asyncio.wait_for(
+                _wait_until(saw_apply_patch_done),
+                timeout=120.0,
+            )
+        except TimeoutError as exc:
+            raise AssertionError(
+                json.dumps(
+                    {
+                        "event_types": _event_type_summary(events),
+                        "patch_event_types": [
+                            event.get("type")
+                            for event in events
+                            if isinstance(event.get("type"), str)
+                            and str(event.get("type")).startswith(
+                                "response.apply_patch_call"
+                            )
+                        ],
+                    },
+                    default=str,
+                    indent=2,
+                )
+            ) from exc
+    finally:
+        next_task.cancel()
+        await asyncio.gather(next_task, return_exceptions=True)
+        await context.close()
+
+    delta_indices = [
+        index
+        for index, event in enumerate(events)
+        if _is_apply_patch_delta_event(event)
+    ]
+    done_index = next(
+        (
+            index
+            for index, event in enumerate(events)
+            if _is_apply_patch_done_event(event)
+        ),
+        None,
+    )
+    accumulated_delta = "".join(
+        str(events[index].get("delta", "")) for index in delta_indices
+    )
+    agent_argument_deltas = [
+        message
+        for message in agent_messages
+        if isinstance(message, AgentToolCallArgumentsDelta)
+    ]
+    assert len(delta_indices) >= 2, json.dumps(
+        {
+            "event_types": _event_type_summary(events),
+            "patch_event_types": [
+                event.get("type")
+                for event in events
+                if isinstance(event.get("type"), str)
+                and str(event.get("type")).startswith("response.apply_patch_call")
+            ],
+            "apply_patch_done_index": done_index,
+        },
+        default=str,
+        indent=2,
+    )
+    assert len(agent_argument_deltas) >= 2, json.dumps(
+        {
+            "event_types": _event_type_summary(events),
+            "agent_message_types": [
+                message.__class__.__name__ for message in agent_messages
+            ],
+        },
+        default=str,
+        indent=2,
+    )
+    assert done_index is not None, json.dumps(_event_type_summary(events), indent=2)
+    assert max(delta_indices) < done_index, json.dumps(
+        {
+            "delta_indices": delta_indices,
+            "apply_patch_done_index": done_index,
+            "event_types": _event_type_summary(events),
+        },
+        indent=2,
+    )
+    assert "report.py" in accumulated_delta or "print('hello')" in accumulated_delta
+    assert (
+        "report.py" in "".join(message.delta for message in agent_argument_deltas)
+        or "print('hello')"
+        in "".join(message.delta for message in agent_argument_deltas)
+    )
+    assert "Keep the example output small" in report_path.read_text(encoding="utf-8")
 
 
 async def _read_websocket_payload(

@@ -1301,7 +1301,25 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
 
         # Prefer response.output_item.added/done for tool items because those carry
         # richer payload details. Suppress duplicate tool lifecycle stream events.
-        if event_type == "response.function_call_arguments.delta":
+        if event_type in {
+            "response.function_call_arguments.delta",
+            "response.mcp_call_arguments.delta",
+            "response.mcp_call.arguments.delta",
+            "response.code_interpreter_call_code.delta",
+            "response.shell_call_command.delta",
+            "response.custom_tool_call_input.delta",
+        } or (
+            (
+                event_type.startswith("response.apply_patch_call.")
+                or event_type.startswith("response.apply_patch_call_")
+            )
+            and event_type.endswith(".delta")
+        ):
+            return True
+        if event_type in {
+            "response.apply_patch_call.in_progress",
+            "response.apply_patch_call.completed",
+        }:
             return True
 
         if (
@@ -1310,7 +1328,10 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             or event_type.startswith("response.web_search_call.")
             or event_type.startswith("response.file_search_call.")
             or event_type.startswith("response.apply_patch_call.")
+            or event_type.startswith("response.apply_patch_call_")
             or event_type.startswith("response.code_interpreter_call.")
+            or event_type.startswith("response.custom_tool_call.")
+            or event_type.startswith("response.custom_tool_call_input.")
             or event_type.startswith("response.function_call.")
             or event_type.startswith("response.function_call_arguments.")
         ):

@@ -586,11 +586,41 @@ def test_openai_responses_adapter_passes_through_tool_truncation_limits() -> Non
     assert tool_adapter.max_tool_call_lines == 7
 
 
-def test_openai_responses_adapter_publishes_function_call_argument_deltas() -> None:
+def test_openai_responses_adapter_publishes_tool_argument_deltas() -> None:
     adapter = OpenAIResponsesAdapter(client=_FakeOpenAIClient(outcomes=[]))
 
     assert adapter._should_publish_stream_event(  # noqa: SLF001
         event=SimpleNamespace(type="response.function_call_arguments.delta")
+    )
+    assert adapter._should_publish_stream_event(  # noqa: SLF001
+        event=SimpleNamespace(type="response.mcp_call_arguments.delta")
+    )
+    assert adapter._should_publish_stream_event(  # noqa: SLF001
+        event=SimpleNamespace(type="response.mcp_call.arguments.delta")
+    )
+    assert adapter._should_publish_stream_event(  # noqa: SLF001
+        event=SimpleNamespace(type="response.code_interpreter_call_code.delta")
+    )
+    assert adapter._should_publish_stream_event(  # noqa: SLF001
+        event=SimpleNamespace(type="response.shell_call_command.delta")
+    )
+    assert adapter._should_publish_stream_event(  # noqa: SLF001
+        event=SimpleNamespace(type="response.custom_tool_call_input.delta")
+    )
+    assert adapter._should_publish_stream_event(  # noqa: SLF001
+        event=SimpleNamespace(type="response.apply_patch_call.delta")
+    )
+    assert adapter._should_publish_stream_event(  # noqa: SLF001
+        event=SimpleNamespace(type="response.apply_patch_call.patch.delta")
+    )
+    assert adapter._should_publish_stream_event(  # noqa: SLF001
+        event=SimpleNamespace(type="response.apply_patch_call_operation_diff.delta")
+    )
+    assert adapter._should_publish_stream_event(  # noqa: SLF001
+        event=SimpleNamespace(type="response.apply_patch_call.in_progress")
+    )
+    assert adapter._should_publish_stream_event(  # noqa: SLF001
+        event=SimpleNamespace(type="response.apply_patch_call.completed")
     )
     assert not adapter._should_publish_stream_event(  # noqa: SLF001
         event=SimpleNamespace(type="response.function_call_arguments.done")
@@ -3469,6 +3499,8 @@ def test_make_agent_event_publisher_emits_content_and_tool_messages() -> None:
         AgentToolCallPending,
         AgentToolCallStarted,
         AgentToolCallEnded,
+        AgentToolCallPending,
+        AgentToolCallArgumentsDelta,
         AgentToolCallStarted,
         AgentToolCallEnded,
     ]
@@ -3495,7 +3527,12 @@ def test_make_agent_event_publisher_emits_content_and_tool_messages() -> None:
     assert function_started.tool == "lookup"
     assert function_started.arguments == {"q": "meshagent"}
 
-    web_search_ended = published[13]
+    web_search_delta = published[13]
+    assert isinstance(web_search_delta, AgentToolCallArgumentsDelta)
+    assert web_search_delta.item_id == "search_1"
+    assert web_search_delta.delta == '{"queries":["meshagent"]}'
+
+    web_search_ended = published[15]
     assert isinstance(web_search_ended, AgentToolCallEnded)
     assert isinstance(web_search_ended.result, JsonContent)
     assert web_search_ended.result.json == {"results": [{"title": "MeshAgent"}]}
@@ -4058,10 +4095,27 @@ def test_make_agent_event_publisher_emits_web_search_tool_events() -> None:
     )
 
     assert [type(event) for event in published] == [
+        AgentToolCallPending,
+        AgentToolCallArgumentsDelta,
         AgentToolCallStarted,
         AgentToolCallEnded,
     ]
-    started = published[0]
+    pending = published[0]
+    assert isinstance(pending, AgentToolCallPending)
+    assert pending.namespace == "openai.responses"
+    assert pending.call_id is None
+    assert pending.toolkit == "openai"
+    assert pending.tool == "web_search"
+
+    arguments_delta = published[1]
+    assert isinstance(arguments_delta, AgentToolCallArgumentsDelta)
+    assert arguments_delta.thread_id == "thread-1"
+    assert arguments_delta.turn_id == "turn-1"
+    assert arguments_delta.item_id == "search_1"
+    assert arguments_delta.call_id is None
+    assert arguments_delta.delta == '{"queries":["meshagent"]}'
+
+    started = published[2]
     assert isinstance(started, AgentToolCallStarted)
     assert started.namespace == "openai.responses"
     assert started.call_id is None
@@ -4069,7 +4123,7 @@ def test_make_agent_event_publisher_emits_web_search_tool_events() -> None:
     assert started.tool == "web_search"
     assert started.arguments == {"queries": ["meshagent"]}
 
-    ended = published[1]
+    ended = published[3]
     assert isinstance(ended, AgentToolCallEnded)
     assert ended.namespace == "openai.responses"
     assert ended.call_id is None
@@ -4295,6 +4349,71 @@ def test_make_agent_event_publisher_emits_shell_command_deltas() -> None:
     ]
     assert [event.delta for event in published[1:]] == ["python", " - <<'PY'"]
     assert all(event.item_id == "shell_1" for event in published[1:])
+
+
+def test_make_agent_event_publisher_emits_apply_patch_deltas() -> None:
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    published = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    publisher(
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "apply_patch_call",
+                "id": "patch_1",
+                "status": "in_progress",
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "response.apply_patch_call.delta",
+            "output_index": 0,
+            "item_id": "patch_1",
+            "delta": "*** Begin Patch\n",
+            "sequence_number": 3,
+        }
+    )
+    publisher(
+        {
+            "type": "response.apply_patch_call.patch.delta",
+            "output_index": 0,
+            "item_id": "patch_1",
+            "delta": "*** Update File: app.ts\n",
+            "sequence_number": 4,
+        }
+    )
+    publisher(
+        {
+            "type": "response.apply_patch_call_operation_diff.delta",
+            "output_index": 0,
+            "item_id": "patch_1",
+            "delta": "+print('hello')\n",
+            "sequence_number": 5,
+        }
+    )
+
+    assert [type(event) for event in published] == [
+        AgentToolCallPending,
+        AgentToolCallArgumentsDelta,
+        AgentToolCallArgumentsDelta,
+        AgentToolCallArgumentsDelta,
+    ]
+    assert [event.delta for event in published[1:]] == [
+        "*** Begin Patch\n",
+        "*** Update File: app.ts\n",
+        "+print('hello')\n",
+    ]
+    assert all(event.item_id == "patch_1" for event in published[1:])
 
 
 def test_make_agent_event_publisher_emits_compaction_without_openai_item_id() -> None:
