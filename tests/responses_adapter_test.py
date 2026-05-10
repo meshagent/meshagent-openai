@@ -24,7 +24,12 @@ from yarl import URL
 from meshagent.agents.adapter import ToolCallApprovalRequest
 from meshagent.agents.messages import (
     AGENT_EVENT_CONTEXT_COMPACTED,
+    AGENT_EVENT_TEXT_CONTENT_DELTA,
+    AGENT_EVENT_TEXT_CONTENT_ENDED,
     AGENT_EVENT_THREAD_EVENT,
+    AGENT_EVENT_TOOL_CALL_ARGUMENTS_DELTA,
+    AGENT_EVENT_TOOL_CALL_ENDED,
+    AGENT_EVENT_TOOL_CALL_STARTED,
     AgentContextCompacted,
     AgentThreadEvent,
     AgentImageGenerationCompleted,
@@ -81,6 +86,239 @@ class _FakeParticipant:
         if key == "name":
             return "assistant"
         return None
+
+
+def test_make_agent_event_reader_accumulates_streamed_text_for_restore() -> None:
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    context = adapter.create_session()
+    restored_messages: list[dict[str, object]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+
+    reader.consume(
+        AgentTextContentDelta(
+            type=AGENT_EVENT_TEXT_CONTENT_DELTA,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="text-1",
+            text="Hi",
+        )
+    )
+    reader.consume(
+        AgentTextContentDelta(
+            type=AGENT_EVENT_TEXT_CONTENT_DELTA,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="text-1",
+            text=" there",
+        )
+    )
+    reader.consume(
+        AgentTextContentDelta(
+            type=AGENT_EVENT_TEXT_CONTENT_DELTA,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="text-1",
+            text="Hi there",
+        )
+    )
+    reader.consume(
+        AgentTextContentEnded(
+            type=AGENT_EVENT_TEXT_CONTENT_ENDED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="text-1",
+        )
+    )
+    adapter.restore_context_messages(context=context, messages=restored_messages)
+
+    assert context.messages == [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Hi there"}],
+        }
+    ]
+
+
+def _restore_tool_lifecycle(
+    adapter: OpenAIResponsesAdapter,
+    *,
+    namespace: str,
+    toolkit: str,
+    tool: str,
+    arguments: dict[str, object],
+) -> list[dict[str, object]]:
+    context = adapter.create_session()
+    restored_messages: list[dict[str, object]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+    serialized_arguments = json.dumps(
+        arguments,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    split_at = max(1, len(serialized_arguments) // 2)
+    for delta in (
+        serialized_arguments[:split_at],
+        serialized_arguments[split_at:],
+    ):
+        reader.consume(
+            AgentToolCallArgumentsDelta(
+                type=AGENT_EVENT_TOOL_CALL_ARGUMENTS_DELTA,
+                thread_id="thread-1",
+                turn_id="turn-1",
+                item_id="tool-1",
+                namespace=namespace,
+                call_id="call-1",
+                delta=delta,
+            )
+        )
+    reader.consume(
+        AgentToolCallStarted(
+            type=AGENT_EVENT_TOOL_CALL_STARTED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="tool-1",
+            namespace=namespace,
+            call_id="call-1",
+            toolkit=toolkit,
+            tool=tool,
+            arguments=arguments,
+        )
+    )
+    reader.consume(
+        AgentToolCallEnded(
+            type=AGENT_EVENT_TOOL_CALL_ENDED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="tool-1",
+            namespace=namespace,
+            call_id="call-1",
+            toolkit=toolkit,
+            tool=tool,
+            result=TextContent(text="tool result"),
+        )
+    )
+    reader.finalize()
+    adapter.restore_context_messages(context=context, messages=restored_messages)
+    return context.messages
+
+
+@pytest.mark.parametrize(
+    ("namespace", "toolkit", "tool", "arguments", "expected_type"),
+    [
+        ("meshagent", "toolkit", "custom_tool", {"value": 1}, "function_call"),
+        (
+            "openai.responses",
+            "openai",
+            "shell",
+            {"action": {"commands": ["pwd"]}},
+            "shell_call",
+        ),
+        (
+            "openai.responses",
+            "openai",
+            "local_shell",
+            {"action": {"commands": ["pwd"]}},
+            "local_shell_call",
+        ),
+        (
+            "openai.responses",
+            "openai",
+            "apply_patch",
+            {"operation": {"type": "update_file", "path": "report.py", "diff": "@@"}},
+            "apply_patch_call",
+        ),
+        (
+            "openai.responses",
+            "openai",
+            "computer",
+            {"action": {"type": "screenshot"}},
+            "computer_call",
+        ),
+        (
+            "openai.responses",
+            "openai",
+            "code_interpreter",
+            {"code": "print(1)"},
+            "code_interpreter_call",
+        ),
+        (
+            "openai.responses",
+            "openai",
+            "web_search",
+            {"query": "meshagent"},
+            "web_search_call",
+        ),
+        (
+            "openai.responses",
+            "openai",
+            "file_search",
+            {"queries": ["meshagent"]},
+            "file_search_call",
+        ),
+        (
+            "openai.responses",
+            "openai",
+            "image_generation",
+            {"prompt": "chart"},
+            "image_generation_call",
+        ),
+        (
+            "openai.responses",
+            "server",
+            "search",
+            {"query": "meshagent"},
+            "mcp_call",
+        ),
+        (
+            "openai.responses",
+            "server",
+            "list_tools",
+            {},
+            "mcp_list_tools",
+        ),
+    ],
+)
+def test_make_agent_event_reader_restores_tool_lifecycle_as_responses_items(
+    namespace: str,
+    toolkit: str,
+    tool: str,
+    arguments: dict[str, object],
+    expected_type: str,
+) -> None:
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+
+    messages = _restore_tool_lifecycle(
+        adapter,
+        namespace=namespace,
+        toolkit=toolkit,
+        tool=tool,
+        arguments=arguments,
+    )
+
+    restored_call = messages[0]
+    assert restored_call["type"] == expected_type
+    if expected_type == "function_call":
+        assert restored_call["arguments"] == json.dumps(
+            arguments,
+            separators=(",", ":"),
+        )
+        assert messages[1] == {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "tool result",
+        }
+        return
+
+    if expected_type in {
+        "shell_call",
+        "local_shell_call",
+        "computer_call",
+        "apply_patch_call",
+    }:
+        assert messages[1]["type"] == f"{expected_type}_output"
+    else:
+        assert restored_call["output"] == {"type": "text", "text": "tool result"}
 
 
 class _FakeImagesDataset:
@@ -1253,7 +1491,7 @@ async def test_next_uses_websocket_path_when_mode_is_websocket(monkeypatch):
         _fake_create_response_websocket_stream,
     )
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[],
@@ -1293,7 +1531,7 @@ async def test_next_tracks_usage_for_non_streaming_request_mode():
     context = adapter.create_session()
     context.append_user_message("hello")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[],
@@ -1344,7 +1582,7 @@ async def test_next_continues_until_final_answer_when_phase_is_present():
     context = adapter.create_session()
     context.append_user_message("hello")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[],
@@ -1406,7 +1644,7 @@ async def test_next_handles_openai_54_computer_output_items():
     context = adapter.create_session()
     context.append_user_message("click the page")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=room.local_participant,
         toolkits=[toolkit],
@@ -1453,7 +1691,7 @@ async def test_next_tracks_usage_for_streaming_request_mode():
     context.append_user_message("hello")
     events: list[dict] = []
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[],
@@ -1506,7 +1744,7 @@ async def test_next_commits_response_state_when_stream_ends_incomplete_after_com
     context.append_user_message("hello")
     events: list[dict] = []
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[],
@@ -1576,7 +1814,7 @@ async def test_next_stream_continues_until_final_answer_when_phase_is_present():
     context.append_user_message("hello")
     events: list[dict] = []
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[],
@@ -1623,7 +1861,7 @@ async def test_next_uses_auto_compaction_context_management_when_compaction_thre
 
     monkeypatch.setattr(adapter, "compact", _fail_compact)
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[],
@@ -1662,7 +1900,7 @@ async def test_next_marks_usage_when_response_contains_auto_compaction() -> None
     context = adapter.create_session()
     context.append_user_message("hello")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[],
@@ -1708,7 +1946,7 @@ async def test_next_disables_auto_compaction_by_default_for_unknown_model(monkey
 
     monkeypatch.setattr(adapter, "compact", _fail_compact)
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[],
@@ -1734,7 +1972,7 @@ async def test_next_combines_context_and_adapter_instructions() -> None:
     context.instructions = "base context instructions"
     context.append_user_message("hello")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[],
@@ -1787,7 +2025,7 @@ async def test_next_disables_auto_compaction_when_computer_use_tool_present(
         ],
     )
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[],
@@ -1826,7 +2064,7 @@ async def test_next_uses_auto_compaction_by_default(monkeypatch):
 
     monkeypatch.setattr(adapter, "compact", _fail_compact)
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[],
@@ -1901,7 +2139,7 @@ async def test_next_uses_manual_compaction_in_standalone_mode(monkeypatch):
 
     monkeypatch.setattr(adapter, "compact", _fake_compact)
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[],
@@ -1941,7 +2179,7 @@ async def test_next_disables_compaction_when_context_management_none(monkeypatch
 
     monkeypatch.setattr(adapter, "compact", _fail_compact)
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[],
@@ -2155,7 +2393,7 @@ async def test_next_serializes_websocket_requests_per_session(monkeypatch):
     )
 
     first_task = asyncio.create_task(
-        adapter.next(
+        adapter.create_response(
             context=context,
             caller=_FakeRoom().local_participant,
             toolkits=[],
@@ -2164,7 +2402,7 @@ async def test_next_serializes_websocket_requests_per_session(monkeypatch):
     await _wait_for(lambda: len(websocket.sent_payloads) == 1)
 
     second_task = asyncio.create_task(
-        adapter.next(
+        adapter.create_response(
             context=context,
             caller=_FakeRoom().local_participant,
             toolkits=[],
@@ -2224,7 +2462,7 @@ async def test_cancelled_request_closes_websocket_and_next_request_reconnects(
     )
 
     first_task = asyncio.create_task(
-        adapter.next(
+        adapter.create_response(
             context=context,
             caller=_FakeRoom().local_participant,
             toolkits=[],
@@ -2236,7 +2474,7 @@ async def test_cancelled_request_closes_websocket_and_next_request_reconnects(
 
         first_task.cancel()
         second_task = asyncio.create_task(
-            adapter.next(
+            adapter.create_response(
                 context=context,
                 caller=_FakeRoom().local_participant,
                 toolkits=[],
@@ -2407,7 +2645,7 @@ async def test_next_inserts_steering_messages_after_tool_results() -> None:
         context.append_user_message("steer now")
         return True
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[Toolkit(name="storage", tools=[_AnyArgsTool("write_file")])],
@@ -2480,7 +2718,7 @@ async def test_next_drops_post_tool_response_items_before_steering_in_request_mo
         context.append_user_message("steer now")
         return True
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[Toolkit(name="storage", tools=[_AnyArgsTool("write_file")])],
@@ -2551,7 +2789,7 @@ async def test_next_passes_thread_and_turn_ids_in_tool_caller_context() -> None:
     context.metadata["thread_id"] = "thread-1"
     context.metadata["turn_id"] = "turn-1"
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[Toolkit(name="tools", tools=[tool])],
@@ -2617,7 +2855,7 @@ async def test_next_drops_post_tool_stream_items_before_steering() -> None:
         context.append_user_message("steer now")
         return True
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[Toolkit(name="storage", tools=[_AnyArgsTool("write_file")])],
@@ -2723,7 +2961,7 @@ async def test_next_restarts_after_first_completed_tool_call_before_later_tool_c
         return True
 
     task = asyncio.create_task(
-        adapter.next(
+        adapter.create_response(
             context=context,
             caller=_FakeRoom().local_participant,
             toolkits=[Toolkit(name="test", tools=[tool_a, tool_b])],
@@ -2790,7 +3028,7 @@ async def test_request_mode_cancellation_restores_context_during_tool_call() -> 
     context.append_user_message("run tool")
 
     task = asyncio.create_task(
-        adapter.next(
+        adapter.create_response(
             context=context,
             caller=_FakeRoom().local_participant,
             toolkits=[Toolkit(name="storage", tools=[blocking_tool])],
@@ -2880,7 +3118,7 @@ async def test_next_retries_after_openai_api_error(monkeypatch):
     context = adapter.create_session()
     context.append_user_message("hello")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[],
@@ -2919,7 +3157,7 @@ async def test_next_retries_after_stream_iterator_api_error(monkeypatch):
     context.append_user_message("hello")
     stream_events: list[dict] = []
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[],
@@ -2955,7 +3193,7 @@ async def test_next_omits_on_behalf_of_header_when_name_is_missing() -> None:
     context = adapter.create_session()
     context.append_user_message("hello")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         on_behalf_of=_NamelessParticipant(),
@@ -3021,7 +3259,7 @@ async def test_next_retries_after_shell_tool_room_exception(monkeypatch):
 
     shell_tool = ShellTool(room=room, image="meshagent/python:default")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=room.local_participant,
         toolkits=[Toolkit(name="openai", tools=[shell_tool])],
@@ -3230,7 +3468,7 @@ async def test_next_retries_after_websocket_close(monkeypatch):
         _fake_coerce_response_stream_event,
     )
     try:
-        result = await adapter.next(
+        result = await adapter.create_response(
             context=context,
             caller=_FakeRoom().local_participant,
             toolkits=[],
@@ -3299,7 +3537,7 @@ async def test_next_does_not_retry_after_websocket_out_of_credits(monkeypatch):
 
     try:
         with pytest.raises(RoomException) as exc_info:
-            await adapter.next(
+            await adapter.create_response(
                 context=context,
                 caller=_FakeRoom().local_participant,
                 toolkits=[],
@@ -3339,7 +3577,7 @@ async def test_next_raises_after_retry_budget_is_exhausted(monkeypatch):
     context.append_user_message("hello")
 
     with pytest.raises(RoomException, match="Error from OpenAI"):
-        await adapter.next(
+        await adapter.create_response(
             context=context,
             caller=_FakeRoom().local_participant,
             toolkits=[],

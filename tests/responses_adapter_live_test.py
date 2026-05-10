@@ -334,7 +334,7 @@ async def test_live_openai_auto_compaction_threshold_reports_compacted_next_call
     context.append_user_message("Reply with OK only.")
 
     first_result = await asyncio.wait_for(
-        adapter.next(
+        adapter.create_response(
             context=context,
             caller=_FakeRoom().local_participant,
             toolkits=[],
@@ -357,7 +357,7 @@ async def test_live_openai_auto_compaction_threshold_reports_compacted_next_call
 
     context.append_user_message("Reply with OK only.")
     second_result = await asyncio.wait_for(
-        adapter.next(
+        adapter.create_response(
             context=context,
             caller=_FakeRoom().local_participant,
             toolkits=[],
@@ -395,7 +395,7 @@ async def test_live_openai_adapter_receives_tool_preamble_message():
     )
 
     result = await asyncio.wait_for(
-        adapter.next(
+        adapter.create_response(
             context=context,
             caller=room.local_participant,
             toolkits=[Toolkit(name="test", tools=[tool])],
@@ -580,7 +580,7 @@ async def test_live_openai_apply_patch_streams_patch_deltas_before_done(tmp_path
         publisher(event)
 
     next_task = asyncio.create_task(
-        adapter.next(
+        adapter.create_response(
             context=context,
             caller=_FakeRoom().local_participant,
             toolkits=[Toolkit(name="openai", tools=[ApplyPatchTool(storage=storage)])],
@@ -676,11 +676,9 @@ async def test_live_openai_apply_patch_streams_patch_deltas_before_done(tmp_path
         indent=2,
     )
     assert "report.py" in accumulated_delta or "print('hello')" in accumulated_delta
-    assert (
-        "report.py" in "".join(message.delta for message in agent_argument_deltas)
-        or "print('hello')"
-        in "".join(message.delta for message in agent_argument_deltas)
-    )
+    assert "report.py" in "".join(
+        message.delta for message in agent_argument_deltas
+    ) or "print('hello')" in "".join(message.delta for message in agent_argument_deltas)
     assert "Keep the example output small" in report_path.read_text(encoding="utf-8")
 
 
@@ -859,7 +857,7 @@ async def test_openai_gpt_54_adapter_uses_native_computer_tool():
 
     try:
         result = await asyncio.wait_for(
-            adapter.next(
+            adapter.create_response(
                 context=context,
                 caller=room.local_participant,
                 toolkits=[toolkit],
@@ -950,7 +948,7 @@ async def test_live_openai_responses_inserts_steer_immediately_after_tool_bounda
         return True
 
     task = asyncio.create_task(
-        adapter.next(
+        adapter.create_response(
             context=context,
             caller=room.local_participant,
             toolkits=[Toolkit(name="test", tools=[tool])],
@@ -1019,7 +1017,7 @@ async def test_live_openai_websocket_inserts_steer_immediately_after_tool_bounda
         return True
 
     task = asyncio.create_task(
-        adapter.next(
+        adapter.create_response(
             context=context,
             caller=room.local_participant,
             toolkits=[Toolkit(name="test", tools=[tool])],
@@ -1092,7 +1090,7 @@ async def test_live_openai_request_inserts_steer_after_first_completed_tool_when
         return True
 
     task = asyncio.create_task(
-        adapter.next(
+        adapter.create_response(
             context=context,
             caller=room.local_participant,
             toolkits=[Toolkit(name="test", tools=[alpha_tool, beta_tool])],

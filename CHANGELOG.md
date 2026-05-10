@@ -1,3 +1,6 @@
+## [0.40.0]
+- Breaking: Renamed OpenAI LLM adapter `next(...)` implementations to `create_response(...)`, including Responses, Chat Completions, and Realtime adapters.
+
 ## [0.39.9]
 - Added/expanded `meshagent init` and `meshagent doctor` CLI workflows in the Python SDK, including TUI init improvements.
 - Expanded `meshagent doctor` to provide richer, toolchain-aware diagnostics (Python/TypeScript/.NET), including stronger deployment/runtime guidance and missing toolchain detection.

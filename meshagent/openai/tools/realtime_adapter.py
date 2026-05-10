@@ -1,0 +1,1023 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import contextlib
+import copy
+import json
+import logging
+from collections.abc import Callable, Mapping
+from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+import aiohttp
+from openai import AsyncOpenAI
+
+from meshagent.agents.adapter import (
+    LLMAdapter,
+    LLMModelInfo,
+    SteeringCallback,
+    llm_model_pricing,
+)
+from meshagent.agents.agent import AgentSessionContext
+from meshagent.agents.agent_event_reader import (
+    AccumulatingAgentEventReader,
+    AgentEventReader,
+    AgentEventReaderCallbacks,
+    _BufferedToolCall,
+)
+from meshagent.openai.tools.event_publisher import make_realtime_agent_event_publisher
+from meshagent.agents.messages import AgentMessage, ToolChoice
+from meshagent.api import Participant, RoomException
+from meshagent.api.error_codes import ErrorCode
+from meshagent.api.http import (
+    llm_annotation_headers,
+    new_client_session,
+    normalize_llm_annotations,
+)
+from meshagent.openai.proxy import (
+    get_client,
+    resolve_api_key,
+    resolve_base_url,
+    resolve_user_agent,
+)
+from meshagent.tools import Toolkit
+
+logger = logging.getLogger("openai_realtime_agent")
+
+
+def _normalize_realtime_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = dict(options)
+    modalities = normalized.pop("modalities", None)
+    if "output_modalities" not in normalized and modalities is not None:
+        normalized["output_modalities"] = modalities
+    return normalized
+
+
+class OpenAIRealtimeSessionContext(AgentSessionContext):
+    _default_websocket_ping_interval_seconds = 20.0
+    _default_websocket_timeout_seconds = 60 * 60
+
+    def __init__(
+        self,
+        *,
+        websocket_timeout: float = _default_websocket_timeout_seconds,
+        websocket_ping_interval_seconds: float = _default_websocket_ping_interval_seconds,
+        session: aiohttp.ClientSession | None = None,
+        **kwargs: Any,
+    ):
+        super().__init__(**kwargs)
+        if websocket_timeout <= 0:
+            raise ValueError("websocket_timeout must be greater than 0")
+        if websocket_ping_interval_seconds <= 0:
+            raise ValueError("websocket_ping_interval_seconds must be greater than 0")
+        self._websocket_timeout = websocket_timeout
+        self._websocket_ping_interval_seconds = websocket_ping_interval_seconds
+        self._session: aiohttp.ClientSession | None = session
+        self._owns_session = session is None
+        self._websocket: aiohttp.ClientWebSocketResponse | None = None
+        self._websocket_url: str | None = None
+        self._websocket_headers_signature: tuple[tuple[str, str], ...] | None = None
+        self._websocket_lock = asyncio.Lock()
+        self._send_lock = asyncio.Lock()
+        self._request_lock = asyncio.Lock()
+        self._receive_task: asyncio.Task[None] | None = None
+        self._websocket_ping_task: asyncio.Task[None] | None = None
+        self._websocket_timeout_task: asyncio.Task[None] | None = None
+        self._event_handler: Callable[[dict[str, Any]], None] | None = None
+        self._response_future: asyncio.Future[dict[str, Any]] | None = None
+        self._synced_message_count = 0
+
+    @staticmethod
+    def _headers_signature(headers: dict[str, str]) -> tuple[tuple[str, str], ...]:
+        return tuple(sorted((key.lower(), value) for key, value in headers.items()))
+
+    @property
+    def is_connected(self) -> bool:
+        return self._websocket is not None and not self._websocket.closed
+
+    async def _run_websocket_ping(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._websocket_ping_interval_seconds)
+                websocket = self._websocket
+                if websocket is None or websocket.closed:
+                    return
+                await websocket.ping()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning("realtime websocket ping failed, closing socket: %s", error)
+            await self.close_websocket()
+
+    async def _run_websocket_timeout(self) -> None:
+        try:
+            await asyncio.sleep(self._websocket_timeout)
+        except asyncio.CancelledError:
+            raise
+        logger.info(
+            "realtime websocket session timed out after %.1f seconds",
+            self._websocket_timeout,
+        )
+        await self.close()
+
+    async def _close_websocket_locked(self) -> None:
+        current_task = asyncio.current_task()
+        tasks: list[asyncio.Task[Any]] = []
+        for task in (
+            self._receive_task,
+            self._websocket_ping_task,
+            self._websocket_timeout_task,
+        ):
+            if task is not None and task is not current_task:
+                tasks.append(task)
+        self._receive_task = None
+        self._websocket_ping_task = None
+        self._websocket_timeout_task = None
+
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
+        websocket = self._websocket
+        self._websocket = None
+        self._websocket_url = None
+        self._websocket_headers_signature = None
+        self._synced_message_count = 0
+        future = self._response_future
+        self._response_future = None
+        if future is not None and not future.done():
+            future.set_exception(
+                RoomException(
+                    "OpenAI Realtime websocket closed before the response completed",
+                    status_code=503,
+                    code=ErrorCode.OPERATION_FAILED,
+                )
+            )
+        if websocket is not None and not websocket.closed:
+            await websocket.close()
+
+    async def close_websocket(self) -> None:
+        async with self._websocket_lock:
+            await self._close_websocket_locked()
+
+    async def close(self) -> None:
+        await self.close_websocket()
+        if self._owns_session:
+            session = self._session
+            self._session = None
+            if session is not None and not session.closed:
+                await asyncio.shield(session.close())
+
+    async def start(self) -> None:
+        await super().start()
+        if self._session is None and self._owns_session:
+            self._session = new_client_session(
+                timeout=aiohttp.ClientTimeout(total=None)
+            )
+
+    def copy(self) -> "OpenAIRealtimeSessionContext":
+        shared_session = self._session if not self._owns_session else None
+        return self.__class__(
+            messages=copy.deepcopy(self.messages),
+            system_role=self.system_role,
+            websocket_timeout=self._websocket_timeout,
+            websocket_ping_interval_seconds=self._websocket_ping_interval_seconds,
+            session=shared_session,
+        )
+
+    async def connect(
+        self,
+        *,
+        url: str,
+        headers: dict[str, str],
+        event_handler: Callable[[dict[str, Any]], None],
+        receive_loop: Callable[["OpenAIRealtimeSessionContext"], Any],
+    ) -> aiohttp.ClientWebSocketResponse:
+        headers_signature = self._headers_signature(headers)
+        async with self._websocket_lock:
+            if (
+                self._websocket is not None
+                and not self._websocket.closed
+                and self._websocket_url == url
+                and self._websocket_headers_signature == headers_signature
+            ):
+                self._event_handler = event_handler
+                return self._websocket
+
+            await self._close_websocket_locked()
+
+            session = self._session
+            created_session = False
+            if session is None:
+                session = new_client_session(timeout=aiohttp.ClientTimeout(total=None))
+                created_session = True
+                if self._owns_session:
+                    self._session = session
+
+            try:
+                websocket = await session.ws_connect(
+                    url,
+                    headers=headers,
+                    heartbeat=None,
+                    autoping=True,
+                )
+            except aiohttp.WSServerHandshakeError as error:
+                if created_session:
+                    if self._session is session:
+                        self._session = None
+                    await session.close()
+                raise RoomException(
+                    f"OpenAI Realtime websocket request failed with status {error.status}.",
+                    status_code=error.status,
+                ) from error
+            except Exception:
+                if created_session:
+                    if self._session is session:
+                        self._session = None
+                    await session.close()
+                raise
+
+            self._websocket = websocket
+            self._websocket_url = url
+            self._websocket_headers_signature = headers_signature
+            self._event_handler = event_handler
+            self._receive_task = asyncio.create_task(receive_loop(self))
+            self._websocket_ping_task = asyncio.create_task(self._run_websocket_ping())
+            self._websocket_timeout_task = asyncio.create_task(
+                self._run_websocket_timeout()
+            )
+            return websocket
+
+    async def send_json(self, payload: dict[str, Any]) -> None:
+        websocket = self._websocket
+        if websocket is None or websocket.closed:
+            raise RoomException(
+                "OpenAI Realtime session is not connected. Call connect() before sending events."
+            )
+        async with self._send_lock:
+            await websocket.send_str(json.dumps(payload))
+
+
+class _OpenAIRealtimeAgentEventReader(AccumulatingAgentEventReader):
+    def _append_user_text(self, text: str) -> None:
+        self._emit_context_message(
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            }
+        )
+
+    def _append_user_content(self, content: list[dict[str, Any]]) -> None:
+        parts: list[dict[str, Any]] = []
+        for item in content:
+            item_type = item.get("type")
+            if item_type == "text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append({"type": "input_text", "text": text})
+            elif item_type == "file":
+                url = item.get("url")
+                if isinstance(url, str):
+                    parts.append(
+                        {"type": "input_text", "text": f"attached file: {url}"}
+                    )
+        if not parts:
+            parts.append({"type": "input_text", "text": json.dumps(content)})
+        self._emit_context_message({"role": "user", "content": parts})
+
+    def _append_assistant_text(self, *, text: str, phase: str | None) -> None:
+        del phase
+        self._emit_context_message(
+            {
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            }
+        )
+
+    def _append_assistant_reasoning(self, *, text: str) -> None:
+        self._append_assistant_text(text=f"Reasoning: {text}", phase=None)
+
+    def _append_assistant_file(self, *, url: str) -> None:
+        self._append_assistant_text(text=f"Generated file: {url}", phase=None)
+
+    def _append_thread_event(self, *, event: dict[str, Any]) -> None:
+        self._append_assistant_text(
+            text=json.dumps({"type": "event", "event": event}),
+            phase=None,
+        )
+
+    def _append_tool_call(
+        self,
+        *,
+        tool_call: _BufferedToolCall,
+        result: dict[str, Any] | None,
+        error: dict[str, Any] | None,
+    ) -> None:
+        self._emit_context_message(
+            {
+                "type": "function_call",
+                "id": tool_call.item_id,
+                "call_id": tool_call.call_id or tool_call.item_id,
+                "name": self._function_name(tool_call=tool_call),
+                "arguments": tool_call.arguments_json(),
+                "status": "completed"
+                if result is not None or error is not None or tool_call.logs
+                else "in_progress",
+            }
+        )
+        if result is not None or error is not None or tool_call.logs:
+            self._emit_context_message(
+                {
+                    "type": "function_call_output",
+                    "id": f"{tool_call.item_id}:output",
+                    "call_id": tool_call.call_id or tool_call.item_id,
+                    "output": self._result_text(
+                        result=result,
+                        error=error,
+                        logs=tool_call.logs,
+                    ),
+                    "status": "failed" if error is not None else "completed",
+                }
+            )
+
+    def _append_image_generation_event(
+        self,
+        *,
+        event_type: str,
+        item_id: str,
+        call_id: str | None,
+        toolkit: str,
+        tool: str,
+        arguments: dict[str, Any] | None,
+        images: list[dict[str, Any]],
+        status: str,
+        status_detail: str | None,
+    ) -> None:
+        item = {
+            "type": "image_generation",
+            "event_type": event_type,
+            "item_id": item_id,
+            "call_id": call_id,
+            "toolkit": toolkit,
+            "tool": tool,
+            "arguments": arguments,
+            "images": images,
+            "status": status,
+            "status_detail": status_detail,
+        }
+        self._append_assistant_text(text=json.dumps(item), phase=None)
+
+    def _append_audio_generation_event(self, *, message: Any) -> None:
+        self._append_assistant_text(
+            text=json.dumps(message.model_dump(mode="json")),
+            phase=None,
+        )
+
+    def _append_audio_transcription_event(self, *, message: Any) -> None:
+        self._append_assistant_text(
+            text=json.dumps(message.model_dump(mode="json")),
+            phase=None,
+        )
+
+    def _restore_compacted_messages(self, *, messages: list[dict[str, Any]]) -> None:
+        for message in messages:
+            self._emit_context_message(message)
+
+    @staticmethod
+    def _function_name(*, tool_call: _BufferedToolCall) -> str:
+        if tool_call.namespace == "openai.responses" and tool_call.toolkit == "openai":
+            return f"{tool_call.tool}_call"
+        if (
+            tool_call.namespace == "anthropic.messages"
+            and tool_call.toolkit == "anthropic"
+        ):
+            return f"{tool_call.tool}_tool_use"
+        if tool_call.namespace in {"openai.responses", "anthropic.messages"}:
+            return f"{tool_call.toolkit}_{tool_call.tool}".strip("_")
+        if tool_call.toolkit in {"", "function", "tool"}:
+            return tool_call.tool
+        return f"{tool_call.toolkit}_{tool_call.tool}"
+
+    def _append_assistant_structured_item(self, item: dict[str, Any]) -> None:
+        self._emit_context_message(
+            {
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": json.dumps(item)}],
+            }
+        )
+
+
+class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
+    _known_models = (
+        "gpt-realtime",
+        "gpt-realtime-2",
+        "gpt-realtime-1.5",
+        "gpt-realtime-mini",
+    )
+
+    def __init__(
+        self,
+        model: str = "gpt-realtime",
+        *,
+        client: AsyncOpenAI | None = None,
+        session_options: Mapping[str, Any] | None = None,
+        response_options: Mapping[str, Any] | None = None,
+        provider: str = "openai-realtime",
+        log_requests: bool = False,
+        websocket_timeout: float = OpenAIRealtimeSessionContext._default_websocket_timeout_seconds,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        user_agent: str | None = None,
+        annotations: Mapping[str, object] | None = None,
+        friendly_name: str | None = None,
+        description: str | None = None,
+        allowed_models: list[str] | None = None,
+    ):
+        if websocket_timeout <= 0:
+            raise ValueError("websocket_timeout must be greater than 0")
+        self._model = model
+        self._client = client
+        self._session_options = dict(session_options or {})
+        self._response_options = dict(response_options or {})
+        self._provider = provider
+        self._log_requests = log_requests
+        self._websocket_timeout = websocket_timeout
+        self._base_url = resolve_base_url(base_url)
+        self._has_explicit_api_key = isinstance(api_key, str) and api_key.strip() != ""
+        self._api_key = resolve_api_key(api_key)
+        self._user_agent = resolve_user_agent(user_agent)
+        self._annotations = normalize_llm_annotations(annotations)
+        self._friendly_name = friendly_name
+        self._description = description
+        self._allowed_models = list(allowed_models) if allowed_models is not None else None
+
+    def default_model(self) -> str:
+        return self._model
+
+    def provider_name(self) -> str | None:
+        return self._provider
+
+    def provider_friendly_name(self) -> str:
+        return self._friendly_name or "OpenAI Realtime"
+
+    def provider_description(self) -> str | None:
+        return self._description or "OpenAI Realtime API"
+
+    def list_models(self) -> list[LLMModelInfo]:
+        names = list(self._allowed_models or self._known_models)
+        if self._allowed_models is None and self._model not in names:
+            names.insert(0, self._model)
+        return [
+            LLMModelInfo(
+                name=name,
+                context_window=32000,
+                pricing=llm_model_pricing(provider="openai", model=name),
+            )
+            for name in names
+        ]
+
+    def create_session(self) -> OpenAIRealtimeSessionContext:
+        return OpenAIRealtimeSessionContext(
+            system_role=None,
+            websocket_timeout=self._websocket_timeout,
+        )
+
+    def make_agent_event_reader(
+        self,
+        *,
+        emit_message: Callable[[dict[str, Any]], None],
+        callbacks: AgentEventReaderCallbacks | None = None,
+    ) -> AgentEventReader:
+        return _OpenAIRealtimeAgentEventReader(
+            emit_message=emit_message,
+            callbacks=callbacks,
+        )
+
+    def restore_context_messages(
+        self,
+        *,
+        context: AgentSessionContext,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        if not isinstance(context, OpenAIRealtimeSessionContext):
+            raise RoomException(
+                "OpenAIRealtimeAdapter requires OpenAIRealtimeSessionContext from create_session()"
+            )
+        context.previous_messages.clear()
+        context.previous_messages.extend(copy.deepcopy(messages))
+        context.messages.clear()
+        context.previous_response_id = None
+        context._synced_message_count = 0
+
+    def make_agent_event_publisher(
+        self,
+        turn_id: str,
+        thread_id: str,
+        callback: Callable[[AgentMessage], None],
+        custom_event_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> Callable[[dict[str, Any]], None]:
+        return make_realtime_agent_event_publisher(
+            turn_id=turn_id,
+            thread_id=thread_id,
+            callback=callback,
+            custom_event_callback=custom_event_callback,
+        )
+
+    def with_runtime_api_key(self, *, api_key: str | None) -> "OpenAIRealtimeAdapter":
+        resolved_api_key = resolve_api_key(api_key)
+        if (
+            self._client is not None
+            or self._has_explicit_api_key
+            or resolved_api_key is None
+        ):
+            return self
+        return type(self)(
+            model=self._model,
+            session_options=self._session_options,
+            response_options=self._response_options,
+            provider=self._provider,
+            log_requests=self._log_requests,
+            websocket_timeout=self._websocket_timeout,
+            base_url=self._base_url,
+            api_key=resolved_api_key,
+            user_agent=self._user_agent,
+            annotations=self._annotations,
+            friendly_name=self._friendly_name,
+            description=self._description,
+            allowed_models=self._allowed_models,
+        )
+
+    def _openai_client(self) -> AsyncOpenAI:
+        if self._client is not None:
+            return self._client
+        return get_client(
+            base_url=self._base_url,
+            api_key=self._api_key,
+            user_agent=self._user_agent,
+        )
+
+    @staticmethod
+    def _http_base_url_to_ws_realtime_url(*, base_url: str, model: str) -> str:
+        parsed = urlparse(base_url)
+        if parsed.scheme == "https":
+            ws_scheme = "wss"
+        elif parsed.scheme == "http":
+            ws_scheme = "ws"
+        elif parsed.scheme in ("ws", "wss"):
+            ws_scheme = parsed.scheme
+        else:
+            raise RoomException(
+                f"unsupported OpenAI base URL scheme for realtime mode: {parsed.scheme}"
+            )
+
+        query_items = parse_qsl(parsed.query, keep_blank_values=True)
+        query_items.append(("model", model))
+        path = parsed.path.rstrip("/") + "/realtime"
+        return urlunparse(
+            (
+                ws_scheme,
+                parsed.netloc,
+                path,
+                parsed.params,
+                urlencode(query_items),
+                parsed.fragment,
+            )
+        )
+
+    def _websocket_headers(
+        self, *, openai: AsyncOpenAI, extra_headers: dict[str, str]
+    ) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        for key, value in openai.default_headers.items():
+            if isinstance(value, str):
+                headers[key] = value
+        headers.update(extra_headers)
+        excluded_headers = {"openai-beta", "content-type", "content-length"}
+        return {
+            key: value
+            for key, value in headers.items()
+            if key.lower() not in excluded_headers
+        }
+
+    @staticmethod
+    def _terminal_response_event(event_type: str) -> bool:
+        return event_type in {
+            "response.done",
+            "response.completed",
+            "response.failed",
+            "response.incomplete",
+        }
+
+    @staticmethod
+    def _response_error(event: dict[str, Any]) -> RoomException | None:
+        if event.get("type") != "response.failed":
+            return None
+        response = event.get("response")
+        error: Any = None
+        if isinstance(response, dict):
+            error = response.get("error")
+        if error is None:
+            error = event.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            code = error.get("code")
+            if isinstance(message, str) and message.strip() != "":
+                return RoomException(
+                    message.strip(),
+                    status_code=500,
+                    code=code if isinstance(code, str) else ErrorCode.OPERATION_FAILED,
+                )
+        return RoomException(
+            "OpenAI Realtime response failed",
+            status_code=500,
+            code=ErrorCode.OPERATION_FAILED,
+        )
+
+    async def _receive_payload(
+        self,
+        *,
+        websocket: aiohttp.ClientWebSocketResponse,
+    ) -> dict[str, Any]:
+        while True:
+            message = await websocket.receive()
+            if message.type == aiohttp.WSMsgType.TEXT:
+                try:
+                    payload = json.loads(message.data)
+                except json.JSONDecodeError as error:
+                    raise RoomException(
+                        f"OpenAI Realtime websocket returned invalid JSON: {error}"
+                    ) from error
+                if not isinstance(payload, dict):
+                    continue
+                if self._log_requests:
+                    logger.info("<== realtime event=%s", payload.get("type"))
+                if payload.get("type") == "error":
+                    error = payload.get("error")
+                    if isinstance(error, dict):
+                        message_text = error.get("message")
+                        if isinstance(message_text, str):
+                            raise RoomException(
+                                f"Error from OpenAI Realtime websocket: {message_text}"
+                            )
+                    raise RoomException(
+                        f"Error from OpenAI Realtime websocket: {json.dumps(payload)}"
+                    )
+                return payload
+
+            if message.type in {
+                aiohttp.WSMsgType.CLOSED,
+                aiohttp.WSMsgType.CLOSE,
+                aiohttp.WSMsgType.CLOSING,
+                aiohttp.WSMsgType.ERROR,
+            }:
+                raise RoomException(
+                    "OpenAI Realtime websocket closed unexpectedly",
+                    status_code=503,
+                    code=ErrorCode.OPERATION_FAILED,
+                )
+
+            if message.type == aiohttp.WSMsgType.BINARY:
+                raise RoomException(
+                    "OpenAI Realtime websocket returned unexpected binary message"
+                )
+
+    async def _receive_loop(self, context: OpenAIRealtimeSessionContext) -> None:
+        try:
+            while True:
+                websocket = context._websocket
+                if websocket is None or websocket.closed:
+                    return
+                event = await self._receive_payload(websocket=websocket)
+                event_handler = context._event_handler
+                if event_handler is not None:
+                    event_handler(event)
+
+                event_type = event.get("type")
+                if not isinstance(event_type, str):
+                    continue
+
+                future = context._response_future
+                if future is None or future.done():
+                    continue
+
+                if self._terminal_response_event(event_type):
+                    error = self._response_error(event)
+                    if error is not None:
+                        future.set_exception(error)
+                    else:
+                        future.set_result(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            future = context._response_future
+            if future is not None and not future.done():
+                if isinstance(error, RoomException):
+                    future.set_exception(error)
+                else:
+                    future.set_exception(
+                        RoomException(
+                            str(error),
+                            status_code=503,
+                            code=ErrorCode.OPERATION_FAILED,
+                        )
+                    )
+            await context.close_websocket()
+
+    async def connect(
+        self,
+        *,
+        context: OpenAIRealtimeSessionContext,
+        event_handler: Callable[[dict[str, Any]], None] | None = None,
+        model: str | None = None,
+        options: Mapping[str, Any] | None = None,
+    ) -> None:
+        realtime_model = model or self.default_model()
+        openai = self._openai_client()
+        extra_headers = llm_annotation_headers(self._annotations)
+        headers = self._websocket_headers(openai=openai, extra_headers=extra_headers)
+        url = self._http_base_url_to_ws_realtime_url(
+            base_url=str(openai.base_url),
+            model=realtime_model,
+        )
+
+        await context.connect(
+            url=url,
+            headers=headers,
+            event_handler=event_handler or (lambda event: None),
+            receive_loop=self._receive_loop,
+        )
+
+        session_payload: dict[str, Any] = {"type": "session.update"}
+        session_options = _normalize_realtime_options(
+            copy.deepcopy(self._session_options)
+        )
+        if options is not None:
+            session_options.update(dict(options))
+            session_options = _normalize_realtime_options(session_options)
+        session_payload["session"] = {"type": "realtime", **session_options}
+        await context.send_json(session_payload)
+
+    async def disconnect(self, *, context: OpenAIRealtimeSessionContext) -> None:
+        await context.close_websocket()
+
+    async def start_session(
+        self,
+        *,
+        context: AgentSessionContext,
+        event_handler: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        if not isinstance(context, OpenAIRealtimeSessionContext):
+            raise RoomException(
+                "OpenAIRealtimeAdapter requires OpenAIRealtimeSessionContext from create_session()"
+            )
+
+        session_options: dict[str, Any] = {}
+        instructions = context.get_system_instructions()
+        if isinstance(instructions, str) and instructions.strip() != "":
+            session_options["instructions"] = instructions
+
+        await self.connect(
+            context=context,
+            event_handler=event_handler,
+            options=session_options or None,
+        )
+
+    async def stop_session(self, *, context: AgentSessionContext) -> None:
+        if not isinstance(context, OpenAIRealtimeSessionContext):
+            raise RoomException(
+                "OpenAIRealtimeAdapter requires OpenAIRealtimeSessionContext from create_session()"
+            )
+        await self.disconnect(context=context)
+
+    async def send_event(
+        self, *, context: OpenAIRealtimeSessionContext, event: Mapping[str, Any]
+    ) -> None:
+        await context.send_json(dict(event))
+
+    async def append_input_audio(
+        self,
+        *,
+        context: OpenAIRealtimeSessionContext,
+        audio: bytes | str,
+    ) -> None:
+        audio_b64 = (
+            base64.b64encode(audio).decode() if isinstance(audio, bytes) else audio
+        )
+        await context.send_json(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": audio_b64,
+            }
+        )
+
+    async def commit_input_audio(
+        self, *, context: OpenAIRealtimeSessionContext
+    ) -> None:
+        await context.send_json({"type": "input_audio_buffer.commit"})
+
+    async def clear_input_audio(self, *, context: OpenAIRealtimeSessionContext) -> None:
+        await context.send_json({"type": "input_audio_buffer.clear"})
+
+    async def cancel_response(
+        self,
+        *,
+        context: OpenAIRealtimeSessionContext,
+        response_id: str | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {"type": "response.cancel"}
+        if response_id is not None:
+            payload["response_id"] = response_id
+        await context.send_json(payload)
+
+    @staticmethod
+    def _content_to_text(content: object) -> str:
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return str(content)
+
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+                continue
+            nested_text = item.get("input_text")
+            if isinstance(nested_text, str):
+                parts.append(nested_text)
+        return "\n".join(part for part in parts if part != "")
+
+    @classmethod
+    def _conversation_item_for_message(
+        cls, message: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        message_type = message.get("type")
+        if message_type in {"function_call", "function_call_output"}:
+            item = dict(message)
+            item.setdefault("id", item.get("call_id"))
+            item.setdefault("status", "completed")
+            return {
+                "type": "conversation.item.create",
+                "item": item,
+            }
+
+        role = message.get("role")
+        if role not in {"user", "assistant"}:
+            return None
+
+        text = cls._content_to_text(message.get("content", ""))
+        if text.strip() == "":
+            return None
+
+        content_type = "input_text" if role == "user" else "output_text"
+        return {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": role,
+                "content": [{"type": content_type, "text": text}],
+            },
+        }
+
+    @classmethod
+    def _response_text(cls, event: Mapping[str, Any]) -> str:
+        response = event.get("response")
+        if not isinstance(response, dict):
+            return ""
+        output = response.get("output")
+        if not isinstance(output, list):
+            return ""
+
+        parts: list[str] = []
+        for item in output:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            if item.get("role") != "assistant":
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for content_item in content:
+                if not isinstance(content_item, dict):
+                    continue
+                text = content_item.get("text") or content_item.get("transcript")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+
+    async def _sync_text_messages(
+        self, *, context: OpenAIRealtimeSessionContext
+    ) -> None:
+        messages: list[dict[str, Any]] = [
+            *context.previous_messages,
+            *context.messages,
+        ]
+        if context._synced_message_count > len(messages):
+            context._synced_message_count = 0
+
+        for message in messages[context._synced_message_count :]:
+            payload = self._conversation_item_for_message(message)
+            if payload is None:
+                context._synced_message_count += 1
+                continue
+            await context.send_json(payload)
+            context._synced_message_count += 1
+
+    @staticmethod
+    def _response_id(event: Mapping[str, Any]) -> str | None:
+        response = event.get("response")
+        if not isinstance(response, dict):
+            return None
+        response_id = response.get("id")
+        if isinstance(response_id, str) and response_id.strip() != "":
+            return response_id
+        return None
+
+    async def create_response(
+        self,
+        *,
+        context: AgentSessionContext,
+        caller: Participant,
+        toolkits: list[Toolkit],
+        output_schema: dict | None = None,
+        event_handler: Callable[[dict[str, Any]], None] | None = None,
+        steering_callback: SteeringCallback | None = None,
+        model: str | None = None,
+        on_behalf_of: Participant | None = None,
+        tool_choice: ToolChoice | None = None,
+        options: dict | None = None,
+    ) -> dict[str, Any]:
+        del caller
+        del toolkits
+        del output_schema
+        del steering_callback
+        del model
+        del on_behalf_of
+        del tool_choice
+        if not isinstance(context, OpenAIRealtimeSessionContext):
+            raise RoomException(
+                "OpenAIRealtimeAdapter requires OpenAIRealtimeSessionContext from create_session()"
+            )
+        if not context.is_connected:
+            raise RoomException(
+                "OpenAI Realtime session is not connected. Call connect() before create_response()."
+            )
+
+        if event_handler is not None:
+            context._event_handler = event_handler
+
+        async with context._request_lock:
+            if (
+                context._response_future is not None
+                and not context._response_future.done()
+            ):
+                raise RoomException("OpenAI Realtime response is already in progress")
+            loop = asyncio.get_running_loop()
+            future: asyncio.Future[dict[str, Any]] = loop.create_future()
+            context._response_future = future
+            payload: dict[str, Any] = {"type": "response.create"}
+            response_options = _normalize_realtime_options(
+                copy.deepcopy(self._response_options)
+            )
+            if options is not None:
+                response_options.update(options)
+                response_options = _normalize_realtime_options(response_options)
+            if len(response_options) > 0:
+                payload["response"] = response_options
+            await self._sync_text_messages(context=context)
+            await context.send_json(payload)
+            try:
+                terminal_event = await future
+                response_id = self._response_id(terminal_event)
+                if response_id is not None:
+                    context.track_response(response_id)
+                else:
+                    context.previous_messages.extend(context.messages)
+                    context.messages.clear()
+                assistant_text = self._response_text(terminal_event)
+                if assistant_text != "":
+                    context.previous_messages.append(
+                        {"role": "assistant", "content": assistant_text}
+                    )
+                context._synced_message_count = len(
+                    [*context.previous_messages, *context.messages]
+                )
+                context.turn_count += 1
+                return terminal_event
+            finally:
+                if context._response_future is future:
+                    context._response_future = None
+
+
+__all__ = [
+    "OpenAIRealtimeAdapter",
+    "OpenAIRealtimeSessionContext",
+]

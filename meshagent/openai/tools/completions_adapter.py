@@ -18,6 +18,12 @@ from meshagent.agents.adapter import (
     LLMAdapter,
     SteeringCallback,
 )
+from meshagent.agents.agent_event_reader import (
+    AccumulatingAgentEventReader,
+    AgentEventReader,
+    AgentEventReaderCallbacks,
+    _BufferedToolCall,
+)
 from meshagent.agents.messages import ToolChoice
 from meshagent.api.http import llm_annotation_headers, normalize_llm_annotations
 import json
@@ -75,6 +81,148 @@ def _replace_non_matching(text: str, allowed_chars: str, replacement: str) -> st
     # Build a regex that matches any character NOT in allowed_chars
     pattern = rf"[^{allowed_chars}]"
     return re.sub(pattern, replacement, text)
+
+
+class OpenAICompletionsAgentEventReader(AccumulatingAgentEventReader):
+    def _append_user_text(self, text: str) -> None:
+        self._emit_context_message({"role": "user", "content": text})
+
+    def _append_user_content(self, content: list[dict[str, Any]]) -> None:
+        parts: list[dict[str, Any]] = []
+        for item in content:
+            item_type = item.get("type")
+            if item_type == "text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append({"type": "text", "text": text})
+            elif item_type == "file":
+                url = item.get("url")
+                if isinstance(url, str):
+                    parts.append(
+                        {"type": "text", "text": f"the user attached a file: {url}"}
+                    )
+        if not parts:
+            parts.append({"type": "text", "text": json.dumps(content)})
+        self._emit_context_message({"role": "user", "content": parts})
+
+    def _append_assistant_text(self, *, text: str, phase: str | None) -> None:
+        del phase
+        self._emit_context_message({"role": "assistant", "content": text})
+
+    def _append_assistant_reasoning(self, *, text: str) -> None:
+        self._emit_context_message(
+            {"role": "assistant", "content": f"Reasoning: {text}"}
+        )
+
+    def _append_assistant_file(self, *, url: str) -> None:
+        self._emit_context_message(
+            {"role": "assistant", "content": f"Generated file: {url}"}
+        )
+
+    def _append_thread_event(self, *, event: dict[str, Any]) -> None:
+        self._emit_context_message(
+            {
+                "role": "assistant",
+                "content": json.dumps({"type": "event", "event": event}),
+            }
+        )
+
+    def _append_tool_call(
+        self,
+        *,
+        tool_call: _BufferedToolCall,
+        result: dict[str, Any] | None,
+        error: dict[str, Any] | None,
+    ) -> None:
+        call_id = tool_call.call_id or tool_call.item_id
+        self._emit_context_message(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": self._function_name(tool_call=tool_call),
+                            "arguments": tool_call.arguments_json(),
+                        },
+                    }
+                ],
+            }
+        )
+        if result is not None or error is not None or tool_call.logs:
+            self._emit_context_message(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": self._result_text(
+                        result=result,
+                        error=error,
+                        logs=tool_call.logs,
+                    ),
+                }
+            )
+
+    def _append_image_generation_event(
+        self,
+        *,
+        event_type: str,
+        item_id: str,
+        call_id: str | None,
+        toolkit: str,
+        tool: str,
+        arguments: dict[str, Any] | None,
+        images: list[dict[str, Any]],
+        status: str,
+        status_detail: str | None,
+    ) -> None:
+        item = {
+            "type": "image_generation",
+            "event_type": event_type,
+            "item_id": item_id,
+            "call_id": call_id,
+            "toolkit": toolkit,
+            "tool": tool,
+            "arguments": arguments,
+            "images": images,
+            "status": status,
+            "status_detail": status_detail,
+        }
+        self._emit_context_message({"role": "assistant", "content": json.dumps(item)})
+
+    def _append_audio_generation_event(self, *, message: Any) -> None:
+        self._emit_context_message(
+            {
+                "role": "assistant",
+                "content": json.dumps(message.model_dump(mode="json")),
+            }
+        )
+
+    def _append_audio_transcription_event(self, *, message: Any) -> None:
+        self._emit_context_message(
+            {
+                "role": "assistant",
+                "content": json.dumps(message.model_dump(mode="json")),
+            }
+        )
+
+    def _restore_compacted_messages(self, *, messages: list[dict[str, Any]]) -> None:
+        for message in messages:
+            self._emit_context_message(message)
+
+    @staticmethod
+    def _function_name(*, tool_call: _BufferedToolCall) -> str:
+        if tool_call.namespace == "openai.responses":
+            provider_tool = (
+                f"{tool_call.tool}_call"
+                if tool_call.toolkit == "openai"
+                else f"mcp_{tool_call.tool}"
+            )
+            return safe_tool_name(provider_tool)
+        if tool_call.toolkit in {"", "function", "tool"}:
+            return safe_tool_name(tool_call.tool)
+        return safe_tool_name(f"{tool_call.toolkit}_{tool_call.tool}")
 
 
 def safe_tool_name(name: str):
@@ -342,6 +490,17 @@ class OpenAICompletionsAdapter(LLMAdapter):
 
         return context
 
+    def make_agent_event_reader(
+        self,
+        *,
+        emit_message: Callable[[dict[str, Any]], None],
+        callbacks: AgentEventReaderCallbacks | None = None,
+    ) -> AgentEventReader:
+        return OpenAICompletionsAgentEventReader(
+            emit_message=emit_message,
+            callbacks=callbacks,
+        )
+
     def _store_usage(
         self, *, context: AgentSessionContext, usage: object, model: str
     ) -> None:
@@ -439,7 +598,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
 
     # Takes the current chat context, executes a completion request and processes the response.
     # If a tool calls are requested, invokes the tools, processes the tool calls results, and appends the tool call results to the context
-    async def next(
+    async def create_response(
         self,
         *,
         model: Optional[str] = None,

@@ -6,7 +6,7 @@ from meshagent.api.http import (
     normalize_extra_headers,
     normalize_llm_annotations,
 )
-from meshagent.agents.event_publisher import (
+from meshagent.openai.tools.event_publisher import (
     _OpenAIAgentEventPublisher,
     make_openai_agent_event_publisher,
 )
@@ -43,9 +43,17 @@ from meshagent.agents.adapter import (
     DEFAULT_MAX_TOOL_CALL_LINES,
     ToolResponseAdapter,
     LLMAdapter,
+    LLMModelInfo,
     SteeringCallback,
     ToolCallApprovalHandler,
     ToolCallApprovalRequest,
+    llm_model_pricing,
+)
+from meshagent.agents.agent_event_reader import (
+    AccumulatingAgentEventReader,
+    AgentEventReader,
+    AgentEventReaderCallbacks,
+    _BufferedToolCall,
 )
 
 from meshagent.tools.script import DEFAULT_CONTAINER_MOUNT_SPEC
@@ -475,6 +483,269 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
 OpenAIResponsesChatContext = OpenAIResponsesSessionContext
 
 
+class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
+    def _append_user_text(self, text: str) -> None:
+        self._emit_context_message(
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            }
+        )
+
+    def _append_user_content(self, content: list[dict[str, Any]]) -> None:
+        parts: list[dict[str, Any]] = []
+        for item in content:
+            item_type = item.get("type")
+            if item_type == "text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append({"type": "input_text", "text": text})
+            elif item_type == "file":
+                url = item.get("url")
+                if isinstance(url, str):
+                    parts.append({"type": "input_file", "file_url": url})
+        if not parts:
+            parts.append({"type": "input_text", "text": json.dumps(content)})
+        self._emit_context_message({"role": "user", "content": parts})
+
+    def _append_assistant_text(self, *, text: str, phase: str | None) -> None:
+        del phase
+        self._emit_context_message(
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            }
+        )
+
+    def _append_assistant_reasoning(self, *, text: str) -> None:
+        self._emit_context_message(
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": text}],
+            }
+        )
+
+    def _append_assistant_file(self, *, url: str) -> None:
+        self._append_assistant_text(text=f"Generated file: {url}", phase=None)
+
+    def _append_thread_event(self, *, event: dict[str, Any]) -> None:
+        self._append_assistant_text(
+            text=json.dumps({"type": "event", "event": event}),
+            phase=None,
+        )
+
+    def _append_tool_call(
+        self,
+        *,
+        tool_call: _BufferedToolCall,
+        result: dict[str, Any] | None,
+        error: dict[str, Any] | None,
+    ) -> None:
+        item_type = self._response_item_type(tool_call=tool_call)
+        call_id = tool_call.call_id or tool_call.item_id
+        if item_type == "function_call":
+            self._emit_context_message(
+                {
+                    "type": "function_call",
+                    "id": tool_call.item_id,
+                    "call_id": call_id,
+                    "name": self._function_name(tool_call=tool_call),
+                    "arguments": tool_call.arguments_json(),
+                }
+            )
+            if result is not None or error is not None or tool_call.logs:
+                self._emit_context_message(
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": self._result_text(
+                            result=result,
+                            error=error,
+                            logs=tool_call.logs,
+                        ),
+                    }
+                )
+            return
+
+        item = self._builtin_call_item(
+            item_type=item_type,
+            tool_call=tool_call,
+            call_id=call_id,
+            result=result,
+            error=error,
+        )
+        self._emit_context_message(item)
+        output = self._builtin_output_item(
+            item_type=item_type,
+            call_id=call_id,
+            result=result,
+            error=error,
+            logs=tool_call.logs,
+        )
+        if output is not None:
+            self._emit_context_message(output)
+
+    def _append_image_generation_event(
+        self,
+        *,
+        event_type: str,
+        item_id: str,
+        call_id: str | None,
+        toolkit: str,
+        tool: str,
+        arguments: dict[str, Any] | None,
+        images: list[dict[str, Any]],
+        status: str,
+        status_detail: str | None,
+    ) -> None:
+        del event_type, toolkit, tool
+        item: dict[str, Any] = {
+            "type": "image_generation_call",
+            "id": item_id,
+            "status": status,
+        }
+        if call_id is not None:
+            item["call_id"] = call_id
+        if arguments is not None:
+            item.update(copy.deepcopy(arguments))
+        if images:
+            item["results"] = copy.deepcopy(images)
+        if status_detail is not None:
+            item["status_detail"] = status_detail
+        self._emit_context_message(item)
+
+    def _append_audio_generation_event(self, *, message: AgentMessage) -> None:
+        self._append_assistant_text(
+            text=json.dumps(message.model_dump(mode="json")),
+            phase=None,
+        )
+
+    def _append_audio_transcription_event(self, *, message: AgentMessage) -> None:
+        self._append_assistant_text(
+            text=json.dumps(message.model_dump(mode="json")),
+            phase=None,
+        )
+
+    def _restore_compacted_messages(self, *, messages: list[dict[str, Any]]) -> None:
+        for message in messages:
+            self._emit_context_message(message)
+
+    @staticmethod
+    def _response_item_type(*, tool_call: _BufferedToolCall) -> str:
+        if tool_call.namespace == "openai.responses":
+            if tool_call.toolkit == "openai":
+                return f"{tool_call.tool}_call"
+            if tool_call.tool == "list_tools":
+                return "mcp_list_tools"
+            return "mcp_call"
+        return "function_call"
+
+    @staticmethod
+    def _function_name(*, tool_call: _BufferedToolCall) -> str:
+        if tool_call.toolkit in {"", "function", "tool"}:
+            return safe_tool_name(tool_call.tool)
+        return safe_tool_name(f"{tool_call.toolkit}_{tool_call.tool}")
+
+    @staticmethod
+    def _builtin_call_item(
+        *,
+        item_type: str,
+        tool_call: _BufferedToolCall,
+        call_id: str,
+        result: dict[str, Any] | None,
+        error: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        arguments = tool_call.arguments_dict()
+        status = (
+            "failed"
+            if error is not None
+            else "completed"
+            if result is not None
+            else "in_progress"
+        )
+        item: dict[str, Any] = {
+            "type": item_type,
+            "id": tool_call.item_id,
+            "status": status,
+        }
+        if item_type not in {
+            "mcp_list_tools",
+            "image_generation_call",
+            "web_search_call",
+        }:
+            item["call_id"] = call_id
+        if item_type == "mcp_call":
+            item["server_label"] = tool_call.toolkit
+            item["name"] = tool_call.tool
+            item["arguments"] = tool_call.arguments_json()
+        elif item_type == "mcp_list_tools":
+            item["server_label"] = tool_call.toolkit
+        elif item_type in {"shell_call", "local_shell_call"}:
+            action = arguments.get("action")
+            if not isinstance(action, dict):
+                if "commands" in arguments:
+                    action = {"commands": arguments["commands"]}
+                else:
+                    action = {"commands": [tool_call.arguments_json()]}
+            item["action"] = action
+        elif item_type == "apply_patch_call":
+            operation = arguments.get("operation")
+            item["operation"] = operation if isinstance(operation, dict) else arguments
+        elif item_type == "code_interpreter_call":
+            code = arguments.get("code")
+            item["code"] = code if isinstance(code, str) else tool_call.arguments_json()
+        else:
+            item.update(arguments)
+        if result is not None and item_type not in {
+            "shell_call",
+            "local_shell_call",
+            "computer_call",
+            "apply_patch_call",
+        }:
+            item["output"] = copy.deepcopy(result)
+        if error is not None:
+            item["error"] = copy.deepcopy(error)
+        return item
+
+    def _builtin_output_item(
+        self,
+        *,
+        item_type: str,
+        call_id: str,
+        result: dict[str, Any] | None,
+        error: dict[str, Any] | None,
+        logs: list[dict[str, str]],
+    ) -> dict[str, Any] | None:
+        if result is None and error is None and not logs:
+            return None
+        output_text = self._result_text(result=result, error=error, logs=logs)
+        if item_type in {"shell_call", "local_shell_call", "computer_call"}:
+            return {
+                "type": f"{item_type}_output",
+                "call_id": call_id,
+                "output": output_text,
+            }
+        if item_type == "apply_patch_call":
+            payload: dict[str, Any] = {
+                "type": "apply_patch_call_output",
+                "call_id": call_id,
+                "output": output_text,
+            }
+            payload["status"] = "failed" if error is not None else "completed"
+            return payload
+        return None
+
+    def _append_assistant_structured_item(self, item: dict[str, Any]) -> None:
+        self._emit_context_message(
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": json.dumps(item)}],
+            }
+        )
+
+
 def _is_html_mime_type(mime_type: str | None) -> bool:
     if not mime_type:
         return False
@@ -853,10 +1124,26 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
 
 
 class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
+    _known_models = (
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.3-codex",
+        "gpt-5.2",
+        "gpt-5",
+        "gpt-4.1",
+        "gpt-4o",
+        "o4-mini",
+        "o3",
+        "o1",
+    )
     _context_window_sizes = {
+        "gpt-5.5": 400000,
         "gpt-4.1": 128000,
         "gpt-4o": 128000,
         "gpt-5.4": 272000,
+        "gpt-5.3-codex": 400000,
+        "gpt-5.2": 400000,
         "gpt-5": 400000,
         "o1": 200000,
         "o3": 200000,
@@ -890,6 +1177,9 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         images_dataset: ImagesDataset | None = None,
         max_tool_call_length: int = DEFAULT_MAX_TOOL_CALL_LENGTH,
         max_tool_call_lines: int = DEFAULT_MAX_TOOL_CALL_LINES,
+        friendly_name: str | None = None,
+        description: str | None = None,
+        allowed_models: list[str] | None = None,
     ):
         if max_retries < 0:
             raise ValueError("max_retries must be greater than or equal to 0")
@@ -944,6 +1234,9 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         self._max_tool_call_length = max_tool_call_length
         self._max_tool_call_lines = max_tool_call_lines
         self._images_dataset = images_dataset
+        self._friendly_name = friendly_name
+        self._description = description
+        self._allowed_models = list(allowed_models) if allowed_models is not None else None
         self._tool_call_approval_handler: ToolCallApprovalHandler | None = None
 
     def default_model(self) -> str:
@@ -951,6 +1244,27 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
 
     def provider_name(self) -> str | None:
         return self._provider
+
+    def provider_friendly_name(self) -> str:
+        return self._friendly_name or "OpenAI"
+
+    def provider_description(self) -> str | None:
+        return self._description or "OpenAI Responses API"
+
+    def list_models(self) -> list[LLMModelInfo]:
+        names = list(self._allowed_models or self._known_models)
+        if self._allowed_models is None and self._model not in names:
+            names.insert(0, self._model)
+        return [
+            LLMModelInfo(
+                name=name,
+                context_window=int(context_window)
+                if (context_window := self.context_window_size(name)) != float("inf")
+                else None,
+                pricing=llm_model_pricing(provider="openai", model=name),
+            )
+            for name in names
+        ]
 
     def set_images_dataset(self, images_dataset: ImagesDataset | None) -> None:
         self._images_dataset = images_dataset
@@ -993,6 +1307,9 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             images_dataset=self._images_dataset,
             max_tool_call_length=self._max_tool_call_length,
             max_tool_call_lines=self._max_tool_call_lines,
+            friendly_name=self._friendly_name,
+            description=self._description,
+            allowed_models=self._allowed_models,
         )
         clone._compaction_threshold = self._compaction_threshold
         clone._tool_call_approval_handler = self._tool_call_approval_handler
@@ -1028,6 +1345,17 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             websocket_timeout=self._websocket_timeout,
         )
         return context
+
+    def make_agent_event_reader(
+        self,
+        *,
+        emit_message: Callable[[dict[str, Any]], None],
+        callbacks: AgentEventReaderCallbacks | None = None,
+    ) -> AgentEventReader:
+        return OpenAIResponsesAgentEventReader(
+            emit_message=emit_message,
+            callbacks=callbacks,
+        )
 
     def _make_tool_response_adapter(self) -> OpenAIResponsesToolResponseAdapter:
         return OpenAIResponsesToolResponseAdapter(
@@ -2191,7 +2519,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
 
     # Takes the current chat context, executes a completion request and processes the response.
     # If a tool calls are requested, invokes the tools, processes the tool calls results, and appends the tool call results to the context
-    async def next(
+    async def create_response(
         self,
         *,
         model: Optional[str] = None,

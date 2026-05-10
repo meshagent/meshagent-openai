@@ -3,6 +3,7 @@ from .responses_adapter import (
     OpenAIResponsesToolResponseAdapter,
     OpenAIResponsesMCPToolkit,
 )
+from .realtime_adapter import OpenAIRealtimeAdapter, OpenAIRealtimeSessionContext
 from .completions_adapter import (
     OpenAICompletionsAdapter,
     OpenAICompletionsToolResponseAdapter,
@@ -13,6 +14,8 @@ __all__ = [
     OpenAIResponsesAdapter,
     OpenAIResponsesToolResponseAdapter,
     OpenAIResponsesMCPToolkit,
+    OpenAIRealtimeAdapter,
+    OpenAIRealtimeSessionContext,
     OpenAICompletionsAdapter,
     OpenAICompletionsToolResponseAdapter,
     OpenAIAudioFileSTT,

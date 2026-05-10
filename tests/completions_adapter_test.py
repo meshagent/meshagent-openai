@@ -5,6 +5,18 @@ from typing import Any
 
 import pytest
 
+from meshagent.agents.messages import (
+    AGENT_EVENT_TEXT_CONTENT_DELTA,
+    AGENT_EVENT_TEXT_CONTENT_ENDED,
+    AGENT_EVENT_TOOL_CALL_ARGUMENTS_DELTA,
+    AGENT_EVENT_TOOL_CALL_ENDED,
+    AGENT_EVENT_TOOL_CALL_STARTED,
+    AgentToolCallArgumentsDelta,
+    AgentToolCallEnded,
+    AgentToolCallStarted,
+    AgentTextContentDelta,
+    AgentTextContentEnded,
+)
 from meshagent.api.messaging import FileContent, JsonContent, TextContent
 import meshagent.openai.tools.completions_adapter as completions_adapter_module
 from meshagent.openai.tools.completions_adapter import (
@@ -35,6 +47,167 @@ class _FakeRoom:
     def __init__(self):
         self.local_participant = _FakeParticipant()
         self.developer = _FakeDeveloper()
+
+
+def test_make_agent_event_reader_accumulates_streamed_text_for_restore() -> None:
+    adapter = OpenAICompletionsAdapter(model="gpt-4o-mini", client=object())
+    context = adapter.create_session()
+    restored_messages: list[dict[str, Any]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+
+    reader.consume(
+        AgentTextContentDelta(
+            type=AGENT_EVENT_TEXT_CONTENT_DELTA,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="text-1",
+            text="Hi",
+        )
+    )
+    reader.consume(
+        AgentTextContentDelta(
+            type=AGENT_EVENT_TEXT_CONTENT_DELTA,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="text-1",
+            text=" there",
+        )
+    )
+    reader.consume(
+        AgentTextContentDelta(
+            type=AGENT_EVENT_TEXT_CONTENT_DELTA,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="text-1",
+            text="Hi there",
+        )
+    )
+    reader.consume(
+        AgentTextContentEnded(
+            type=AGENT_EVENT_TEXT_CONTENT_ENDED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="text-1",
+        )
+    )
+    adapter.restore_context_messages(context=context, messages=restored_messages)
+
+    assert context.messages == [{"role": "assistant", "content": "Hi there"}]
+
+
+@pytest.mark.parametrize(
+    ("namespace", "toolkit", "tool", "arguments", "expected_name"),
+    [
+        ("meshagent", "toolkit", "custom_tool", {"value": 1}, "toolkit_custom_tool"),
+        (
+            "openai.responses",
+            "openai",
+            "shell",
+            {"action": {"commands": ["pwd"]}},
+            "shell_call",
+        ),
+        (
+            "openai.responses",
+            "openai",
+            "apply_patch",
+            {"operation": {"type": "update_file", "path": "report.py", "diff": "@@"}},
+            "apply_patch_call",
+        ),
+        (
+            "openai.responses",
+            "openai",
+            "web_search",
+            {"query": "meshagent"},
+            "web_search_call",
+        ),
+        (
+            "openai.responses",
+            "server",
+            "search",
+            {"query": "meshagent"},
+            "mcp_search",
+        ),
+        (
+            "openai.responses",
+            "server",
+            "list_tools",
+            {},
+            "mcp_list_tools",
+        ),
+    ],
+)
+def test_make_agent_event_reader_restores_tool_lifecycle_as_chat_tool_calls(
+    namespace: str,
+    toolkit: str,
+    tool: str,
+    arguments: dict[str, object],
+    expected_name: str,
+) -> None:
+    adapter = OpenAICompletionsAdapter(model="gpt-4o-mini", client=object())
+    context = adapter.create_session()
+    restored_messages: list[dict[str, Any]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+    serialized_arguments = json.dumps(arguments, separators=(",", ":"))
+    split_at = max(1, len(serialized_arguments) // 2)
+
+    for delta in (
+        serialized_arguments[:split_at],
+        serialized_arguments[split_at:],
+    ):
+        reader.consume(
+            AgentToolCallArgumentsDelta(
+                type=AGENT_EVENT_TOOL_CALL_ARGUMENTS_DELTA,
+                thread_id="thread-1",
+                turn_id="turn-1",
+                item_id="tool-1",
+                namespace=namespace,
+                call_id="call-1",
+                delta=delta,
+            )
+        )
+    reader.consume(
+        AgentToolCallStarted(
+            type=AGENT_EVENT_TOOL_CALL_STARTED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="tool-1",
+            namespace=namespace,
+            call_id="call-1",
+            toolkit=toolkit,
+            tool=tool,
+            arguments=arguments,
+        )
+    )
+    reader.consume(
+        AgentToolCallEnded(
+            type=AGENT_EVENT_TOOL_CALL_ENDED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="tool-1",
+            namespace=namespace,
+            call_id="call-1",
+            toolkit=toolkit,
+            tool=tool,
+            result=TextContent(text="tool result"),
+        )
+    )
+    reader.finalize()
+    adapter.restore_context_messages(context=context, messages=restored_messages)
+
+    assistant_message = context.messages[0]
+    assert assistant_message["role"] == "assistant"
+    restored_call = assistant_message["tool_calls"][0]
+    assert restored_call["id"] == "call-1"
+    assert restored_call["type"] == "function"
+    assert restored_call["function"] == {
+        "name": expected_name,
+        "arguments": serialized_arguments,
+    }
+    assert context.messages[1] == {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": "tool result",
+    }
 
 
 class _StreamingTool(FunctionTool):
@@ -322,7 +495,7 @@ async def test_openai_completions_adapter_passes_base_url_to_get_client(monkeypa
     context = adapter.create_session()
     context.append_user_message("hello")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[],
@@ -447,7 +620,7 @@ async def test_next_consumes_streaming_tool_events_and_uses_final_item_result():
     context.append_user_message("run tool")
     events: list[dict] = []
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[Toolkit(name="tools", tools=[_StreamingTool()])],
@@ -499,7 +672,7 @@ async def test_next_accumulates_cached_usage_across_tool_loop_calls() -> None:
     context = adapter.create_session()
     context.append_user_message("run tool")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[Toolkit(name="tools", tools=[_StreamingTool()])],
@@ -551,7 +724,7 @@ async def test_next_passes_thread_and_turn_ids_in_tool_caller_context() -> None:
     context.metadata["thread_id"] = "thread-1"
     context.metadata["turn_id"] = "turn-1"
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[Toolkit(name="tools", tools=[tool])],
@@ -587,7 +760,7 @@ async def test_next_tracks_usage_for_single_completion_response():
     context = adapter.create_session()
     context.append_user_message("hello")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[],
@@ -638,7 +811,7 @@ async def test_next_inserts_steering_messages_after_tool_results() -> None:
         context.append_user_message("steer now")
         return True
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_FakeRoom().local_participant,
         toolkits=[Toolkit(name="tools", tools=[_StreamingTool()])],
@@ -688,7 +861,7 @@ async def test_cancellation_restores_context_during_tool_call() -> None:
     context.append_user_message("run tool")
 
     task = asyncio.create_task(
-        adapter.next(
+        adapter.create_response(
             context=context,
             caller=_FakeRoom().local_participant,
             toolkits=[Toolkit(name="storage", tools=[blocking_tool])],
