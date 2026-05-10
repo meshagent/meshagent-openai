@@ -3,7 +3,11 @@ from .responses_adapter import (
     OpenAIResponsesToolResponseAdapter,
     OpenAIResponsesMCPToolkit,
 )
-from .realtime_adapter import OpenAIRealtimeAdapter, OpenAIRealtimeSessionContext
+from .realtime_adapter import (
+    DEFAULT_OPENAI_REALTIME_TRANSCRIPTION_MODEL,
+    OpenAIRealtimeAdapter,
+    OpenAIRealtimeSessionContext,
+)
 from .completions_adapter import (
     OpenAICompletionsAdapter,
     OpenAICompletionsToolResponseAdapter,
@@ -14,6 +18,7 @@ __all__ = [
     OpenAIResponsesAdapter,
     OpenAIResponsesToolResponseAdapter,
     OpenAIResponsesMCPToolkit,
+    DEFAULT_OPENAI_REALTIME_TRANSCRIPTION_MODEL,
     OpenAIRealtimeAdapter,
     OpenAIRealtimeSessionContext,
     OpenAICompletionsAdapter,

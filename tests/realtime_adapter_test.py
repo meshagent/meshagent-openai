@@ -33,6 +33,7 @@ from meshagent.agents.messages import (
 from meshagent.api import RoomException
 from meshagent.api.messaging import TextContent
 from meshagent.openai.tools.realtime_adapter import (
+    DEFAULT_OPENAI_REALTIME_TRANSCRIPTION_MODEL,
     OpenAIRealtimeAdapter,
     OpenAIRealtimeSessionContext,
 )
@@ -184,6 +185,9 @@ async def test_connect_opens_realtime_websocket_and_sends_session_update() -> No
                     "input": {
                         "format": {"type": "audio/pcm", "rate": 24000},
                         "turn_detection": None,
+                        "transcription": {
+                            "model": DEFAULT_OPENAI_REALTIME_TRANSCRIPTION_MODEL
+                        },
                     }
                 },
             },
@@ -242,11 +246,78 @@ async def test_start_session_connects_realtime_websocket_with_instructions() -> 
                     "input": {
                         "format": {"type": "audio/pcm", "rate": 24000},
                         "turn_detection": None,
+                        "transcription": {
+                            "model": DEFAULT_OPENAI_REALTIME_TRANSCRIPTION_MODEL
+                        },
                     }
                 },
             },
         }
     ]
+
+    await adapter.disconnect(context=context)
+
+
+@pytest.mark.asyncio
+async def test_connect_uses_custom_realtime_transcription_model() -> None:
+    websocket = _FakeWebSocket()
+    context = _context(websocket)
+    adapter = _adapter(
+        session_options={"output_modalities": ["text"]},
+        transcription_model="custom-transcribe",
+    )
+
+    await adapter.connect(context=context)
+
+    assert websocket.sent == [
+        {
+            "type": "session.update",
+            "session": {
+                "type": "realtime",
+                "output_modalities": ["text"],
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "turn_detection": None,
+                        "transcription": {"model": "custom-transcribe"},
+                    }
+                },
+            },
+        }
+    ]
+
+    await adapter.disconnect(context=context)
+
+
+@pytest.mark.asyncio
+async def test_connect_preserves_explicit_realtime_transcription_options() -> None:
+    websocket = _FakeWebSocket()
+    context = _context(websocket)
+    adapter = _adapter(
+        session_options={
+            "output_modalities": ["text"],
+            "audio": {
+                "input": {
+                    "transcription": {"model": "configured-transcribe"},
+                }
+            },
+        },
+        transcription_model="constructor-transcribe",
+    )
+
+    await adapter.connect(context=context)
+
+    assert websocket.sent[0]["session"] == {
+        "type": "realtime",
+        "output_modalities": ["text"],
+        "audio": {
+            "input": {
+                "transcription": {"model": "configured-transcribe"},
+                "format": {"type": "audio/pcm", "rate": 24000},
+                "turn_detection": None,
+            }
+        },
+    }
 
     await adapter.disconnect(context=context)
 

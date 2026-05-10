@@ -46,6 +46,8 @@ from meshagent.tools import Toolkit
 
 logger = logging.getLogger("openai_realtime_agent")
 
+DEFAULT_OPENAI_REALTIME_TRANSCRIPTION_MODEL = "gpt-realtime-whisper"
+
 
 def _normalize_realtime_options(options: Mapping[str, Any]) -> dict[str, Any]:
     normalized = dict(options)
@@ -55,7 +57,9 @@ def _normalize_realtime_options(options: Mapping[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def _ensure_realtime_input_audio_options(options: dict[str, Any]) -> None:
+def _ensure_realtime_input_audio_options(
+    options: dict[str, Any], *, transcription_model: str | None
+) -> None:
     audio = options.get("audio")
     if audio is None:
         audio = {}
@@ -72,6 +76,8 @@ def _ensure_realtime_input_audio_options(options: dict[str, Any]) -> None:
 
     input_options.setdefault("format", {"type": "audio/pcm", "rate": 24000})
     input_options.setdefault("turn_detection", None)
+    if transcription_model is not None:
+        input_options.setdefault("transcription", {"model": transcription_model})
 
 
 def _riff_wav_data_chunk(data: bytes) -> bytes | None:
@@ -553,6 +559,7 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
         friendly_name: str | None = None,
         description: str | None = None,
         allowed_models: list[str] | None = None,
+        transcription_model: str | None = DEFAULT_OPENAI_REALTIME_TRANSCRIPTION_MODEL,
     ):
         if websocket_timeout <= 0:
             raise ValueError("websocket_timeout must be greater than 0")
@@ -573,6 +580,9 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
         self._allowed_models = (
             list(allowed_models) if allowed_models is not None else None
         )
+        if isinstance(transcription_model, str):
+            transcription_model = transcription_model.strip() or None
+        self._transcription_model = transcription_model
 
     def default_model(self) -> str:
         return self._model
@@ -669,6 +679,7 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
             friendly_name=self._friendly_name,
             description=self._description,
             allowed_models=self._allowed_models,
+            transcription_model=self._transcription_model,
         )
 
     def _openai_client(self) -> AsyncOpenAI:
@@ -883,7 +894,10 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
         if options is not None:
             session_options.update(dict(options))
             session_options = _normalize_realtime_options(session_options)
-        _ensure_realtime_input_audio_options(session_options)
+        _ensure_realtime_input_audio_options(
+            session_options,
+            transcription_model=self._transcription_model,
+        )
         session_payload["session"] = {"type": "realtime", **session_options}
         context._session_update_future = asyncio.get_running_loop().create_future()
         await context.send_json(session_payload)
