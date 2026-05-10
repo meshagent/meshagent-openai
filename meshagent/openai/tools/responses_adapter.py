@@ -1236,7 +1236,9 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         self._images_dataset = images_dataset
         self._friendly_name = friendly_name
         self._description = description
-        self._allowed_models = list(allowed_models) if allowed_models is not None else None
+        self._allowed_models = (
+            list(allowed_models) if allowed_models is not None else None
+        )
         self._tool_call_approval_handler: ToolCallApprovalHandler | None = None
 
     def default_model(self) -> str:

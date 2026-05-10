@@ -7,6 +7,9 @@ import pytest
 from openai import AsyncOpenAI
 
 from meshagent.agents.messages import (
+    AGENT_EVENT_AUDIO_GENERATION_COMPLETED,
+    AGENT_EVENT_AUDIO_GENERATION_DELTA,
+    AGENT_EVENT_AUDIO_GENERATION_STARTED,
     AGENT_EVENT_TEXT_CONTENT_DELTA,
     AGENT_EVENT_TEXT_CONTENT_ENDED,
     AGENT_EVENT_TEXT_CONTENT_STARTED,
@@ -52,7 +55,10 @@ class _FakeWebSocket:
         self.close_count = 0
 
     async def send_str(self, data: str) -> None:
-        self.sent.append(json.loads(data))
+        payload = json.loads(data)
+        self.sent.append(payload)
+        if payload.get("type") == "session.update":
+            await self.messages.put(_text_message({"type": "session.updated"}))
 
     async def receive(self) -> aiohttp.WSMessage:
         return await self.messages.get()
@@ -138,6 +144,19 @@ async def _wait_for_sent_type(
     raise AssertionError(f"{event_type} was not sent")
 
 
+async def _wait_for_sent_count(
+    websocket: _FakeWebSocket, event_type: str, count: int
+) -> list[dict[str, object]]:
+    for _ in range(100):
+        payloads = [
+            payload for payload in websocket.sent if payload.get("type") == event_type
+        ]
+        if len(payloads) >= count:
+            return payloads
+        await asyncio.sleep(0)
+    raise AssertionError(f"{count} {event_type} events were not sent")
+
+
 @pytest.mark.asyncio
 async def test_connect_opens_realtime_websocket_and_sends_session_update() -> None:
     websocket = _FakeWebSocket()
@@ -161,6 +180,12 @@ async def test_connect_opens_realtime_websocket_and_sends_session_update() -> No
             "session": {
                 "type": "realtime",
                 "output_modalities": ["text", "audio"],
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "turn_detection": None,
+                    }
+                },
             },
         }
     ]
@@ -213,6 +238,12 @@ async def test_start_session_connects_realtime_websocket_with_instructions() -> 
                 "type": "realtime",
                 "output_modalities": ["text"],
                 "instructions": "Reply with concise text.",
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "turn_detection": None,
+                    }
+                },
             },
         }
     ]
@@ -287,10 +318,85 @@ async def test_create_response_sends_response_create_and_returns_terminal_event(
         "response": {"id": "resp-1", "status": "completed"},
     }
     assert [event["type"] for event in received] == [
+        "session.updated",
         "response.audio.delta",
         "response.audio_transcript.delta",
         "response.done",
     ]
+
+    await adapter.disconnect(context=context)
+
+
+@pytest.mark.asyncio
+async def test_create_response_allows_multiple_realtime_responses_in_flight() -> None:
+    websocket = _FakeWebSocket()
+    context = _context(websocket)
+    adapter = _adapter(response_options={"modalities": ["text"]})
+    await adapter.connect(context=context)
+
+    first = asyncio.create_task(
+        adapter.create_response(
+            context=context,
+            caller=_FakeParticipant(),
+            toolkits=[],
+        )
+    )
+    second = asyncio.create_task(
+        adapter.create_response(
+            context=context,
+            caller=_FakeParticipant(),
+            toolkits=[],
+        )
+    )
+
+    response_creates = await _wait_for_sent_count(websocket, "response.create", 2)
+    assert response_creates == [
+        {"type": "response.create", "response": {"output_modalities": ["text"]}},
+        {"type": "response.create", "response": {"output_modalities": ["text"]}},
+    ]
+
+    await websocket.messages.put(
+        _text_message(
+            {
+                "type": "response.created",
+                "response": {"id": "resp-1", "status": "in_progress"},
+            }
+        )
+    )
+    await websocket.messages.put(
+        _text_message(
+            {
+                "type": "response.created",
+                "response": {"id": "resp-2", "status": "in_progress"},
+            }
+        )
+    )
+    await websocket.messages.put(
+        _text_message(
+            {
+                "type": "response.done",
+                "response": {"id": "resp-2", "status": "completed"},
+            }
+        )
+    )
+    await websocket.messages.put(
+        _text_message(
+            {
+                "type": "response.done",
+                "response": {"id": "resp-1", "status": "completed"},
+            }
+        )
+    )
+
+    first_result, second_result = await asyncio.gather(first, second)
+    assert first_result == {
+        "type": "response.done",
+        "response": {"id": "resp-1", "status": "completed"},
+    }
+    assert second_result == {
+        "type": "response.done",
+        "response": {"id": "resp-2", "status": "completed"},
+    }
 
     await adapter.disconnect(context=context)
 
@@ -591,6 +697,38 @@ async def test_make_agent_event_reader_restores_tool_lifecycle_for_realtime_repl
 
     await task
     await adapter.disconnect(context=context)
+
+
+def test_make_agent_event_reader_ignores_realtime_audio_generation_for_replay() -> None:
+    adapter = _adapter(response_options={"modalities": ["audio"]})
+
+    restored_messages: list[dict[str, Any]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+    for message in [
+        AgentAudioGenerationStarted(
+            type=AGENT_EVENT_AUDIO_GENERATION_STARTED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="audio-1",
+        ),
+        AgentAudioGenerationDelta(
+            type=AGENT_EVENT_AUDIO_GENERATION_DELTA,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="audio-1",
+            data=b"\xf2\x00\x01",
+        ),
+        AgentAudioGenerationCompleted(
+            type=AGENT_EVENT_AUDIO_GENERATION_COMPLETED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="audio-1",
+        ),
+    ]:
+        reader.consume(message)
+    reader.finalize()
+
+    assert restored_messages == []
 
 
 def test_realtime_publisher_emits_audio_generation_and_transcription_lifecycles() -> (

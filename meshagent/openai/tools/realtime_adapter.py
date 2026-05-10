@@ -6,6 +6,7 @@ import contextlib
 import copy
 import json
 import logging
+from collections import deque
 from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -54,6 +55,51 @@ def _normalize_realtime_options(options: Mapping[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _ensure_realtime_input_audio_options(options: dict[str, Any]) -> None:
+    audio = options.get("audio")
+    if audio is None:
+        audio = {}
+        options["audio"] = audio
+    if not isinstance(audio, dict):
+        return
+
+    input_options = audio.get("input")
+    if input_options is None:
+        input_options = {}
+        audio["input"] = input_options
+    if not isinstance(input_options, dict):
+        return
+
+    input_options.setdefault("format", {"type": "audio/pcm", "rate": 24000})
+    input_options.setdefault("turn_detection", None)
+
+
+def _riff_wav_data_chunk(data: bytes) -> bytes | None:
+    if len(data) < 44 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return None
+    offset = 12
+    while offset + 8 <= len(data):
+        chunk_id = data[offset : offset + 4]
+        chunk_size = int.from_bytes(data[offset + 4 : offset + 8], "little")
+        chunk_start = offset + 8
+        chunk_end = len(data) if chunk_size == 0xFFFFFFFF else chunk_start + chunk_size
+        if chunk_end > len(data):
+            return None
+        if chunk_id == b"data":
+            return data[chunk_start:chunk_end]
+        offset = chunk_end + (chunk_size % 2)
+    return None
+
+
+def _input_audio_pcm_bytes(*, mime_type: str, data: bytes) -> bytes:
+    normalized_mime_type = mime_type.partition(";")[0].strip().lower()
+    if normalized_mime_type in {"audio/wav", "audio/wave", "audio/x-wav"}:
+        wav_data = _riff_wav_data_chunk(data)
+        if wav_data is not None:
+            return wav_data
+    return data
+
+
 class OpenAIRealtimeSessionContext(AgentSessionContext):
     _default_websocket_ping_interval_seconds = 20.0
     _default_websocket_timeout_seconds = 60 * 60
@@ -85,7 +131,9 @@ class OpenAIRealtimeSessionContext(AgentSessionContext):
         self._websocket_ping_task: asyncio.Task[None] | None = None
         self._websocket_timeout_task: asyncio.Task[None] | None = None
         self._event_handler: Callable[[dict[str, Any]], None] | None = None
-        self._response_future: asyncio.Future[dict[str, Any]] | None = None
+        self._pending_response_futures: deque[asyncio.Future[dict[str, Any]]] = deque()
+        self._response_futures_by_id: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._session_update_future: asyncio.Future[dict[str, Any]] | None = None
         self._synced_message_count = 0
 
     @staticmethod
@@ -95,6 +143,26 @@ class OpenAIRealtimeSessionContext(AgentSessionContext):
     @property
     def is_connected(self) -> bool:
         return self._websocket is not None and not self._websocket.closed
+
+    @property
+    def supports_realtime_audio(self) -> bool:
+        return True
+
+    async def append_realtime_audio_chunk(
+        self, *, mime_type: str, data: bytes, sample_rate: int | None = None
+    ) -> None:
+        del sample_rate
+        audio = _input_audio_pcm_bytes(mime_type=mime_type, data=data)
+        audio_b64 = base64.b64encode(audio).decode()
+        await self.send_json(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": audio_b64,
+            }
+        )
+
+    async def commit_realtime_audio(self) -> None:
+        await self.send_json({"type": "input_audio_buffer.commit"})
 
     async def _run_websocket_ping(self) -> None:
         try:
@@ -146,18 +214,71 @@ class OpenAIRealtimeSessionContext(AgentSessionContext):
         self._websocket_url = None
         self._websocket_headers_signature = None
         self._synced_message_count = 0
-        future = self._response_future
-        self._response_future = None
-        if future is not None and not future.done():
-            future.set_exception(
+        pending_response_futures = list(self._pending_response_futures)
+        response_futures = list(self._response_futures_by_id.values())
+        self._pending_response_futures.clear()
+        self._response_futures_by_id.clear()
+        for future in [*pending_response_futures, *response_futures]:
+            if not future.done():
+                future.set_exception(
+                    RoomException(
+                        "OpenAI Realtime websocket closed before the response completed",
+                        status_code=503,
+                        code=ErrorCode.OPERATION_FAILED,
+                    )
+                )
+        session_update_future = self._session_update_future
+        self._session_update_future = None
+        if session_update_future is not None and not session_update_future.done():
+            session_update_future.set_exception(
                 RoomException(
-                    "OpenAI Realtime websocket closed before the response completed",
+                    "OpenAI Realtime websocket closed before the session update completed",
                     status_code=503,
                     code=ErrorCode.OPERATION_FAILED,
                 )
             )
         if websocket is not None and not websocket.closed:
             await websocket.close()
+
+    def _response_created(self, event: dict[str, Any]) -> None:
+        response_id = OpenAIRealtimeAdapter._response_id(event)
+        if response_id is None or len(self._pending_response_futures) == 0:
+            return
+        future = self._pending_response_futures.popleft()
+        self._response_futures_by_id[response_id] = future
+
+    def _complete_response_future(
+        self, *, event: dict[str, Any], error: RoomException | None
+    ) -> None:
+        response_id = OpenAIRealtimeAdapter._response_id(event)
+        future: asyncio.Future[dict[str, Any]] | None = None
+        if response_id is not None:
+            future = self._response_futures_by_id.pop(response_id, None)
+        if future is None and len(self._pending_response_futures) > 0:
+            future = self._pending_response_futures.popleft()
+        if future is None or future.done():
+            return
+        if error is not None:
+            future.set_exception(error)
+        else:
+            future.set_result(event)
+
+    def _fail_response_futures(self, error: BaseException) -> None:
+        if isinstance(error, RoomException):
+            response_error = error
+        else:
+            response_error = RoomException(
+                str(error),
+                status_code=503,
+                code=ErrorCode.OPERATION_FAILED,
+            )
+        pending_response_futures = list(self._pending_response_futures)
+        response_futures = list(self._response_futures_by_id.values())
+        self._pending_response_futures.clear()
+        self._response_futures_by_id.clear()
+        for future in [*pending_response_futures, *response_futures]:
+            if not future.done():
+                future.set_exception(response_error)
 
     async def close_websocket(self) -> None:
         async with self._websocket_lock:
@@ -371,10 +492,7 @@ class _OpenAIRealtimeAgentEventReader(AccumulatingAgentEventReader):
         self._append_assistant_text(text=json.dumps(item), phase=None)
 
     def _append_audio_generation_event(self, *, message: Any) -> None:
-        self._append_assistant_text(
-            text=json.dumps(message.model_dump(mode="json")),
-            phase=None,
-        )
+        return
 
     def _append_audio_transcription_event(self, *, message: Any) -> None:
         self._append_assistant_text(
@@ -452,7 +570,9 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
         self._annotations = normalize_llm_annotations(annotations)
         self._friendly_name = friendly_name
         self._description = description
-        self._allowed_models = list(allowed_models) if allowed_models is not None else None
+        self._allowed_models = (
+            list(allowed_models) if allowed_models is not None else None
+        )
 
     def default_model(self) -> str:
         return self._model
@@ -475,6 +595,7 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
                 name=name,
                 context_window=32000,
                 pricing=llm_model_pricing(provider="openai", model=name),
+                modalities=("text", "audio"),
             )
             for name in names
         ]
@@ -699,25 +820,30 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
                 if not isinstance(event_type, str):
                     continue
 
-                future = context._response_future
-                if future is None or future.done():
-                    continue
+                if event_type == "session.updated":
+                    session_update_future = context._session_update_future
+                    if (
+                        session_update_future is not None
+                        and not session_update_future.done()
+                    ):
+                        session_update_future.set_result(event)
 
+                if event_type == "response.created":
+                    context._response_created(event)
+                    continue
                 if self._terminal_response_event(event_type):
                     error = self._response_error(event)
-                    if error is not None:
-                        future.set_exception(error)
-                    else:
-                        future.set_result(event)
+                    context._complete_response_future(event=event, error=error)
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            future = context._response_future
-            if future is not None and not future.done():
+            context._fail_response_futures(error)
+            session_update_future = context._session_update_future
+            if session_update_future is not None and not session_update_future.done():
                 if isinstance(error, RoomException):
-                    future.set_exception(error)
+                    session_update_future.set_exception(error)
                 else:
-                    future.set_exception(
+                    session_update_future.set_exception(
                         RoomException(
                             str(error),
                             status_code=503,
@@ -757,8 +883,14 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
         if options is not None:
             session_options.update(dict(options))
             session_options = _normalize_realtime_options(session_options)
+        _ensure_realtime_input_audio_options(session_options)
         session_payload["session"] = {"type": "realtime", **session_options}
+        context._session_update_future = asyncio.get_running_loop().create_future()
         await context.send_json(session_payload)
+        await asyncio.wait_for(
+            context._session_update_future,
+            timeout=min(context._websocket_timeout, 30.0),
+        )
 
     async def disconnect(self, *, context: OpenAIRealtimeSessionContext) -> None:
         await context.close_websocket()
@@ -974,15 +1106,9 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
         if event_handler is not None:
             context._event_handler = event_handler
 
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[dict[str, Any]] = loop.create_future()
         async with context._request_lock:
-            if (
-                context._response_future is not None
-                and not context._response_future.done()
-            ):
-                raise RoomException("OpenAI Realtime response is already in progress")
-            loop = asyncio.get_running_loop()
-            future: asyncio.Future[dict[str, Any]] = loop.create_future()
-            context._response_future = future
             payload: dict[str, Any] = {"type": "response.create"}
             response_options = _normalize_realtime_options(
                 copy.deepcopy(self._response_options)
@@ -993,28 +1119,31 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
             if len(response_options) > 0:
                 payload["response"] = response_options
             await self._sync_text_messages(context=context)
-            await context.send_json(payload)
+            context._pending_response_futures.append(future)
             try:
-                terminal_event = await future
-                response_id = self._response_id(terminal_event)
-                if response_id is not None:
-                    context.track_response(response_id)
-                else:
-                    context.previous_messages.extend(context.messages)
-                    context.messages.clear()
-                assistant_text = self._response_text(terminal_event)
-                if assistant_text != "":
-                    context.previous_messages.append(
-                        {"role": "assistant", "content": assistant_text}
-                    )
-                context._synced_message_count = len(
-                    [*context.previous_messages, *context.messages]
-                )
-                context.turn_count += 1
-                return terminal_event
-            finally:
-                if context._response_future is future:
-                    context._response_future = None
+                await context.send_json(payload)
+            except BaseException:
+                with contextlib.suppress(ValueError):
+                    context._pending_response_futures.remove(future)
+                raise
+
+        terminal_event = await future
+        response_id = self._response_id(terminal_event)
+        if response_id is not None:
+            context.track_response(response_id)
+        else:
+            context.previous_messages.extend(context.messages)
+            context.messages.clear()
+        assistant_text = self._response_text(terminal_event)
+        if assistant_text != "":
+            context.previous_messages.append(
+                {"role": "assistant", "content": assistant_text}
+            )
+        context._synced_message_count = len(
+            [*context.previous_messages, *context.messages]
+        )
+        context.turn_count += 1
+        return terminal_event
 
 
 __all__ = [
