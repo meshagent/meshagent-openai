@@ -19,6 +19,8 @@ from meshagent.agents.messages import (
     AgentAudioGenerationCompleted,
     AgentAudioGenerationDelta,
     AgentAudioGenerationStarted,
+    AgentAudioInputSpeechEnded,
+    AgentAudioInputSpeechStarted,
     AgentAudioTranscriptionCompleted,
     AgentAudioTranscriptionDelta,
     AgentAudioTranscriptionStarted,
@@ -37,6 +39,7 @@ from meshagent.openai.tools.realtime_adapter import (
     OpenAIRealtimeAdapter,
     OpenAIRealtimeSessionContext,
 )
+from meshagent.tools import FunctionTool, Toolkit
 
 
 class _FakeParticipant:
@@ -46,6 +49,21 @@ class _FakeParticipant:
         if key == "name":
             return "caller"
         return None
+
+
+class _AnyArgsTool(FunctionTool):
+    def __init__(self, name: str) -> None:
+        super().__init__(
+            name=name,
+            input_schema={"type": "object", "additionalProperties": True},
+            description="test tool",
+        )
+        self.calls: list[dict[str, object]] = []
+
+    async def execute(self, context, **kwargs):
+        del context
+        self.calls.append(dict(kwargs))
+        return {"ok": True, "args": kwargs}
 
 
 class _FakeWebSocket:
@@ -132,6 +150,31 @@ def _context(websocket: _FakeWebSocket) -> OpenAIRealtimeSessionContext:
 
 def _text_message(event: dict[str, object]) -> aiohttp.WSMessage:
     return aiohttp.WSMessage(aiohttp.WSMsgType.TEXT, json.dumps(event), None)
+
+
+def test_realtime_conversation_item_normalizes_function_call_status() -> None:
+    payload = OpenAIRealtimeAdapter._conversation_item_for_message(
+        {
+            "type": "function_call",
+            "id": "call-item-1",
+            "call_id": "call-1",
+            "name": "write_file",
+            "arguments": "{}",
+            "status": "in_progress",
+        }
+    )
+
+    assert payload == {
+        "type": "conversation.item.create",
+        "item": {
+            "type": "function_call",
+            "id": "call-item-1",
+            "call_id": "call-1",
+            "name": "write_file",
+            "arguments": "{}",
+            "status": "completed",
+        },
+    }
 
 
 async def _wait_for_sent_type(
@@ -267,6 +310,113 @@ async def test_start_session_connects_realtime_websocket_with_instructions() -> 
 
 
 @pytest.mark.asyncio
+async def test_start_realtime_session_advertises_function_tools() -> None:
+    websocket = _FakeWebSocket()
+    context = _context(websocket)
+    adapter = _adapter(
+        session_options={"modalities": ["audio"]},
+        response_options={"modalities": ["audio"]},
+    )
+    tool = _AnyArgsTool("write_file")
+
+    await adapter.start_realtime_session(
+        context=context,
+        toolkits=[Toolkit(name="storage", tools=[tool])],
+    )
+
+    assert websocket.sent[0]["session"]["tools"] == [
+        {
+            "type": "function",
+            "name": "write_file",
+            "description": "test tool",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": True,
+            },
+        }
+    ]
+    assert "strict" not in websocket.sent[0]["session"]["tools"][0]
+
+    await adapter.disconnect(context=context)
+
+
+@pytest.mark.asyncio
+async def test_realtime_session_executes_tool_calls_from_automatic_response() -> None:
+    websocket = _FakeWebSocket()
+    context = _context(websocket)
+    adapter = _adapter(
+        session_options={"modalities": ["audio"]},
+        response_options={"modalities": ["audio"]},
+    )
+    tool = _AnyArgsTool("write_file")
+    received: list[dict[str, object]] = []
+
+    await adapter.start_realtime_session(
+        context=context,
+        event_handler=received.append,
+        caller=_FakeParticipant(),
+        toolkits=[Toolkit(name="storage", tools=[tool])],
+    )
+
+    await websocket.messages.put(
+        _text_message(
+            {
+                "type": "response.done",
+                "response": {
+                    "id": "resp-tool",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "id": "fc-1",
+                            "call_id": "call-1",
+                            "name": "write_file",
+                            "arguments": '{"path": "note.txt"}',
+                        }
+                    ],
+                },
+            }
+        )
+    )
+
+    conversation_items = await _wait_for_sent_count(
+        websocket, "conversation.item.create", 1
+    )
+    assert conversation_items[-1]["item"] == {
+        "type": "function_call_output",
+        "id": "call-1",
+        "call_id": "call-1",
+        "output": '{"ok": true, "args": {"path": "note.txt"}}',
+        "status": "completed",
+    }
+    response_creates = await _wait_for_sent_count(websocket, "response.create", 1)
+    assert response_creates[0]["response"]["output_modalities"] == ["audio"]
+
+    await websocket.messages.put(
+        _text_message(
+            {
+                "type": "response.done",
+                "response": {"id": "resp-final", "status": "completed"},
+            }
+        )
+    )
+    for _ in range(100):
+        if any(event.get("type") == "response.done" for event in received):
+            break
+        await asyncio.sleep(0)
+
+    assert tool.calls == [{"path": "note.txt"}]
+    assert [event.get("type") for event in received] == [
+        "session.updated",
+        "meshagent.handler.added",
+        "meshagent.handler.done",
+        "response.done",
+    ]
+
+    await adapter.disconnect(context=context)
+
+
+@pytest.mark.asyncio
 async def test_connect_uses_custom_realtime_transcription_model() -> None:
     websocket = _FakeWebSocket()
     context = _context(websocket)
@@ -297,6 +447,24 @@ async def test_connect_uses_custom_realtime_transcription_model() -> None:
             },
         }
     ]
+
+    await adapter.disconnect(context=context)
+
+
+@pytest.mark.asyncio
+async def test_connect_uses_automatic_realtime_turn_detection() -> None:
+    websocket = _FakeWebSocket()
+    context = _context(websocket)
+    adapter = _adapter(
+        session_options={"output_modalities": ["text"]},
+        turn_detection="automatic",
+    )
+
+    await adapter.connect(context=context)
+
+    audio_input = websocket.sent[0]["session"]["audio"]["input"]
+    assert audio_input["turn_detection"] == {"type": "server_vad"}
+    assert adapter.list_models()[0].turn_detection == "automatic"
 
     await adapter.disconnect(context=context)
 
@@ -410,6 +578,91 @@ async def test_create_response_sends_response_create_and_returns_terminal_event(
         "response.audio_transcript.delta",
         "response.done",
     ]
+
+    await adapter.disconnect(context=context)
+
+
+@pytest.mark.asyncio
+async def test_create_response_advertises_and_executes_function_tools() -> None:
+    websocket = _FakeWebSocket()
+    context = _context(websocket)
+    adapter = _adapter(response_options={"modalities": ["text"]})
+    tool = _AnyArgsTool("write_file")
+    await adapter.connect(context=context)
+
+    task = asyncio.create_task(
+        adapter.create_response(
+            context=context,
+            caller=_FakeParticipant(),
+            toolkits=[Toolkit(name="storage", tools=[tool])],
+        )
+    )
+    response_create = await _wait_for_sent_type(websocket, "response.create")
+    assert response_create == {
+        "type": "response.create",
+        "response": {
+            "output_modalities": ["text"],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "write_file",
+                    "description": "test tool",
+                    "parameters": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    },
+                }
+            ],
+        },
+    }
+
+    await websocket.messages.put(
+        _text_message(
+            {
+                "type": "response.done",
+                "response": {
+                    "id": "resp-tool",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "id": "fc-1",
+                            "call_id": "call-1",
+                            "name": "write_file",
+                            "arguments": '{"path": "note.txt"}',
+                        }
+                    ],
+                },
+            }
+        )
+    )
+
+    conversation_items = await _wait_for_sent_count(
+        websocket, "conversation.item.create", 1
+    )
+    assert conversation_items[-1]["item"] == {
+        "type": "function_call_output",
+        "call_id": "call-1",
+        "output": '{"ok": true, "args": {"path": "note.txt"}}',
+        "status": "completed",
+        "id": "call-1",
+    }
+    response_creates = await _wait_for_sent_count(websocket, "response.create", 2)
+    assert response_creates[1]["response"]["tools"][0]["name"] == "write_file"
+    assert "strict" not in response_creates[1]["response"]["tools"][0]
+
+    await websocket.messages.put(
+        _text_message(
+            {
+                "type": "response.done",
+                "response": {"id": "resp-final", "status": "completed"},
+            }
+        )
+    )
+
+    terminal_event = await task
+    assert terminal_event["response"]["id"] == "resp-final"
+    assert tool.calls == [{"path": "note.txt"}]
 
     await adapter.disconnect(context=context)
 
@@ -861,6 +1114,20 @@ def test_realtime_publisher_emits_audio_generation_and_transcription_lifecycles(
             "transcript": "hello",
         }
     )
+    publisher(
+        {
+            "type": "input_audio_buffer.speech_started",
+            "item_id": "user-audio-2",
+            "audio_start_ms": 120,
+        }
+    )
+    publisher(
+        {
+            "type": "input_audio_buffer.speech_stopped",
+            "item_id": "user-audio-2",
+            "audio_end_ms": 450,
+        }
+    )
 
     assert [type(message) for message in messages] == [
         AgentAudioGenerationStarted,
@@ -869,6 +1136,8 @@ def test_realtime_publisher_emits_audio_generation_and_transcription_lifecycles(
         AgentAudioTranscriptionStarted,
         AgentAudioTranscriptionDelta,
         AgentAudioTranscriptionCompleted,
+        AgentAudioInputSpeechStarted,
+        AgentAudioInputSpeechEnded,
     ]
     generation_completed = messages[2]
     assert isinstance(generation_completed, AgentAudioGenerationCompleted)
@@ -877,6 +1146,14 @@ def test_realtime_publisher_emits_audio_generation_and_transcription_lifecycles(
     transcription_completed = messages[5]
     assert isinstance(transcription_completed, AgentAudioTranscriptionCompleted)
     assert transcription_completed.text == "hello"
+    speech_started = messages[6]
+    assert isinstance(speech_started, AgentAudioInputSpeechStarted)
+    assert speech_started.item_id == "user-audio-2"
+    assert speech_started.audio_start_ms == 120
+    speech_ended = messages[7]
+    assert isinstance(speech_ended, AgentAudioInputSpeechEnded)
+    assert speech_ended.item_id == "user-audio-2"
+    assert speech_ended.audio_end_ms == 450
 
 
 @pytest.mark.asyncio

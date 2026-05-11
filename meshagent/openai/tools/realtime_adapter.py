@@ -8,13 +8,17 @@ import json
 import logging
 from collections import deque
 from collections.abc import Callable, Mapping
+from types import SimpleNamespace
 from typing import Any
+from typing import Literal
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import aiohttp
 from openai import AsyncOpenAI
 
 from meshagent.agents.adapter import (
+    DEFAULT_MAX_TOOL_CALL_LENGTH,
+    DEFAULT_MAX_TOOL_CALL_LINES,
     LLMAdapter,
     LLMAudioFormat,
     LLMModelInfo,
@@ -29,6 +33,11 @@ from meshagent.agents.agent_event_reader import (
     _BufferedToolCall,
 )
 from meshagent.openai.tools.event_publisher import make_realtime_agent_event_publisher
+from meshagent.openai.tools.responses_adapter import (
+    OpenAIResponsesToolResponseAdapter,
+    ResponsesToolBundle,
+    safe_tool_name,
+)
 from meshagent.agents.messages import AgentMessage, ToolChoice
 from meshagent.api import Participant, RoomException
 from meshagent.api.error_codes import ErrorCode
@@ -43,7 +52,7 @@ from meshagent.openai.proxy import (
     resolve_base_url,
     resolve_user_agent,
 )
-from meshagent.tools import Toolkit
+from meshagent.tools import ToolContext, Toolkit
 
 logger = logging.getLogger("openai_realtime_agent")
 
@@ -57,6 +66,7 @@ DEFAULT_OPENAI_REALTIME_OUTPUT_FORMAT = LLMAudioFormat(
     type="audio/pcm",
     sample_rate=24000,
 )
+DEFAULT_OPENAI_REALTIME_TURN_DETECTION: Literal["none", "automatic"] = "none"
 OPENAI_REALTIME_VOICES = (
     "alloy",
     "ash",
@@ -75,6 +85,19 @@ def _normalize_realtime_options(options: Mapping[str, Any]) -> dict[str, Any]:
     if "output_modalities" not in normalized and modalities is not None:
         normalized["output_modalities"] = modalities
     return normalized
+
+
+def _realtime_tool_definitions(
+    tools: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]] | None:
+    if tools is None:
+        return None
+    realtime_tools: list[dict[str, Any]] = []
+    for tool in tools:
+        realtime_tool = dict(tool)
+        realtime_tool.pop("strict", None)
+        realtime_tools.append(realtime_tool)
+    return realtime_tools
 
 
 def _merge_realtime_options(
@@ -98,6 +121,7 @@ def _ensure_realtime_input_audio_options(
     input_format: LLMAudioFormat,
     output_format: LLMAudioFormat,
     voice: str | None,
+    turn_detection: Literal["none", "automatic"],
 ) -> None:
     audio = options.get("audio")
     if audio is None:
@@ -114,7 +138,10 @@ def _ensure_realtime_input_audio_options(
         return
 
     input_options.setdefault("format", _openai_realtime_audio_format(input_format))
-    input_options.setdefault("turn_detection", None)
+    input_options.setdefault(
+        "turn_detection",
+        None if turn_detection == "none" else {"type": "server_vad"},
+    )
     if transcription_model is not None:
         input_options.setdefault("transcription", {"model": transcription_model})
 
@@ -223,6 +250,9 @@ class OpenAIRealtimeSessionContext(AgentSessionContext):
         self._session_update_future: asyncio.Future[dict[str, Any]] | None = None
         self._session_options_signature: str | None = None
         self._synced_message_count = 0
+        self._realtime_toolkits: list[Toolkit] = []
+        self._realtime_tool_caller: Participant | None = None
+        self._realtime_tool_choice: ToolChoice | None = None
 
     @staticmethod
     def _headers_signature(headers: dict[str, str]) -> tuple[tuple[str, str], ...]:
@@ -570,7 +600,6 @@ class _OpenAIRealtimeAgentEventReader(AccumulatingAgentEventReader):
         arguments: dict[str, Any] | None,
         images: list[dict[str, Any]],
         status: str,
-        status_detail: str | None,
     ) -> None:
         item = {
             "type": "image_generation",
@@ -582,7 +611,6 @@ class _OpenAIRealtimeAgentEventReader(AccumulatingAgentEventReader):
             "arguments": arguments,
             "images": images,
             "status": status,
-            "status_detail": status_detail,
         }
         self._append_assistant_text(text=json.dumps(item), phase=None)
 
@@ -652,6 +680,9 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
         voice: str | None = DEFAULT_OPENAI_REALTIME_VOICE,
         input_format: LLMAudioFormat | Mapping[str, Any] | None = None,
         output_format: LLMAudioFormat | Mapping[str, Any] | None = None,
+        turn_detection: Literal[
+            "none", "automatic"
+        ] = DEFAULT_OPENAI_REALTIME_TURN_DETECTION,
     ):
         if websocket_timeout <= 0:
             raise ValueError("websocket_timeout must be greater than 0")
@@ -686,6 +717,7 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
             output_format,
             default=DEFAULT_OPENAI_REALTIME_OUTPUT_FORMAT,
         )
+        self._turn_detection = turn_detection
 
     def default_model(self) -> str:
         return self._model
@@ -713,6 +745,7 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
                 default_output_voice=self._voice,
                 input_format=self._input_format,
                 output_format=self._output_format,
+                turn_detection=self._turn_detection,
             )
             for name in names
         ]
@@ -790,6 +823,7 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
             voice=self._voice,
             input_format=self._input_format,
             output_format=self._output_format,
+            turn_detection=self._turn_detection,
         )
 
     def _openai_client(self) -> AsyncOpenAI:
@@ -926,6 +960,80 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
                     "OpenAI Realtime websocket returned unexpected binary message"
                 )
 
+    async def _handle_realtime_tool_calls(
+        self,
+        *,
+        context: OpenAIRealtimeSessionContext,
+        event: Mapping[str, Any],
+    ) -> bool:
+        tool_calls = self._response_function_calls(event)
+        if len(tool_calls) == 0:
+            return False
+
+        caller = context._realtime_tool_caller
+        if caller is None or len(context._realtime_toolkits) == 0:
+            return False
+
+        event_handler = context._event_handler
+        tool_bundle = ResponsesToolBundle(toolkits=[*context._realtime_toolkits])
+        tool_adapter = OpenAIResponsesToolResponseAdapter(
+            max_tool_call_length=DEFAULT_MAX_TOOL_CALL_LENGTH,
+            max_tool_call_lines=DEFAULT_MAX_TOOL_CALL_LINES,
+        )
+        for tool_call in tool_calls:
+            tool_context = ToolContext(
+                caller=caller,
+                caller_context=context.to_tool_caller_context(
+                    item_id=tool_call.get("id")
+                ),
+                event_handler=event_handler,
+            )
+            if event_handler is not None:
+                event_handler(
+                    {
+                        "type": "meshagent.handler.added",
+                        "item": dict(tool_call),
+                    }
+                )
+            realtime_tool_call = SimpleNamespace(
+                id=tool_call.get("id"),
+                call_id=tool_call.get("call_id"),
+                name=tool_call["name"],
+                arguments=tool_call["arguments"],
+            )
+            tool_result = await tool_bundle.execute(
+                context=tool_context,
+                tool_call=realtime_tool_call,
+            )
+            tool_output_messages = await tool_adapter.create_messages(
+                context=context,
+                tool_call=realtime_tool_call,
+                response=tool_result,
+            )
+            context.previous_messages.append(dict(tool_call))
+            for output_message in tool_output_messages:
+                await self._send_conversation_item(
+                    context=context, message=output_message
+                )
+                context.previous_messages.append(output_message)
+                if event_handler is not None:
+                    event_handler(
+                        {
+                            "type": "meshagent.handler.done",
+                            "item": dict(output_message),
+                        }
+                    )
+            context._synced_message_count = len(
+                [*context.previous_messages, *context.messages]
+            )
+
+        await self._send_response_create(
+            context=context,
+            toolkits=context._realtime_toolkits,
+            tool_choice=context._realtime_tool_choice,
+        )
+        return True
+
     async def _receive_loop(self, context: OpenAIRealtimeSessionContext) -> None:
         try:
             while True:
@@ -933,12 +1041,11 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
                 if websocket is None or websocket.closed:
                     return
                 event = await self._receive_payload(websocket=websocket)
-                event_handler = context._event_handler
-                if event_handler is not None:
-                    event_handler(event)
-
                 event_type = event.get("type")
                 if not isinstance(event_type, str):
+                    event_handler = context._event_handler
+                    if event_handler is not None:
+                        event_handler(event)
                     continue
 
                 if event_type == "session.updated":
@@ -948,6 +1055,18 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
                         and not session_update_future.done()
                     ):
                         session_update_future.set_result(event)
+
+                if self._terminal_response_event(event_type):
+                    error = self._response_error(event)
+                    if error is None and await self._handle_realtime_tool_calls(
+                        context=context,
+                        event=event,
+                    ):
+                        continue
+
+                event_handler = context._event_handler
+                if event_handler is not None:
+                    event_handler(event)
 
                 if event_type == "response.created":
                     context._response_created(event)
@@ -1003,6 +1122,7 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
             input_format=self._input_format,
             output_format=self._output_format,
             voice=self._voice,
+            turn_detection=self._turn_detection,
         )
         session_payload["session"] = {"type": "realtime", **session_options}
         session_options_signature = json.dumps(
@@ -1047,22 +1167,56 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
         context: AgentSessionContext,
         event_handler: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
+        await self.start_realtime_session(
+            context=context,
+            event_handler=event_handler,
+        )
+
+    async def start_realtime_session(
+        self,
+        *,
+        context: AgentSessionContext,
+        event_handler: Callable[[dict[str, Any]], None] | None = None,
+        caller: Participant | None = None,
+        toolkits: list[Toolkit] | None = None,
+        tool_choice: ToolChoice | None = None,
+        model: str | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> None:
         if not isinstance(context, OpenAIRealtimeSessionContext):
             raise RoomException(
                 "OpenAIRealtimeAdapter requires OpenAIRealtimeSessionContext from create_session()"
             )
 
-        session_options: dict[str, Any] = {}
+        session_options = _normalize_realtime_options(copy.deepcopy(options or {}))
         instructions = context.get_system_instructions()
         if isinstance(instructions, str) and instructions.strip() != "":
             session_options["instructions"] = instructions
         voice = context.metadata.get("voice")
         if isinstance(voice, str) and voice.strip() != "":
-            session_options["audio"] = {"output": {"voice": voice.strip()}}
+            session_options = _merge_realtime_options(
+                session_options,
+                {"audio": {"output": {"voice": voice.strip()}}},
+            )
+
+        if toolkits is not None:
+            tool_bundle = ResponsesToolBundle(toolkits=[*toolkits])
+            openai_tools = _realtime_tool_definitions(tool_bundle.to_json())
+            if openai_tools is not None:
+                session_options["tools"] = openai_tools
+        if tool_choice is not None:
+            session_options["tool_choice"] = {
+                "type": "function",
+                "name": safe_tool_name(tool_choice.tool_name),
+            }
+        context._realtime_toolkits = [*toolkits] if toolkits is not None else []
+        context._realtime_tool_caller = caller
+        context._realtime_tool_choice = tool_choice
 
         await self.connect(
             context=context,
             event_handler=event_handler,
+            model=model,
             options=session_options or None,
         )
 
@@ -1144,7 +1298,8 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
         if message_type in {"function_call", "function_call_output"}:
             item = dict(message)
             item.setdefault("id", item.get("call_id"))
-            item.setdefault("status", "completed")
+            if item.get("status") not in {"completed", "incomplete"}:
+                item["status"] = "completed"
             return {
                 "type": "conversation.item.create",
                 "item": item,
@@ -1194,6 +1349,37 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
                     parts.append(text)
         return "".join(parts)
 
+    @staticmethod
+    def _response_function_calls(event: Mapping[str, Any]) -> list[dict[str, Any]]:
+        response = event.get("response")
+        if not isinstance(response, dict):
+            return []
+        output = response.get("output")
+        if not isinstance(output, list):
+            return []
+
+        tool_calls: list[dict[str, Any]] = []
+        for item in output:
+            if not isinstance(item, dict) or item.get("type") != "function_call":
+                continue
+            name = item.get("name")
+            if not isinstance(name, str) or name.strip() == "":
+                continue
+            call_id = item.get("call_id")
+            item_id = item.get("id")
+            arguments = item.get("arguments")
+            tool_calls.append(
+                {
+                    "type": "function_call",
+                    "id": item_id if isinstance(item_id, str) else call_id,
+                    "call_id": call_id if isinstance(call_id, str) else item_id,
+                    "name": name,
+                    "arguments": arguments if isinstance(arguments, str) else "{}",
+                    "status": "completed",
+                }
+            )
+        return tool_calls
+
     async def _sync_text_messages(
         self, *, context: OpenAIRealtimeSessionContext
     ) -> None:
@@ -1211,6 +1397,42 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
                 continue
             await context.send_json(payload)
             context._synced_message_count += 1
+
+    @staticmethod
+    async def _send_conversation_item(
+        *, context: OpenAIRealtimeSessionContext, message: Mapping[str, Any]
+    ) -> None:
+        payload = OpenAIRealtimeAdapter._conversation_item_for_message(message)
+        if payload is not None:
+            await context.send_json(payload)
+
+    async def _send_response_create(
+        self,
+        *,
+        context: OpenAIRealtimeSessionContext,
+        toolkits: list[Toolkit],
+        tool_choice: ToolChoice | None,
+        options: Mapping[str, Any] | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {"type": "response.create"}
+        response_options = _normalize_realtime_options(
+            copy.deepcopy(self._response_options)
+        )
+        if options is not None:
+            response_options.update(options)
+            response_options = _normalize_realtime_options(response_options)
+        tool_bundle = ResponsesToolBundle(toolkits=[*toolkits])
+        openai_tools = _realtime_tool_definitions(tool_bundle.to_json())
+        if openai_tools is not None:
+            response_options["tools"] = openai_tools
+        if tool_choice is not None:
+            response_options["tool_choice"] = {
+                "type": "function",
+                "name": safe_tool_name(tool_choice.tool_name),
+            }
+        if len(response_options) > 0:
+            payload["response"] = response_options
+        await context.send_json(payload)
 
     @staticmethod
     def _response_id(event: Mapping[str, Any]) -> str | None:
@@ -1236,13 +1458,10 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
         tool_choice: ToolChoice | None = None,
         options: dict | None = None,
     ) -> dict[str, Any]:
-        del caller
-        del toolkits
         del output_schema
         del steering_callback
         del model
         del on_behalf_of
-        del tool_choice
         if not isinstance(context, OpenAIRealtimeSessionContext):
             raise RoomException(
                 "OpenAIRealtimeAdapter requires OpenAIRealtimeSessionContext from create_session()"
@@ -1255,42 +1474,101 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
         if event_handler is not None:
             context._event_handler = event_handler
 
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[dict[str, Any]] = loop.create_future()
-        async with context._request_lock:
-            payload: dict[str, Any] = {"type": "response.create"}
-            response_options = _normalize_realtime_options(
-                copy.deepcopy(self._response_options)
-            )
-            if options is not None:
-                response_options.update(options)
-                response_options = _normalize_realtime_options(response_options)
-            if len(response_options) > 0:
-                payload["response"] = response_options
-            await self._sync_text_messages(context=context)
-            context._pending_response_futures.append(future)
-            try:
-                await context.send_json(payload)
-            except BaseException:
-                with contextlib.suppress(ValueError):
-                    context._pending_response_futures.remove(future)
-                raise
-
-        terminal_event = await future
-        response_id = self._response_id(terminal_event)
-        if response_id is not None:
-            context.track_response(response_id)
-        else:
-            context.previous_messages.extend(context.messages)
-            context.messages.clear()
-        assistant_text = self._response_text(terminal_event)
-        if assistant_text != "":
-            context.previous_messages.append(
-                {"role": "assistant", "content": assistant_text}
-            )
-        context._synced_message_count = len(
-            [*context.previous_messages, *context.messages]
+        tool_adapter = OpenAIResponsesToolResponseAdapter(
+            max_tool_call_length=DEFAULT_MAX_TOOL_CALL_LENGTH,
+            max_tool_call_lines=DEFAULT_MAX_TOOL_CALL_LINES,
         )
+        terminal_event: dict[str, Any] | None = None
+        while True:
+            loop = asyncio.get_running_loop()
+            future: asyncio.Future[dict[str, Any]] = loop.create_future()
+            async with context._request_lock:
+                await self._sync_text_messages(context=context)
+                context._pending_response_futures.append(future)
+                try:
+                    await self._send_response_create(
+                        context=context,
+                        toolkits=toolkits,
+                        tool_choice=tool_choice,
+                        options=options,
+                    )
+                except BaseException:
+                    with contextlib.suppress(ValueError):
+                        context._pending_response_futures.remove(future)
+                    raise
+
+            terminal_event = await future
+            response_id = self._response_id(terminal_event)
+            if response_id is not None:
+                context.track_response(response_id)
+            else:
+                context.previous_messages.extend(context.messages)
+                context.messages.clear()
+            assistant_text = self._response_text(terminal_event)
+            if assistant_text != "":
+                context.previous_messages.append(
+                    {"role": "assistant", "content": assistant_text}
+                )
+
+            tool_calls = self._response_function_calls(terminal_event)
+            if not tool_calls:
+                context._synced_message_count = len(
+                    [*context.previous_messages, *context.messages]
+                )
+                break
+
+            tool_bundle = ResponsesToolBundle(toolkits=[*toolkits])
+            for tool_call in tool_calls:
+                tool_context = ToolContext(
+                    caller=caller,
+                    caller_context=context.to_tool_caller_context(
+                        item_id=tool_call.get("id")
+                    ),
+                    event_handler=event_handler,
+                )
+                if event_handler is not None:
+                    event_handler(
+                        {
+                            "type": "meshagent.handler.added",
+                            "item": dict(tool_call),
+                        }
+                    )
+                realtime_tool_call = SimpleNamespace(
+                    id=tool_call.get("id"),
+                    call_id=tool_call.get("call_id"),
+                    name=tool_call["name"],
+                    arguments=tool_call["arguments"],
+                )
+                tool_result = await tool_bundle.execute(
+                    context=tool_context,
+                    tool_call=realtime_tool_call,
+                )
+                tool_output_messages = await tool_adapter.create_messages(
+                    context=context,
+                    tool_call=realtime_tool_call,
+                    response=tool_result,
+                )
+                context.previous_messages.append(tool_call)
+                for output_message in tool_output_messages:
+                    await self._send_conversation_item(
+                        context=context, message=output_message
+                    )
+                    context.previous_messages.append(output_message)
+                    if event_handler is not None:
+                        event_handler(
+                            {
+                                "type": "meshagent.handler.done",
+                                "item": dict(output_message),
+                            }
+                        )
+                context._synced_message_count = len(
+                    [*context.previous_messages, *context.messages]
+                )
+
+        if terminal_event is None:
+            raise RoomException(
+                "OpenAI Realtime response ended without a terminal event."
+            )
         context.turn_count += 1
         return terminal_event
 

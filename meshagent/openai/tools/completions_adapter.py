@@ -175,7 +175,6 @@ class OpenAICompletionsAgentEventReader(AccumulatingAgentEventReader):
         arguments: dict[str, Any] | None,
         images: list[dict[str, Any]],
         status: str,
-        status_detail: str | None,
     ) -> None:
         item = {
             "type": "image_generation",
@@ -187,7 +186,6 @@ class OpenAICompletionsAgentEventReader(AccumulatingAgentEventReader):
             "arguments": arguments,
             "images": images,
             "status": status,
-            "status_detail": status_detail,
         }
         self._emit_context_message({"role": "assistant", "content": json.dumps(item)})
 

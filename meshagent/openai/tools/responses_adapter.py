@@ -597,7 +597,6 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
         arguments: dict[str, Any] | None,
         images: list[dict[str, Any]],
         status: str,
-        status_detail: str | None,
     ) -> None:
         del event_type, toolkit, tool
         item: dict[str, Any] = {
@@ -611,8 +610,6 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
             item.update(copy.deepcopy(arguments))
         if images:
             item["results"] = copy.deepcopy(images)
-        if status_detail is not None:
-            item["status_detail"] = status_detail
         self._emit_context_message(item)
 
     def _append_audio_generation_event(self, *, message: AgentMessage) -> None:
@@ -1958,7 +1955,6 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                 "width": width,
                 "height": height,
                 "status": "completed",
-                "status_detail": "Image saved",
             }
         ]
         return persisted_item

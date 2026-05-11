@@ -3985,7 +3985,6 @@ def test_make_agent_event_publisher_emits_persisted_image_generation_result() ->
                         "width": 1024,
                         "height": 1024,
                         "status": "completed",
-                        "status_detail": "Image saved",
                     }
                 ],
             },

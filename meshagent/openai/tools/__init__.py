@@ -4,6 +4,7 @@ from .responses_adapter import (
     OpenAIResponsesMCPToolkit,
 )
 from .realtime_adapter import (
+    DEFAULT_OPENAI_REALTIME_TURN_DETECTION,
     DEFAULT_OPENAI_REALTIME_TRANSCRIPTION_MODEL,
     OpenAIRealtimeAdapter,
     OpenAIRealtimeSessionContext,
@@ -18,6 +19,7 @@ __all__ = [
     OpenAIResponsesAdapter,
     OpenAIResponsesToolResponseAdapter,
     OpenAIResponsesMCPToolkit,
+    DEFAULT_OPENAI_REALTIME_TURN_DETECTION,
     DEFAULT_OPENAI_REALTIME_TRANSCRIPTION_MODEL,
     OpenAIRealtimeAdapter,
     OpenAIRealtimeSessionContext,
