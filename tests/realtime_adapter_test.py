@@ -260,6 +260,28 @@ def test_websocket_headers_remove_beta_and_http_headers_case_insensitively() -> 
     }
 
 
+def test_list_models_advertises_realtime_protocols() -> None:
+    adapter = _adapter(realtime_protocols=("webrtc", "websocket"))
+
+    assert adapter.list_models()[0].realtime_protocols == ("webrtc", "websocket")
+
+
+@pytest.mark.asyncio
+async def test_create_realtime_connection_returns_webrtc_endpoint() -> None:
+    connection = await _adapter().create_realtime_connection(
+        protocol="webrtc",
+        model="gpt-realtime-test",
+    )
+
+    assert connection.protocol == "webrtc"
+    assert connection.url == (
+        "https://api.openai.test/v1/realtime/calls?model=gpt-realtime-test"
+    )
+    assert connection.headers["Authorization"] == "Bearer test-key"
+    assert "content-type" not in {key.lower() for key in connection.headers}
+    assert "content-length" not in {key.lower() for key in connection.headers}
+
+
 @pytest.mark.asyncio
 async def test_create_response_requires_an_explicit_realtime_connection() -> None:
     adapter = _adapter()

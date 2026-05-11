@@ -22,6 +22,7 @@ from meshagent.agents.adapter import (
     LLMAdapter,
     LLMAudioFormat,
     LLMModelInfo,
+    LLMRealtimeConnectionInfo,
     SteeringCallback,
     llm_model_pricing,
 )
@@ -67,6 +68,10 @@ DEFAULT_OPENAI_REALTIME_OUTPUT_FORMAT = LLMAudioFormat(
     sample_rate=24000,
 )
 DEFAULT_OPENAI_REALTIME_TURN_DETECTION: Literal["none", "automatic"] = "none"
+DEFAULT_OPENAI_REALTIME_PROTOCOLS: tuple[Literal["websocket", "webrtc"], ...] = (
+    "websocket",
+    "webrtc",
+)
 OPENAI_REALTIME_VOICES = (
     "alloy",
     "ash",
@@ -683,6 +688,9 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
         turn_detection: Literal[
             "none", "automatic"
         ] = DEFAULT_OPENAI_REALTIME_TURN_DETECTION,
+        realtime_protocols: tuple[Literal["websocket", "webrtc"], ...]
+        | list[Literal["websocket", "webrtc"]]
+        | None = DEFAULT_OPENAI_REALTIME_PROTOCOLS,
     ):
         if websocket_timeout <= 0:
             raise ValueError("websocket_timeout must be greater than 0")
@@ -718,6 +726,9 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
             default=DEFAULT_OPENAI_REALTIME_OUTPUT_FORMAT,
         )
         self._turn_detection = turn_detection
+        self._realtime_protocols = tuple(
+            dict.fromkeys(realtime_protocols or DEFAULT_OPENAI_REALTIME_PROTOCOLS)
+        )
 
     def default_model(self) -> str:
         return self._model
@@ -746,6 +757,7 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
                 input_format=self._input_format,
                 output_format=self._output_format,
                 turn_detection=self._turn_detection,
+                realtime_protocols=self._realtime_protocols,
             )
             for name in names
         ]
@@ -824,6 +836,7 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
             input_format=self._input_format,
             output_format=self._output_format,
             turn_detection=self._turn_detection,
+            realtime_protocols=self._realtime_protocols,
         )
 
     def _openai_client(self) -> AsyncOpenAI:
@@ -861,6 +874,68 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
                 urlencode(query_items),
                 parsed.fragment,
             )
+        )
+
+    @staticmethod
+    def _http_base_url_to_webrtc_realtime_url(*, base_url: str, model: str) -> str:
+        parsed = urlparse(base_url)
+        if parsed.scheme not in ("http", "https"):
+            raise RoomException(
+                f"unsupported OpenAI base URL scheme for realtime WebRTC mode: {parsed.scheme}"
+            )
+        query_items = parse_qsl(parsed.query, keep_blank_values=True)
+        query_items.append(("model", model))
+        path = parsed.path.rstrip("/") + "/realtime/calls"
+        return urlunparse(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                path,
+                parsed.params,
+                urlencode(query_items),
+                parsed.fragment,
+            )
+        )
+
+    async def create_realtime_connection(
+        self,
+        *,
+        protocol: Literal["websocket", "webrtc"],
+        model: str | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> LLMRealtimeConnectionInfo:
+        if protocol not in self._realtime_protocols:
+            raise RoomException(
+                f"OpenAI Realtime adapter does not support realtime protocol {protocol!r}"
+            )
+        del options
+        realtime_model = model or self.default_model()
+        openai = self._openai_client()
+        extra_headers = llm_annotation_headers(self._annotations)
+        headers = self._websocket_headers(openai=openai, extra_headers=extra_headers)
+        if protocol == "websocket":
+            return LLMRealtimeConnectionInfo(
+                protocol=protocol,
+                url=self._http_base_url_to_ws_realtime_url(
+                    base_url=str(openai.base_url),
+                    model=realtime_model,
+                ),
+                headers=headers,
+                web_only_protocol=None,
+            )
+        headers = {
+            key: value
+            for key, value in headers.items()
+            if key.lower() not in {"content-type", "content-length"}
+        }
+        return LLMRealtimeConnectionInfo(
+            protocol=protocol,
+            url=self._http_base_url_to_webrtc_realtime_url(
+                base_url=str(openai.base_url),
+                model=realtime_model,
+            ),
+            headers=headers,
+            web_only_protocol=None,
         )
 
     def _websocket_headers(
