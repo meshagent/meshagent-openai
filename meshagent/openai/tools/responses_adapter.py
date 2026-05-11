@@ -616,10 +616,8 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
         self._emit_context_message(item)
 
     def _append_audio_generation_event(self, *, message: AgentMessage) -> None:
-        self._append_assistant_text(
-            text=json.dumps(message.model_dump(mode="json")),
-            phase=None,
-        )
+        del message
+        return
 
     def _append_audio_transcription_event(self, *, message: AgentMessage) -> None:
         self._append_assistant_text(
@@ -2656,6 +2654,9 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                     "effort": self._reasoning_effort,
                                     "summary": "detailed",
                                 }
+                            request_options = copy.deepcopy(options or {})
+                            request_options.pop("output_modalities", None)
+                            request_options.pop("voice", None)
 
                             extra_headers = {}
                             extra_headers.update(
@@ -2690,7 +2691,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                 "instructions": instructions or NOT_GIVEN,
                                 "max_output_tokens": self.max_output_tokens,
                                 **response_options,
-                                **(options or {}),
+                                **request_options,
                             }
                             normalized_extra_headers = llm_annotation_headers(
                                 self._annotations

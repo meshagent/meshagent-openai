@@ -188,7 +188,11 @@ async def test_connect_opens_realtime_websocket_and_sends_session_update() -> No
                         "transcription": {
                             "model": DEFAULT_OPENAI_REALTIME_TRANSCRIPTION_MODEL
                         },
-                    }
+                    },
+                    "output": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "voice": "echo",
+                    },
                 },
             },
         }
@@ -249,7 +253,11 @@ async def test_start_session_connects_realtime_websocket_with_instructions() -> 
                         "transcription": {
                             "model": DEFAULT_OPENAI_REALTIME_TRANSCRIPTION_MODEL
                         },
-                    }
+                    },
+                    "output": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "voice": "echo",
+                    },
                 },
             },
         }
@@ -280,7 +288,11 @@ async def test_connect_uses_custom_realtime_transcription_model() -> None:
                         "format": {"type": "audio/pcm", "rate": 24000},
                         "turn_detection": None,
                         "transcription": {"model": "custom-transcribe"},
-                    }
+                    },
+                    "output": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "voice": "echo",
+                    },
                 },
             },
         }
@@ -315,7 +327,11 @@ async def test_connect_preserves_explicit_realtime_transcription_options() -> No
                 "transcription": {"model": "configured-transcribe"},
                 "format": {"type": "audio/pcm", "rate": 24000},
                 "turn_detection": None,
-            }
+            },
+            "output": {
+                "format": {"type": "audio/pcm", "rate": 24000},
+                "voice": "echo",
+            },
         },
     }
 

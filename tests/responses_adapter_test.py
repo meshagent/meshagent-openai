@@ -31,6 +31,9 @@ from meshagent.agents.messages import (
     AGENT_EVENT_TOOL_CALL_ENDED,
     AGENT_EVENT_TOOL_CALL_STARTED,
     AgentContextCompacted,
+    AgentAudioGenerationCompleted,
+    AgentAudioGenerationDelta,
+    AgentAudioGenerationStarted,
     AgentThreadEvent,
     AgentImageGenerationCompleted,
     AgentImageGenerationStarted,
@@ -48,6 +51,9 @@ from meshagent.agents.messages import (
     AgentToolCallLogDelta,
     AgentToolCallEnded,
     AgentToolCallStarted,
+    AGENT_EVENT_AUDIO_GENERATION_COMPLETED,
+    AGENT_EVENT_AUDIO_GENERATION_DELTA,
+    AGENT_EVENT_AUDIO_GENERATION_STARTED,
 )
 from meshagent.api import RoomException
 from meshagent.api.error_codes import ErrorCode
@@ -138,6 +144,44 @@ def test_make_agent_event_reader_accumulates_streamed_text_for_restore() -> None
             "content": [{"type": "output_text", "text": "Hi there"}],
         }
     ]
+
+
+def test_make_agent_event_reader_ignores_audio_generation_for_restore() -> None:
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    context = adapter.create_session()
+    restored_messages: list[dict[str, object]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+
+    reader.consume(
+        AgentAudioGenerationStarted(
+            type=AGENT_EVENT_AUDIO_GENERATION_STARTED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="audio-1",
+        )
+    )
+    reader.consume(
+        AgentAudioGenerationDelta(
+            type=AGENT_EVENT_AUDIO_GENERATION_DELTA,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="audio-1",
+            data=b"\xfe\x00\x01",
+            mime_type="audio/pcm",
+        )
+    )
+    reader.consume(
+        AgentAudioGenerationCompleted(
+            type=AGENT_EVENT_AUDIO_GENERATION_COMPLETED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="audio-1",
+        )
+    )
+    reader.finalize()
+    adapter.restore_context_messages(context=context, messages=restored_messages)
+
+    assert context.messages == []
 
 
 def _restore_tool_lifecycle(
@@ -1547,6 +1591,38 @@ async def test_next_tracks_usage_for_non_streaming_request_mode():
         "total_tokens": 11.0,
     }
     assert context.metadata["last_response_context_used_tokens"] == 11
+
+
+@pytest.mark.asyncio
+async def test_create_response_drops_process_audio_selection_options() -> None:
+    client = _FakeOpenAIClient(
+        outcomes=[_FakeResponse(response_id="resp_audio_options")]
+    )
+    adapter = OpenAIResponsesAdapter(
+        mode="request",
+        client=client,
+        context_management="none",
+    )
+    context = adapter.create_session()
+    context.append_user_message("hello")
+
+    result = await adapter.create_response(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        toolkits=[],
+        options={
+            "output_modalities": ["text"],
+            "voice": "echo",
+            "metadata": {"tag": "kept"},
+        },
+    )
+
+    assert result == ""
+    assert len(client.responses.create_kwargs) == 1
+    create_kwargs = client.responses.create_kwargs[0]
+    assert "output_modalities" not in create_kwargs
+    assert "voice" not in create_kwargs
+    assert create_kwargs["metadata"] == {"tag": "kept"}
 
 
 @pytest.mark.asyncio
