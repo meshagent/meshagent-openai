@@ -266,6 +266,12 @@ def test_list_models_advertises_realtime_protocols() -> None:
     assert adapter.list_models()[0].realtime_protocols == ("webrtc", "websocket")
 
 
+def test_list_models_uses_response_output_modalities() -> None:
+    adapter = _adapter(response_options={"output_modalities": ["audio"]})
+
+    assert adapter.list_models()[0].modalities == ("audio",)
+
+
 @pytest.mark.asyncio
 async def test_create_realtime_connection_returns_webrtc_endpoint() -> None:
     connection = await _adapter().create_realtime_connection(

@@ -92,6 +92,24 @@ def _normalize_realtime_options(options: Mapping[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _output_modalities_from_options(
+    options: Mapping[str, Any],
+) -> tuple[Literal["text", "audio"], ...]:
+    normalized = _normalize_realtime_options(options)
+    raw_modalities = normalized.get("output_modalities")
+    selected: list[Literal["text", "audio"]] = []
+    if isinstance(raw_modalities, (list, tuple)):
+        for raw_modality in raw_modalities:
+            if raw_modality not in ("text", "audio"):
+                continue
+            modality: Literal["text", "audio"] = (
+                "audio" if raw_modality == "audio" else "text"
+            )
+            if modality not in selected:
+                selected.append(modality)
+    return tuple(selected) if len(selected) > 0 else ("text", "audio")
+
+
 def _realtime_tool_definitions(
     tools: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]] | None:
@@ -746,12 +764,13 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
         names = list(self._allowed_models or self._known_models)
         if self._allowed_models is None and self._model not in names:
             names.insert(0, self._model)
+        output_modalities = _output_modalities_from_options(self._response_options)
         return [
             LLMModelInfo(
                 name=name,
                 context_window=32000,
                 pricing=llm_model_pricing(provider="openai", model=name),
-                modalities=("text", "audio"),
+                modalities=output_modalities,
                 available_voices=OPENAI_REALTIME_VOICES,
                 default_output_voice=self._voice,
                 input_format=self._input_format,
