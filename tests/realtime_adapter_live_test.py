@@ -2,6 +2,7 @@ import asyncio
 import os
 import time
 import uuid
+from collections.abc import Mapping
 from typing import Any
 
 import pyarrow as pa
@@ -25,6 +26,7 @@ from meshagent.agents.messages import (
 from meshagent.agents.process import AgentSupervisor, LLMAgentProcess, Message
 from meshagent.agents.thread_status_publisher import AgentMessageThreadStatusPublisher
 from meshagent.api import DatasetJson, Participant
+from meshagent.api.http import new_client_session
 from meshagent.openai.tools.realtime_adapter import OpenAIRealtimeAdapter
 
 
@@ -39,6 +41,22 @@ def _should_run_live_openai_tests() -> bool:
 pytestmark = pytest.mark.skipif(
     not _should_run_live_openai_tests(),
     reason="set RUN_OPENAI_LIVE_TESTS=1 and OPENAI_API_KEY to run live OpenAI tests",
+)
+
+
+def _openai_admin_api_key() -> str | None:
+    api_key = os.getenv("OPENAI_ADMIN_API_KEY", "").strip()
+    if api_key != "":
+        return api_key
+    api_key = os.getenv("OPENAI_ADMIN_KEY", "").strip()
+    if api_key != "":
+        return api_key
+    return None
+
+
+requires_openai_admin_key = pytest.mark.skipif(
+    _openai_admin_api_key() is None,
+    reason="set OPENAI_ADMIN_API_KEY to verify live usage against the OpenAI Usage API",
 )
 
 
@@ -266,6 +284,126 @@ def _stored_message_data(insert: dict[str, Any]) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def _usage_api_metric_name(metric: str) -> str:
+    if metric == "audio_input_tokens":
+        return "input_audio_tokens"
+    if metric == "audio_output_tokens":
+        return "output_audio_tokens"
+    if metric == "audio_cached_tokens":
+        return "input_cached_audio_tokens"
+    if metric == "cached_tokens":
+        return "input_cached_tokens"
+    return metric
+
+
+def _usage_api_tokens(payload: Mapping[str, Any], *, model: str) -> dict[str, float]:
+    totals: dict[str, float] = {}
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return totals
+    for bucket in data:
+        if not isinstance(bucket, Mapping):
+            continue
+        results = bucket.get("results")
+        if not isinstance(results, list):
+            continue
+        for result in results:
+            if not isinstance(result, Mapping):
+                continue
+            result_model = result.get("model")
+            if isinstance(result_model, str) and result_model != model:
+                continue
+            for key, value in result.items():
+                if isinstance(value, bool) or not isinstance(value, int | float):
+                    continue
+                totals[key] = totals.get(key, 0.0) + float(value)
+    return totals
+
+
+async def _fetch_openai_completions_usage(
+    *,
+    model: str,
+    start_time: int,
+    end_time: int,
+) -> dict[str, float]:
+    api_key = _openai_admin_api_key()
+    if api_key is None:
+        raise AssertionError(
+            "set OPENAI_ADMIN_API_KEY to verify live usage against the OpenAI Usage API"
+        )
+    base_url = os.getenv("OPENAI_REALTIME_BASE_URL", "https://api.openai.com/v1")
+    url = f"{base_url.rstrip('/')}/organization/usage/completions"
+    params = {
+        "start_time": str(start_time),
+        "end_time": str(end_time),
+        "bucket_width": "1m",
+        "limit": "1440",
+        "models[]": model,
+        "group_by[]": "model",
+    }
+    headers = {"Authorization": f"Bearer {api_key}"}
+    async with new_client_session() as session:
+        async with session.get(url, params=params, headers=headers) as response:
+            response.raise_for_status()
+            payload = await response.json()
+    return _usage_api_tokens(payload, model=model)
+
+
+async def _wait_for_openai_usage_delta(
+    *,
+    model: str,
+    start_time: int,
+    end_time: int,
+    before: dict[str, float],
+    expected: dict[str, float],
+) -> dict[str, float]:
+    deadline = time.monotonic() + float(
+        os.getenv("OPENAI_USAGE_API_POLL_TIMEOUT_SECONDS", "180")
+    )
+    interval = float(os.getenv("OPENAI_USAGE_API_POLL_INTERVAL_SECONDS", "10"))
+    last_after: dict[str, float] = {}
+    while True:
+        last_after = await _fetch_openai_completions_usage(
+            model=model,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        matched = True
+        for local_key, local_value in expected.items():
+            if local_value <= 0:
+                continue
+            api_key = _usage_api_metric_name(local_key)
+            delta = last_after.get(api_key, 0.0) - before.get(api_key, 0.0)
+            if delta < local_value:
+                matched = False
+                break
+        if matched:
+            return last_after
+        if time.monotonic() >= deadline:
+            return last_after
+        await asyncio.sleep(interval)
+
+
+def _assert_openai_usage_delta_matches_session_usage(
+    *,
+    before: dict[str, float],
+    after: dict[str, float],
+    expected: dict[str, float],
+) -> None:
+    checked = 0
+    for local_key, local_value in expected.items():
+        if local_value <= 0:
+            continue
+        api_key = _usage_api_metric_name(local_key)
+        delta = after.get(api_key, 0.0) - before.get(api_key, 0.0)
+        assert delta >= local_value, (
+            f"expected OpenAI Usage API {api_key} delta to be at least "
+            f"{local_value}, got {delta}; before={before}, after={after}"
+        )
+        checked += 1
+    assert checked > 0
+
+
 def _turn_started_messages(
     supervisor: _TimedSupervisor,
 ) -> list[tuple[float, TurnStarted]]:
@@ -408,6 +546,88 @@ async def test_live_realtime_create_response_streams_audio_deltas() -> None:
     assert not any(
         event_type in {"response.output_text.delta", "response.text.delta"}
         for event_type in event_types
+    )
+
+
+@requires_openai_admin_key
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("output_modality", "expected_usage_keys"),
+    [
+        ("text", {"input_tokens", "output_tokens"}),
+        ("audio", {"input_tokens", "audio_output_tokens"}),
+    ],
+)
+async def test_live_realtime_session_usage_matches_openai_usage_api(
+    output_modality: str,
+    expected_usage_keys: set[str],
+) -> None:
+    model = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
+    window_start = int(time.time()) - 60
+    window_end = int(time.time()) + 15 * 60
+    before_usage = await _fetch_openai_completions_usage(
+        model=model,
+        start_time=window_start,
+        end_time=window_end,
+    )
+    adapter = OpenAIRealtimeAdapter(
+        model=model,
+        base_url=os.getenv("OPENAI_REALTIME_BASE_URL", "https://api.openai.com/v1"),
+        api_key=os.getenv("OPENAI_API_KEY"),
+        session_options={
+            "instructions": "You are a test assistant. Keep responses short.",
+            "output_modalities": [output_modality],
+        },
+        response_options={
+            "instructions": (
+                "Reply with exactly one short sentence about billing usage."
+                if output_modality == "text"
+                else "Say exactly one short sentence about billing usage."
+            ),
+            "output_modalities": [output_modality],
+        },
+    )
+    usage_updates = []
+    context = adapter.create_session(usage_callback=usage_updates.append)
+    events: list[dict[str, object]] = []
+
+    await adapter.connect(context=context, event_handler=events.append)
+    try:
+        terminal_event = await asyncio.wait_for(
+            adapter.create_response(
+                context=context,
+                caller=_FakeParticipant(),
+                toolkits=[],
+                event_handler=events.append,
+            ),
+            timeout=60,
+        )
+    finally:
+        await adapter.disconnect(context=context)
+
+    terminal_type = terminal_event.get("type")
+    assert terminal_type in {"response.done", "response.completed"}
+    assert context.last_usage is not None
+    assert usage_updates[-1] == context.last_usage
+    assert context.last_usage.model == model
+    expected_usage = {
+        key: value
+        for key, value in context.last_usage.usage.items()
+        if key in expected_usage_keys
+    }
+    assert expected_usage.keys() == expected_usage_keys
+
+    after_usage = await _wait_for_openai_usage_delta(
+        model=model,
+        start_time=window_start,
+        end_time=window_end,
+        before=before_usage,
+        expected=expected_usage,
+    )
+    _assert_openai_usage_delta_matches_session_usage(
+        before=before_usage,
+        after=after_usage,
+        expected=expected_usage,
     )
 
 

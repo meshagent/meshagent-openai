@@ -1,4 +1,5 @@
 from meshagent.agents.agent import AgentSessionContext
+from meshagent.agents.context import SessionUsage, SessionUsageCallback
 from meshagent.api import Participant, RoomClient, RoomException
 from meshagent.api.http import (
     llm_annotation_headers,
@@ -105,7 +106,6 @@ logger = logging.getLogger("openai_agent")
 tracer = trace.get_tracer("openai.llm.responses")
 _MAX_LOGGED_WEBSOCKET_PAYLOAD_CHARS = 128000
 _MESHAGENT_ERROR_MESSAGE_HEADER = "x-meshagent-error-message"
-_LAST_RESPONSE_SUPPLEMENTAL_USAGE_KEY = "last_response_supplemental_usage"
 _OPENAI_OUT_OF_CREDITS_MESSAGE = (
     "Your account is out of credits. Add credits from the account dashboard "
     "or set up auto reload to continue."
@@ -171,6 +171,7 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
         self._websocket_timeout_task: asyncio.Task[None] | None = None
         self._websocket_lock = asyncio.Lock()
         self._request_lock = asyncio.Lock()
+        self.pending_supplemental_usage: dict[str, float] | None = None
 
     @staticmethod
     def _headers_signature(headers: dict[str, str]) -> tuple[tuple[str, str], ...]:
@@ -1336,10 +1337,13 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         if isinstance(event_handler, _OpenAIAgentEventPublisher):
             event_handler.set_function_tool_name_resolver(resolver)
 
-    def create_session(self):
+    def create_session(
+        self, *, usage_callback: SessionUsageCallback | None = None
+    ) -> OpenAIResponsesSessionContext:
         context = OpenAIResponsesSessionContext(
             system_role=None,
             websocket_timeout=self._websocket_timeout,
+            usage_callback=usage_callback,
         )
         return context
 
@@ -1386,16 +1390,21 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
     def compaction_threshold(self, model: str) -> int | None:
         return self._effective_compaction_threshold(model=model)
 
+    def _usage_context_window_size(self, model: str) -> int | None:
+        size = self.context_window_size(model)
+        if not math.isfinite(size):
+            return None
+        return max(0, int(size))
+
     def needs_compaction(self, *, context: AgentSessionContext) -> bool:
         if self._context_management_mode != "standalone":
             return False
-        context_used_tokens = context.metadata.get("last_response_context_used_tokens")
-        if not isinstance(context_used_tokens, int | float) or not math.isfinite(
-            context_used_tokens
-        ):
+        usage = context.last_usage
+        if usage is None or usage.context_window_used is None:
             return False
 
-        model = context.metadata.get("last_response_model", self.default_model())
+        context_used_tokens = usage.context_window_used
+        model = usage.model
         threshold = self._effective_compaction_threshold(model=model)
         if threshold is None:
             return False
@@ -1508,14 +1517,8 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         )
         context.previous_messages.clear()
         context.previous_response_id = None
-        usage = normalize_openai_usage(response.usage)
-        if usage is not None:
-            context.metadata["last_compaction_usage"] = usage
-        context.metadata.pop("last_response_usage", None)
-        context.metadata.pop("last_response_flattened_usage", None)
-        context.metadata.pop("last_response_context_used_tokens", None)
-        context.metadata.pop("last_response_model", None)
-        context.metadata.pop(_LAST_RESPONSE_SUPPLEMENTAL_USAGE_KEY, None)
+        context.last_usage = None
+        context.pending_supplemental_usage = None
 
     def _store_image_generation_usage(
         self,
@@ -1534,10 +1537,10 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         if flattened_usage is None:
             return
 
-        supplemental_usage = context.metadata.get(_LAST_RESPONSE_SUPPLEMENTAL_USAGE_KEY)
-        if not isinstance(supplemental_usage, dict):
+        supplemental_usage = context.pending_supplemental_usage
+        if supplemental_usage is None:
             supplemental_usage = {}
-            context.metadata[_LAST_RESPONSE_SUPPLEMENTAL_USAGE_KEY] = supplemental_usage
+            context.pending_supplemental_usage = supplemental_usage
         add_usage_metrics(totals=supplemental_usage, usage=flattened_usage)
 
     def _store_image_generation_usage_from_response(
@@ -1567,23 +1570,12 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         compaction_threshold: int | None = None,
     ) -> None:
         usage_dict = normalize_openai_usage(usage)
-        supplemental_usage = context.metadata.pop(
-            _LAST_RESPONSE_SUPPLEMENTAL_USAGE_KEY,
-            None,
-        )
-        if usage_dict is None and not isinstance(supplemental_usage, dict):
+        supplemental_usage = context.pending_supplemental_usage
+        context.pending_supplemental_usage = None
+        if usage_dict is None and supplemental_usage is None:
             return
         if usage_dict is None:
             usage_dict = {}
-
-        context.metadata["last_response_usage"] = usage_dict
-        context.metadata["last_response_model"] = model
-        if compacted and compaction_threshold is not None:
-            context.metadata["last_response_compaction_threshold"] = (
-                compaction_threshold
-            )
-        else:
-            context.metadata.pop("last_response_compaction_threshold", None)
 
         flattened_usage = preprocess_openai_usage(model=model, usage=usage_dict)
         if flattened_usage is None:
@@ -1592,11 +1584,17 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             add_usage_metrics(totals=flattened_usage, usage=supplemental_usage)
         if len(flattened_usage) == 0:
             return
-        context.metadata["last_response_flattened_usage"] = dict(flattened_usage)
-        context.metadata["last_response_context_used_tokens"] = (
-            self._context_used_tokens_from_usage(flattened_usage)
+        context_used_tokens = self._context_used_tokens_from_usage(flattened_usage)
+        if compacted and compaction_threshold is not None:
+            context_used_tokens = min(context_used_tokens, compaction_threshold)
+        context.emit_usage_updated(
+            SessionUsage(
+                model=model,
+                usage=dict(flattened_usage),
+                context_window_used=context_used_tokens,
+                context_window_size=self._usage_context_window_size(model),
+            )
         )
-        add_usage_metrics(totals=context.usage, usage=flattened_usage)
         track_otel_usage_metrics(
             model=model,
             provider="openai",

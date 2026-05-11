@@ -353,7 +353,9 @@ async def test_live_openai_auto_compaction_threshold_reports_compacted_next_call
     )
     compaction_usage = adapter.recorded_response_usages[compaction_response_index]
     assert compaction_usage is not None
-    assert context.metadata["last_response_compaction_threshold"] == threshold
+    assert context.last_usage is not None
+    assert context.last_usage.context_window_used is not None
+    assert context.last_usage.context_window_used <= threshold
 
     context.append_user_message("Reply with OK only.")
     second_result = await asyncio.wait_for(
@@ -366,8 +368,8 @@ async def test_live_openai_auto_compaction_threshold_reports_compacted_next_call
     )
 
     assert isinstance(second_result, str)
-    second_usage = context.metadata["last_response_usage"]
-    second_input_tokens = second_usage["input_tokens"]
+    assert context.last_usage is not None
+    second_input_tokens = context.last_usage.usage["input_tokens"]
     assert second_input_tokens <= threshold
 
 

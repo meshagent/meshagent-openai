@@ -18,6 +18,7 @@ from meshagent.agents.messages import (
     AgentTextContentEnded,
 )
 from meshagent.api.messaging import FileContent, JsonContent, TextContent
+from meshagent.agents.context import SessionUsage
 import meshagent.openai.tools.completions_adapter as completions_adapter_module
 from meshagent.openai.tools.completions_adapter import (
     OpenAICompletionsAdapter,
@@ -274,11 +275,11 @@ def test_store_usage_publishes_otel_usage_metrics(monkeypatch: pytest.MonkeyPatc
             "annotations": {"env": "prod"},
         }
     ]
-    assert context.metadata["last_response_flattened_usage"] == {
-        "input_tokens": 6.0,
-        "output_tokens": 2.0,
-    }
-    assert context.metadata["last_response_context_used_tokens"] == 8
+    assert context.last_usage == SessionUsage(
+        model="gpt-4o-mini",
+        usage={"input_tokens": 6.0, "output_tokens": 2.0},
+        context_window_used=8,
+    )
 
 
 def test_store_usage_splits_cached_prompt_tokens() -> None:
@@ -299,19 +300,16 @@ def test_store_usage_splits_cached_prompt_tokens() -> None:
         model="gpt-4o-mini",
     )
 
-    assert context.metadata["last_response_flattened_usage"] == {
-        "cached_tokens": 4864.0,
-        "input_tokens": 220.0,
-        "output_tokens": 2.0,
-        "total_tokens": 5086.0,
-    }
-    assert context.metadata["last_response_context_used_tokens"] == 5086
-    assert context.usage == {
-        "cached_tokens": 4864.0,
-        "input_tokens": 220.0,
-        "output_tokens": 2.0,
-        "total_tokens": 5086.0,
-    }
+    assert context.last_usage == SessionUsage(
+        model="gpt-4o-mini",
+        usage={
+            "cached_tokens": 4864.0,
+            "input_tokens": 220.0,
+            "output_tokens": 2.0,
+            "total_tokens": 5086.0,
+        },
+        context_window_used=5086,
+    )
 
 
 class _BlockingTool(FunctionTool):
@@ -629,7 +627,11 @@ async def test_next_consumes_streaming_tool_events_and_uses_final_item_result():
 
     assert result == "done"
     assert context.turn_count == 1
-    assert context.usage == {"input_tokens": 7.0, "output_tokens": 4.0}
+    assert context.last_usage == SessionUsage(
+        model="gpt-4o-mini",
+        usage={"input_tokens": 7.0, "output_tokens": 4.0},
+        context_window_used=11,
+    )
     assert events == [{"type": "agent.event", "headline": "working"}]
 
 
@@ -679,19 +681,16 @@ async def test_next_accumulates_cached_usage_across_tool_loop_calls() -> None:
     )
 
     assert result == "done"
-    assert context.usage == {
-        "cached_tokens": 4928.0,
-        "input_tokens": 276.0,
-        "output_tokens": 5.0,
-        "total_tokens": 5209.0,
-    }
-    assert context.metadata["last_response_flattened_usage"] == {
-        "cached_tokens": 64.0,
-        "input_tokens": 56.0,
-        "output_tokens": 3.0,
-        "total_tokens": 123.0,
-    }
-    assert context.metadata["last_response_context_used_tokens"] == 123
+    assert context.last_usage == SessionUsage(
+        model="gpt-4o-mini",
+        usage={
+            "cached_tokens": 64.0,
+            "input_tokens": 56.0,
+            "output_tokens": 3.0,
+            "total_tokens": 123.0,
+        },
+        context_window_used=123,
+    )
 
 
 @pytest.mark.asyncio
@@ -768,12 +767,15 @@ async def test_next_tracks_usage_for_single_completion_response():
 
     assert result == "done"
     assert context.turn_count == 1
-    assert context.metadata["last_response_usage"]["prompt_tokens"] == 6
-    assert context.usage == {
-        "input_tokens": 6.0,
-        "output_tokens": 2.0,
-        "reasoning_tokens": 1.0,
-    }
+    assert context.last_usage == SessionUsage(
+        model="gpt-4o-mini",
+        usage={
+            "input_tokens": 6.0,
+            "output_tokens": 2.0,
+            "reasoning_tokens": 1.0,
+        },
+        context_window_used=8,
+    )
 
 
 @pytest.mark.asyncio

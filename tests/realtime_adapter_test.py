@@ -34,6 +34,7 @@ from meshagent.agents.messages import (
 )
 from meshagent.api import RoomException
 from meshagent.api.messaging import TextContent
+from meshagent.agents.context import SessionUsage
 from meshagent.openai.tools.realtime_adapter import (
     DEFAULT_OPENAI_REALTIME_TRANSCRIPTION_MODEL,
     OpenAIRealtimeAdapter,
@@ -264,6 +265,32 @@ def test_list_models_advertises_realtime_protocols() -> None:
     adapter = _adapter(realtime_protocols=("webrtc", "websocket"))
 
     assert adapter.list_models()[0].realtime_protocols == ("webrtc", "websocket")
+
+
+def test_list_models_advertises_realtime_context_windows() -> None:
+    adapter = _adapter()
+
+    context_windows = {
+        model.name: model.context_window for model in adapter.list_models()
+    }
+
+    assert context_windows["gpt-realtime"] == 32000
+    assert context_windows["gpt-realtime-1.5"] == 32000
+    assert context_windows["gpt-realtime-2"] == 128000
+    assert context_windows["gpt-realtime-mini"] == 32000
+    assert context_windows["gpt-4o-realtime-preview"] == 32000
+    assert context_windows["gpt-4o-mini-realtime-preview"] == 16000
+
+
+def test_realtime_context_window_size_prefers_specific_model_prefixes() -> None:
+    adapter = _adapter()
+
+    assert adapter.context_window_size("gpt-realtime-2") == 128000
+    assert adapter.context_window_size("gpt-realtime-2-2026-05-07") == 128000
+    assert adapter.context_window_size("gpt-realtime-2025-08-28") == 32000
+    assert (
+        adapter.context_window_size("gpt-4o-mini-realtime-preview-2024-12-17") == 16000
+    )
 
 
 def test_list_models_uses_response_output_modalities() -> None:
@@ -615,6 +642,58 @@ async def test_create_response_sends_response_create_and_returns_terminal_event(
         "response.audio_transcript.delta",
         "response.done",
     ]
+
+    await adapter.disconnect(context=context)
+
+
+@pytest.mark.asyncio
+async def test_create_response_stores_realtime_usage_from_terminal_event() -> None:
+    websocket = _FakeWebSocket()
+    context = _context(websocket)
+    usage_updates: list[SessionUsage] = []
+    context.set_usage_callback(usage_updates.append)
+    adapter = _adapter()
+    await adapter.connect(context=context, event_handler=lambda event: None)
+
+    task = asyncio.create_task(
+        adapter.create_response(
+            context=context,
+            caller=_FakeParticipant(),
+            toolkits=[],
+        )
+    )
+    await _wait_for_sent_type(websocket, "response.create")
+    await websocket.messages.put(
+        _text_message(
+            {
+                "type": "response.done",
+                "response": {
+                    "id": "resp-usage",
+                    "model": "gpt-realtime-2",
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "total_tokens": 15,
+                    },
+                },
+            }
+        )
+    )
+
+    await task
+
+    assert context.last_usage == SessionUsage(
+        model="gpt-realtime-2",
+        usage={
+            "input_tokens": 10.0,
+            "output_tokens": 5.0,
+            "total_tokens": 15.0,
+        },
+        context_window_used=15,
+        context_window_size=128000,
+    )
+    assert usage_updates == [context.last_usage]
 
     await adapter.disconnect(context=context)
 

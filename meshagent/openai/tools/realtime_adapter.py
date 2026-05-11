@@ -6,6 +6,7 @@ import contextlib
 import copy
 import json
 import logging
+import math
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from types import SimpleNamespace
@@ -27,6 +28,7 @@ from meshagent.agents.adapter import (
     llm_model_pricing,
 )
 from meshagent.agents.agent import AgentSessionContext
+from meshagent.agents.context import SessionUsageCallback, SessionUsage
 from meshagent.agents.agent_event_reader import (
     AccumulatingAgentEventReader,
     AgentEventReader,
@@ -38,6 +40,11 @@ from meshagent.openai.tools.responses_adapter import (
     OpenAIResponsesToolResponseAdapter,
     ResponsesToolBundle,
     safe_tool_name,
+)
+from meshagent.openai.tools.usage import (
+    normalize_openai_usage,
+    preprocess_openai_usage,
+    track_otel_usage_metrics,
 )
 from meshagent.agents.messages import AgentMessage, ToolChoice
 from meshagent.api import Participant, RoomException
@@ -711,7 +718,17 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
         "gpt-realtime-2",
         "gpt-realtime-1.5",
         "gpt-realtime-mini",
+        "gpt-4o-realtime-preview",
+        "gpt-4o-mini-realtime-preview",
     )
+    _context_window_sizes = {
+        "gpt-realtime-2": 128000,
+        "gpt-realtime-1.5": 32000,
+        "gpt-realtime-mini": 32000,
+        "gpt-realtime": 32000,
+        "gpt-4o-mini-realtime-preview": 16000,
+        "gpt-4o-realtime-preview": 32000,
+    }
 
     def __init__(
         self,
@@ -808,7 +825,7 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
         return [
             LLMModelInfo(
                 name=name,
-                context_window=32000,
+                context_window=self._usage_context_window_size(name),
                 pricing=llm_model_pricing(provider="openai", model=name),
                 modalities=output_modalities,
                 available_voices=OPENAI_REALTIME_VOICES,
@@ -821,10 +838,29 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
             for name in names
         ]
 
-    def create_session(self) -> OpenAIRealtimeSessionContext:
+    def context_window_size(self, model: str) -> float:
+        for prefix, size in sorted(
+            self._context_window_sizes.items(),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        ):
+            if model == prefix or model.startswith(f"{prefix}-"):
+                return size
+        return float("inf")
+
+    def _usage_context_window_size(self, model: str) -> int | None:
+        size = self.context_window_size(model)
+        if not math.isfinite(size):
+            return None
+        return max(0, int(size))
+
+    def create_session(
+        self, *, usage_callback: SessionUsageCallback | None = None
+    ) -> OpenAIRealtimeSessionContext:
         return OpenAIRealtimeSessionContext(
             system_role=None,
             websocket_timeout=self._websocket_timeout,
+            usage_callback=usage_callback,
         )
 
     def make_agent_event_reader(
@@ -1193,6 +1229,8 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
 
                 if self._terminal_response_event(event_type):
                     error = self._response_error(event)
+                    if error is None:
+                        self._store_usage(context=context, event=event)
                     if error is None and await self._handle_realtime_tool_calls(
                         context=context,
                         event=event,
@@ -1324,6 +1362,7 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
             )
 
         session_options = _normalize_realtime_options(copy.deepcopy(options or {}))
+        context.metadata["realtime_model"] = model or self.default_model()
         instructions = context.get_system_instructions()
         if isinstance(instructions, str) and instructions.strip() != "":
             session_options["instructions"] = instructions
@@ -1578,6 +1617,67 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
         if isinstance(response_id, str) and response_id.strip() != "":
             return response_id
         return None
+
+    def _response_model(
+        self, *, context: OpenAIRealtimeSessionContext, event: Mapping[str, Any]
+    ) -> str:
+        response = event.get("response")
+        if isinstance(response, Mapping):
+            model = response.get("model")
+            if isinstance(model, str) and model.strip() != "":
+                return model
+        model = context.metadata.get("realtime_model")
+        if isinstance(model, str) and model.strip() != "":
+            return model
+        return self.default_model()
+
+    @staticmethod
+    def _context_used_tokens_from_usage(usage: dict[str, float]) -> int:
+        token_total = (
+            usage.get("input_tokens", 0.0)
+            + usage.get("cached_tokens", 0.0)
+            + usage.get("output_tokens", 0.0)
+            + usage.get("audio_input_tokens", 0.0)
+            + usage.get("audio_cached_tokens", 0.0)
+            + usage.get("audio_output_tokens", 0.0)
+            + usage.get("image_input_tokens", 0.0)
+            + usage.get("image_cached_tokens", 0.0)
+            + usage.get("image_output_tokens", 0.0)
+        )
+        if token_total <= 0:
+            token_total = usage.get("total_tokens", 0.0)
+        return max(0, int(token_total))
+
+    def _store_usage(
+        self, *, context: OpenAIRealtimeSessionContext, event: Mapping[str, Any]
+    ) -> None:
+        response = event.get("response")
+        if not isinstance(response, Mapping):
+            return
+        usage_dict = normalize_openai_usage(response.get("usage"))
+        if usage_dict is None:
+            return
+
+        model = self._response_model(context=context, event=event)
+        flattened_usage = preprocess_openai_usage(model=model, usage=usage_dict)
+        if flattened_usage is None or len(flattened_usage) == 0:
+            return
+
+        context_used_tokens = self._context_used_tokens_from_usage(flattened_usage)
+        context.emit_usage_updated(
+            SessionUsage(
+                model=model,
+                usage=dict(flattened_usage),
+                context_window_used=context_used_tokens,
+                context_window_size=self._usage_context_window_size(model),
+            )
+        )
+        track_otel_usage_metrics(
+            model=model,
+            provider="openai",
+            tokens=flattened_usage,
+            annotations=self._annotations,
+        )
 
     async def create_response(
         self,

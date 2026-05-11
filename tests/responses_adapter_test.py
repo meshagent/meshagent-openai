@@ -22,6 +22,7 @@ from openai.types.responses.response_output_text import ResponseOutputText
 from yarl import URL
 
 from meshagent.agents.adapter import ToolCallApprovalRequest
+from meshagent.agents.context import SessionUsage
 from meshagent.agents.messages import (
     AGENT_EVENT_CONTEXT_COMPACTED,
     AGENT_EVENT_TEXT_CONTENT_DELTA,
@@ -441,12 +442,16 @@ def test_store_usage_publishes_otel_usage_metrics(monkeypatch: pytest.MonkeyPatc
             "annotations": {"env": "prod"},
         }
     ]
-    assert context.metadata["last_response_flattened_usage"] == {
-        "input_tokens": 7.0,
-        "output_tokens": 7.0,
-        "cached_tokens": 4.0,
-    }
-    assert context.metadata["last_response_context_used_tokens"] == 18
+    assert context.last_usage == SessionUsage(
+        model="gpt-5-mini",
+        usage={
+            "input_tokens": 7.0,
+            "output_tokens": 7.0,
+            "cached_tokens": 4.0,
+        },
+        context_window_used=18,
+        context_window_size=400000,
+    )
 
 
 def test_store_usage_includes_image_generation_usage() -> None:
@@ -491,16 +496,19 @@ def test_store_usage_includes_image_generation_usage() -> None:
         model="gpt-5-mini",
     )
 
-    assert context.metadata["last_response_flattened_usage"] == {
-        "input_tokens": 37.0,
-        "output_tokens": 7.0,
-        "cached_tokens": 4.0,
-        "total_tokens": 538.0,
-        "image_input_tokens": 90.0,
-        "image_output_tokens": 400.0,
-    }
-    assert context.metadata["last_response_context_used_tokens"] == 538
-    assert context.usage == context.metadata["last_response_flattened_usage"]
+    assert context.last_usage == SessionUsage(
+        model="gpt-5-mini",
+        usage={
+            "input_tokens": 37.0,
+            "output_tokens": 7.0,
+            "cached_tokens": 4.0,
+            "total_tokens": 538.0,
+            "image_input_tokens": 90.0,
+            "image_output_tokens": 400.0,
+        },
+        context_window_used=538,
+        context_window_size=400000,
+    )
 
 
 def test_store_usage_keeps_image_generation_usage_without_response_usage() -> None:
@@ -540,14 +548,17 @@ def test_store_usage_keeps_image_generation_usage_without_response_usage() -> No
         model="gpt-5-mini",
     )
 
-    assert context.metadata["last_response_flattened_usage"] == {
-        "input_tokens": 30.0,
-        "total_tokens": 520.0,
-        "image_input_tokens": 90.0,
-        "image_output_tokens": 400.0,
-    }
-    assert context.metadata["last_response_context_used_tokens"] == 520
-    assert context.usage == context.metadata["last_response_flattened_usage"]
+    assert context.last_usage == SessionUsage(
+        model="gpt-5-mini",
+        usage={
+            "input_tokens": 30.0,
+            "total_tokens": 520.0,
+            "image_input_tokens": 90.0,
+            "image_output_tokens": 400.0,
+        },
+        context_window_used=520,
+        context_window_size=400000,
+    )
 
 
 class _FakeRoom:
@@ -1544,14 +1555,17 @@ async def test_next_uses_websocket_path_when_mode_is_websocket(monkeypatch):
     assert result == ""
     assert call_count["count"] == 1
     assert context.turn_count == 1
-    assert context.metadata["last_response_usage"]["input_tokens"] == 12
-    assert context.usage == {
-        "input_tokens": 9.0,
-        "output_tokens": 4.0,
-        "cached_tokens": 3.0,
-        "total_tokens": 16.0,
-    }
-    assert context.metadata["last_response_context_used_tokens"] == 16
+    assert context.last_usage == SessionUsage(
+        model="gpt-5.2",
+        usage={
+            "input_tokens": 9.0,
+            "output_tokens": 4.0,
+            "cached_tokens": 3.0,
+            "total_tokens": 16.0,
+        },
+        context_window_used=16,
+        context_window_size=400000,
+    )
 
 
 @pytest.mark.asyncio
@@ -1583,14 +1597,17 @@ async def test_next_tracks_usage_for_non_streaming_request_mode():
 
     assert result == ""
     assert context.turn_count == 1
-    assert context.metadata["last_response_usage"]["input_tokens"] == 9
-    assert context.usage == {
-        "input_tokens": 4.0,
-        "output_tokens": 2.0,
-        "cached_tokens": 5.0,
-        "total_tokens": 11.0,
-    }
-    assert context.metadata["last_response_context_used_tokens"] == 11
+    assert context.last_usage == SessionUsage(
+        model="gpt-5.2",
+        usage={
+            "input_tokens": 4.0,
+            "output_tokens": 2.0,
+            "cached_tokens": 5.0,
+            "total_tokens": 11.0,
+        },
+        context_window_used=11,
+        context_window_size=400000,
+    )
 
 
 @pytest.mark.asyncio
@@ -1777,14 +1794,17 @@ async def test_next_tracks_usage_for_streaming_request_mode():
     assert result == ""
     assert context.turn_count == 1
     assert events[0]["type"] == "response.completed"
-    assert context.metadata["last_response_usage"]["output_tokens"] == 7
-    assert context.usage == {
-        "input_tokens": 7.0,
-        "output_tokens": 7.0,
-        "cached_tokens": 4.0,
-        "total_tokens": 18.0,
-    }
-    assert context.metadata["last_response_context_used_tokens"] == 18
+    assert context.last_usage == SessionUsage(
+        model="gpt-5.2",
+        usage={
+            "input_tokens": 7.0,
+            "output_tokens": 7.0,
+            "cached_tokens": 4.0,
+            "total_tokens": 18.0,
+        },
+        context_window_used=18,
+        context_window_size=400000,
+    )
 
 
 @pytest.mark.asyncio
@@ -1835,13 +1855,16 @@ async def test_next_commits_response_state_when_stream_ends_incomplete_after_com
         "encrypted_content": "opaque",
         "status": "completed",
     }
-    assert context.metadata["last_response_usage"]["input_tokens"] == 20
-    assert context.metadata["last_response_compaction_threshold"] == 200000
-    assert context.usage == {
-        "input_tokens": 18.0,
-        "output_tokens": 3.0,
-        "cached_tokens": 2.0,
-    }
+    assert context.last_usage == SessionUsage(
+        model="gpt-5.2",
+        usage={
+            "input_tokens": 18.0,
+            "output_tokens": 3.0,
+            "cached_tokens": 2.0,
+        },
+        context_window_used=21,
+        context_window_size=400000,
+    )
     assert [event["type"] for event in events] == [
         "response.output_item.done",
         "response.incomplete",
@@ -1922,12 +1945,12 @@ async def test_next_uses_auto_compaction_context_management_when_compaction_thre
     )
     context = adapter.create_session()
     context.append_user_message("hello")
-    context.metadata["last_response_usage"] = {
-        "input_tokens": 200000,
-        "input_tokens_details": {"cached_tokens": 0},
-        "output_tokens": 1000,
-    }
-    context.metadata["last_response_model"] = "gpt-5.2"
+    context.last_usage = SessionUsage(
+        model="gpt-5.2",
+        usage={"input_tokens": 200000.0, "output_tokens": 1000.0},
+        context_window_used=201000,
+        context_window_size=400000,
+    )
 
     async def _fail_compact(**kwargs):
         del kwargs
@@ -1983,15 +2006,12 @@ async def test_next_marks_usage_when_response_contains_auto_compaction() -> None
     )
 
     assert result == ""
-    assert context.metadata["last_response_usage"] == {
-        "input_tokens": 20000,
-        "output_tokens": 10,
-    }
-    assert context.metadata["last_response_compaction_threshold"] == 10000
-    assert context.usage == {
-        "input_tokens": 20000.0,
-        "output_tokens": 10.0,
-    }
+    assert context.last_usage == SessionUsage(
+        model="gpt-5.2",
+        usage={"input_tokens": 20000.0, "output_tokens": 10.0},
+        context_window_used=10000,
+        context_window_size=400000,
+    )
 
 
 @pytest.mark.asyncio
@@ -2007,12 +2027,11 @@ async def test_next_disables_auto_compaction_by_default_for_unknown_model(monkey
     )
     context = adapter.create_session()
     context.append_user_message("hello")
-    context.metadata["last_response_usage"] = {
-        "input_tokens": 200000,
-        "input_tokens_details": {"cached_tokens": 0},
-        "output_tokens": 1000,
-    }
-    context.metadata["last_response_model"] = "computer-use-preview"
+    context.last_usage = SessionUsage(
+        model="computer-use-preview",
+        usage={"input_tokens": 200000.0, "output_tokens": 1000.0},
+        context_window_used=201000,
+    )
 
     async def _fail_compact(**kwargs):
         del kwargs
@@ -2125,12 +2144,12 @@ async def test_next_uses_auto_compaction_by_default(monkeypatch):
     )
     context = adapter.create_session()
     context.append_user_message("hello")
-    context.metadata["last_response_usage"] = {
-        "input_tokens": 200000,
-        "input_tokens_details": {"cached_tokens": 0},
-        "output_tokens": 1000,
-    }
-    context.metadata["last_response_model"] = "gpt-5.2"
+    context.last_usage = SessionUsage(
+        model="gpt-5.2",
+        usage={"input_tokens": 200000.0, "output_tokens": 1000.0},
+        context_window_used=201000,
+        context_window_size=400000,
+    )
 
     async def _fail_compact(**kwargs):
         del kwargs
@@ -2161,25 +2180,23 @@ def test_needs_compaction_uses_adapter_context_used_tokens():
         compaction_threshold=200,
     )
     context = adapter.create_session()
-    context.metadata["last_response_context_used_tokens"] = 330
-    context.metadata["last_response_model"] = "gpt-5.2"
+    context.last_usage = SessionUsage(
+        model="gpt-5.2",
+        usage={"input_tokens": 300.0, "output_tokens": 30.0},
+        context_window_used=330,
+        context_window_size=400000,
+    )
 
     assert adapter.needs_compaction(context=context)
 
 
-def test_needs_compaction_ignores_raw_usage_without_flattened_usage():
+def test_needs_compaction_ignores_missing_session_usage():
     adapter = OpenAIResponsesAdapter(
         mode="request",
         context_management="standalone",
         compaction_threshold=200,
     )
     context = adapter.create_session()
-    context.metadata["last_response_usage"] = {
-        "input_tokens": 100,
-        "input_tokens_details": {"cached_tokens": 200},
-        "output_tokens": 30,
-    }
-    context.metadata["last_response_model"] = "gpt-5.2"
 
     assert not adapter.needs_compaction(context=context)
 
@@ -2196,17 +2213,12 @@ async def test_next_uses_manual_compaction_in_standalone_mode(monkeypatch):
     )
     context = adapter.create_session()
     context.append_user_message("hello")
-    context.metadata["last_response_usage"] = {
-        "input_tokens": 300000,
-        "input_tokens_details": {"cached_tokens": 0},
-        "output_tokens": 1000,
-    }
-    context.metadata["last_response_flattened_usage"] = {
-        "input_tokens": 300000,
-        "output_tokens": 1000,
-    }
-    context.metadata["last_response_context_used_tokens"] = 301000
-    context.metadata["last_response_model"] = "gpt-5.2"
+    context.last_usage = SessionUsage(
+        model="gpt-5.2",
+        usage={"input_tokens": 300000.0, "output_tokens": 1000.0},
+        context_window_used=301000,
+        context_window_size=400000,
+    )
     compact_call_count = {"count": 0}
 
     async def _fake_compact(**kwargs):
@@ -2240,12 +2252,12 @@ async def test_next_disables_compaction_when_context_management_none(monkeypatch
     )
     context = adapter.create_session()
     context.append_user_message("hello")
-    context.metadata["last_response_usage"] = {
-        "input_tokens": 300000,
-        "input_tokens_details": {"cached_tokens": 0},
-        "output_tokens": 1000,
-    }
-    context.metadata["last_response_model"] = "gpt-5.2"
+    context.last_usage = SessionUsage(
+        model="gpt-5.2",
+        usage={"input_tokens": 300000.0, "output_tokens": 1000.0},
+        context_window_used=301000,
+        context_window_size=400000,
+    )
 
     async def _fail_compact(**kwargs):
         del kwargs

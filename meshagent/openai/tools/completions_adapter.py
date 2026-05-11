@@ -1,4 +1,5 @@
 from meshagent.agents.agent import AgentSessionContext
+from meshagent.agents.context import SessionUsage, SessionUsageCallback
 from meshagent.api import Participant, RoomException
 from meshagent.tools import Toolkit, ToolContext, FunctionTool
 from meshagent.api.messaging import (
@@ -48,7 +49,6 @@ from meshagent.openai.proxy import (
     resolve_user_agent,
 )
 from meshagent.openai.tools.usage import (
-    add_usage_metrics,
     normalize_openai_usage,
     preprocess_openai_usage,
     track_otel_usage_metrics,
@@ -475,7 +475,9 @@ class OpenAICompletionsAdapter(LLMAdapter):
             max_tool_call_lines=self._max_tool_call_lines,
         )
 
-    def create_session(self):
+    def create_session(
+        self, *, usage_callback: SessionUsageCallback | None = None
+    ) -> AgentSessionContext:
         system_role = "system"
         if self._model.startswith("o1"):
             system_role = "developer"
@@ -484,7 +486,10 @@ class OpenAICompletionsAdapter(LLMAdapter):
         elif self._model.startswith("o4"):
             system_role = "developer"
 
-        context = AgentSessionContext(system_role=system_role)
+        context = AgentSessionContext(
+            system_role=system_role,
+            usage_callback=usage_callback,
+        )
 
         return context
 
@@ -506,17 +511,17 @@ class OpenAICompletionsAdapter(LLMAdapter):
         if usage_dict is None:
             return
 
-        context.metadata["last_response_usage"] = usage_dict
-        context.metadata["last_response_model"] = model
-
         flattened_usage = preprocess_openai_usage(model=model, usage=usage_dict)
         if flattened_usage is None:
             return
-        context.metadata["last_response_flattened_usage"] = dict(flattened_usage)
-        context.metadata["last_response_context_used_tokens"] = (
-            self._context_used_tokens_from_usage(flattened_usage)
+        context_used_tokens = self._context_used_tokens_from_usage(flattened_usage)
+        context.emit_usage_updated(
+            SessionUsage(
+                model=model,
+                usage=dict(flattened_usage),
+                context_window_used=context_used_tokens,
+            )
         )
-        add_usage_metrics(totals=context.usage, usage=flattened_usage)
         track_otel_usage_metrics(
             model=model,
             provider="openai",
