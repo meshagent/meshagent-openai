@@ -223,7 +223,7 @@ async def test_connect_opens_realtime_websocket_and_sends_session_update() -> No
             "type": "session.update",
             "session": {
                 "type": "realtime",
-                "output_modalities": ["text", "audio"],
+                "output_modalities": ["text"],
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcm", "rate": 24000},
@@ -270,6 +270,15 @@ def test_list_models_uses_response_output_modalities() -> None:
     adapter = _adapter(response_options={"output_modalities": ["audio"]})
 
     assert adapter.list_models()[0].modalities == ("audio",)
+
+
+def test_list_models_uses_supported_output_modalities_over_response_default() -> None:
+    adapter = _adapter(
+        response_options={"output_modalities": ["text"]},
+        supported_output_modalities=("text", "audio"),
+    )
+
+    assert adapter.list_models()[0].modalities == ("text", "audio")
 
 
 @pytest.mark.asyncio
@@ -568,7 +577,7 @@ async def test_create_response_sends_response_create_and_returns_terminal_event(
     response_create = await _wait_for_sent_type(websocket, "response.create")
     assert response_create == {
         "type": "response.create",
-        "response": {"output_modalities": ["text", "audio"]},
+        "response": {"output_modalities": ["text"]},
     }
 
     await websocket.messages.put(

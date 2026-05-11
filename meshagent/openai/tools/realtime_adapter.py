@@ -7,7 +7,7 @@ import copy
 import json
 import logging
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from types import SimpleNamespace
 from typing import Any
 from typing import Literal
@@ -89,11 +89,30 @@ def _normalize_realtime_options(options: Mapping[str, Any]) -> dict[str, Any]:
     modalities = normalized.pop("modalities", None)
     if "output_modalities" not in normalized and modalities is not None:
         normalized["output_modalities"] = modalities
+    raw_modalities = normalized.get("output_modalities")
+    if isinstance(raw_modalities, (list, tuple)):
+        selected: list[Literal["text", "audio"]] = []
+        for raw_modality in raw_modalities:
+            if raw_modality not in ("text", "audio"):
+                continue
+            modality: Literal["text", "audio"] = (
+                "audio" if raw_modality == "audio" else "text"
+            )
+            if modality not in selected:
+                selected.append(modality)
+        if "text" in selected:
+            normalized["output_modalities"] = ["text"]
+        elif len(selected) > 0:
+            normalized["output_modalities"] = [selected[0]]
+        else:
+            normalized.pop("output_modalities", None)
     return normalized
 
 
 def _output_modalities_from_options(
     options: Mapping[str, Any],
+    *,
+    default: tuple[Literal["text", "audio"], ...] = ("text",),
 ) -> tuple[Literal["text", "audio"], ...]:
     normalized = _normalize_realtime_options(options)
     raw_modalities = normalized.get("output_modalities")
@@ -107,7 +126,19 @@ def _output_modalities_from_options(
             )
             if modality not in selected:
                 selected.append(modality)
-    return tuple(selected) if len(selected) > 0 else ("text", "audio")
+    return tuple(selected) if len(selected) > 0 else default
+
+
+def _output_modalities_from_values(
+    output_modalities: Sequence[Literal["text", "audio"]],
+) -> tuple[Literal["text", "audio"], ...]:
+    selected: list[Literal["text", "audio"]] = []
+    for output_modality in output_modalities:
+        if output_modality not in ("text", "audio"):
+            continue
+        if output_modality not in selected:
+            selected.append(output_modality)
+    return tuple(selected) if len(selected) > 0 else ("text",)
 
 
 def _realtime_tool_definitions(
@@ -706,6 +737,7 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
         turn_detection: Literal[
             "none", "automatic"
         ] = DEFAULT_OPENAI_REALTIME_TURN_DETECTION,
+        supported_output_modalities: Sequence[Literal["text", "audio"]] | None = None,
         realtime_protocols: tuple[Literal["websocket", "webrtc"], ...]
         | list[Literal["websocket", "webrtc"]]
         | None = DEFAULT_OPENAI_REALTIME_PROTOCOLS,
@@ -744,6 +776,14 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
             default=DEFAULT_OPENAI_REALTIME_OUTPUT_FORMAT,
         )
         self._turn_detection = turn_detection
+        self._supported_output_modalities = (
+            _output_modalities_from_values(supported_output_modalities)
+            if supported_output_modalities is not None
+            else _output_modalities_from_options(
+                self._response_options,
+                default=("text", "audio"),
+            )
+        )
         self._realtime_protocols = tuple(
             dict.fromkeys(realtime_protocols or DEFAULT_OPENAI_REALTIME_PROTOCOLS)
         )
@@ -764,7 +804,7 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
         names = list(self._allowed_models or self._known_models)
         if self._allowed_models is None and self._model not in names:
             names.insert(0, self._model)
-        output_modalities = _output_modalities_from_options(self._response_options)
+        output_modalities = self._supported_output_modalities
         return [
             LLMModelInfo(
                 name=name,
@@ -855,6 +895,7 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
             input_format=self._input_format,
             output_format=self._output_format,
             turn_detection=self._turn_detection,
+            supported_output_modalities=self._supported_output_modalities,
             realtime_protocols=self._realtime_protocols,
         )
 
