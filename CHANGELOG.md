@@ -1,3 +1,6 @@
+## [0.40.1]
+- Stability
+
 ## [0.40.0]
 - Breaking: Renamed OpenAI LLM adapter `next(...)` implementations to `create_response(...)`, including Responses, Chat Completions, and Realtime adapters.
 
