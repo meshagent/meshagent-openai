@@ -82,6 +82,7 @@ from openai.types.responses import (
 import os
 from typing import Optional, Callable
 import base64
+from dataclasses import dataclass
 
 import logging
 import re
@@ -92,7 +93,7 @@ import httpx
 from pydantic import BaseModel, model_validator
 from opentelemetry import trace
 from html_to_markdown import convert
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import unquote, unquote_to_bytes, urlparse, urlunparse
 from meshagent.openai.tools.usage import (
     add_usage_metrics,
     normalize_openai_usage,
@@ -110,6 +111,62 @@ _OPENAI_OUT_OF_CREDITS_MESSAGE = (
     "Your account is out of credits. Add credits from the account dashboard "
     "or set up auto reload to continue."
 )
+_OPENAI_RESPONSES_MAX_INLINE_IMAGE_BYTES = 20 * 1024 * 1024
+_OPENAI_RESPONSES_MAX_INLINE_FILE_BYTES = 32 * 1024 * 1024
+_OPENAI_RESPONSES_ACCEPTED_ATTACHMENT_TYPES = (
+    "image/*",
+    "text/*",
+    "application/json",
+    "application/pdf",
+    "application/xhtml+xml",
+)
+
+
+@dataclass(frozen=True)
+class _DataUrlAttachment:
+    filename: str
+    mime_type: str
+    data: bytes
+
+
+def _decode_data_url_attachment(url: str) -> _DataUrlAttachment | None:
+    if not url.startswith("data:"):
+        return None
+    header, separator, payload = url[5:].partition(",")
+    if separator == "":
+        return None
+
+    parts = [part.strip() for part in header.split(";") if part.strip()]
+    mime_type = "text/plain"
+    parameter_parts = parts
+    if parts and "/" in parts[0]:
+        mime_type = parts[0].lower()
+        parameter_parts = parts[1:]
+
+    is_base64 = False
+    filename = "attachment"
+    for part in parameter_parts:
+        lower = part.lower()
+        if lower == "base64":
+            is_base64 = True
+            continue
+        key, key_separator, value = part.partition("=")
+        if key_separator != "=":
+            continue
+        if key.strip().lower() in {"name", "filename"}:
+            decoded = unquote(value.strip().strip('"'))
+            if decoded:
+                filename = decoded
+
+    try:
+        data = (
+            base64.b64decode(payload, validate=False)
+            if is_base64
+            else unquote_to_bytes(payload)
+        )
+    except Exception:
+        return None
+    return _DataUrlAttachment(filename=filename, mime_type=mime_type, data=data)
 
 
 def _is_openai_out_of_credits_message(message: str) -> bool:
@@ -425,12 +482,21 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
         return True
 
     def append_image_message(self, *, mime_type: str, data: bytes) -> dict:
+        normalized_mime_type = (mime_type or "application/octet-stream").lower()
+        if not normalized_mime_type.startswith("image/"):
+            return self._append_attachment_note(
+                f"the user attached an unsupported image with mime type {normalized_mime_type}"
+            )
+        if len(data) > _OPENAI_RESPONSES_MAX_INLINE_IMAGE_BYTES:
+            return self._append_attachment_note(
+                f"the user attached an image ({normalized_mime_type}) that was too large to include"
+            )
         message = {
             "role": "user",
             "content": [
                 {
                     "type": "input_image",
-                    "image_url": f"data:{mime_type};base64,{base64.b64encode(data).decode()}",
+                    "image_url": f"data:{normalized_mime_type};base64,{base64.b64encode(data).decode()}",
                 },
             ],
         }
@@ -438,6 +504,12 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
         return message
 
     def append_image_url(self, *, url: str) -> dict:
+        data_url = _decode_data_url_attachment(url)
+        if data_url is not None:
+            return self.append_image_message(
+                mime_type=data_url.mime_type,
+                data=data_url.data,
+            )
         message = {
             "role": "user",
             "content": [
@@ -453,13 +525,29 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
     def append_file_message(
         self, *, filename: str, mime_type: str, data: bytes
     ) -> dict:
+        normalized_mime_type = (mime_type or "application/octet-stream").lower()
+        if normalized_mime_type.startswith("image/"):
+            return self.append_image_message(mime_type=normalized_mime_type, data=data)
+        if not (
+            normalized_mime_type.startswith("text/")
+            or normalized_mime_type == "application/json"
+            or normalized_mime_type == "application/pdf"
+            or normalized_mime_type == "application/xhtml+xml"
+        ):
+            return self._append_attachment_note(
+                f"the user attached {filename} with unsupported mime type {normalized_mime_type}"
+            )
+        if len(data) > _OPENAI_RESPONSES_MAX_INLINE_FILE_BYTES:
+            return self._append_attachment_note(
+                f"the user attached {filename} ({normalized_mime_type}) but it was too large to include"
+            )
         message = {
             "role": "user",
             "content": [
                 {
                     "type": "input_file",
                     "filename": filename,
-                    "file_data": f"data:{mime_type or 'text/plain'};base64,{base64.b64encode(data).decode()}",
+                    "file_data": f"data:{normalized_mime_type};base64,{base64.b64encode(data).decode()}",
                 }
             ],
         }
@@ -467,6 +555,13 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
         return message
 
     def append_file_url(self, *, url: str) -> dict:
+        data_url = _decode_data_url_attachment(url)
+        if data_url is not None:
+            return self.append_file_message(
+                filename=data_url.filename,
+                mime_type=data_url.mime_type,
+                data=data_url.data,
+            )
         message = {
             "role": "user",
             "content": [
@@ -476,6 +571,11 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
                 }
             ],
         }
+        self.messages.append(message)
+        return message
+
+    def _append_attachment_note(self, text: str) -> dict:
+        message = {"role": "user", "content": [{"type": "input_text", "text": text}]}
         self.messages.append(message)
         return message
 
@@ -1260,6 +1360,8 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                 if (context_window := self.context_window_size(name)) != float("inf")
                 else None,
                 pricing=llm_model_pricing(provider="openai", model=name),
+                supports_attachments=True,
+                accepts=_OPENAI_RESPONSES_ACCEPTED_ATTACHMENT_TYPES,
             )
             for name in names
         ]
@@ -1486,6 +1588,22 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         for item in response.output:
             if item.type == "compaction":
                 return True
+        return False
+
+    @staticmethod
+    def _response_has_terminal_image_generation_output(response: Response) -> bool:
+        for output_item in response.output:
+            item = output_item.model_dump(mode="json", exclude_none=True)
+            if item.get("type") != "image_generation_call":
+                continue
+
+            status = item.get("status")
+            if status in {"completed", "failed", "cancelled"}:
+                return True
+
+            if item.get("result") is not None or item.get("images") is not None:
+                return True
+
         return False
 
     async def compact(
@@ -1884,6 +2002,18 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         return int(match.group(1)), int(match.group(2))
 
     @staticmethod
+    def _image_generation_mime_type(item: dict[str, Any]) -> str:
+        output_format = item.get("output_format")
+        mime_type = (
+            f"image/{output_format.strip().lower()}"
+            if isinstance(output_format, str) and output_format.strip() != ""
+            else "image/png"
+        )
+        if mime_type == "image/jpg":
+            return "image/jpeg"
+        return mime_type
+
+    @staticmethod
     def _participant_name(participant: Participant) -> str:
         name = participant.get_attribute("name")
         if isinstance(name, str):
@@ -1898,8 +2028,6 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         item: dict[str, Any],
     ) -> dict[str, Any]:
         images_dataset = self._images_dataset
-        if images_dataset is None:
-            return item
         if item.get("type") != "image_generation_call":
             return item
         result = item.get("result")
@@ -1911,14 +2039,22 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         except Exception:
             return item
 
-        output_format = item.get("output_format")
-        mime_type = (
-            f"image/{output_format.strip().lower()}"
-            if isinstance(output_format, str) and output_format.strip() != ""
-            else "image/png"
-        )
-        if mime_type == "image/jpg":
-            mime_type = "image/jpeg"
+        mime_type = self._image_generation_mime_type(item)
+        width, height = self._image_dimensions_from_size(item.get("size"))
+        if images_dataset is None:
+            inline_item = dict(item)
+            inline_item.pop("result", None)
+            inline_item["images"] = [
+                {
+                    "uri": f"data:{mime_type};base64,{result.strip()}",
+                    "mime_type": mime_type,
+                    "created_by": self._participant_name(caller),
+                    "width": width,
+                    "height": height,
+                    "status": "completed",
+                }
+            ]
+            return inline_item
 
         item_id = item.get("id")
         annotations: dict[str, str] = {"source": "openai.responses"}
@@ -1941,7 +2077,6 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             created_by=self._participant_name(caller),
             annotations=annotations,
         )
-        width, height = self._image_dimensions_from_size(item.get("size"))
         persisted_item = dict(item)
         persisted_item.pop("result", None)
         persisted_item["images"] = [
@@ -3150,6 +3285,11 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                 if len(final_outputs) > 0:
                                     return final_outputs[0]
 
+                                if self._response_has_terminal_image_generation_output(
+                                    response
+                                ):
+                                    return ""
+
                                 with tracer.start_as_current_span(
                                     "llm.turn.check_for_termination"
                                 ) as span:
@@ -3305,6 +3445,11 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                             )
                                                             all_outputs = []
                                                             continue
+
+                                                    if self._response_has_terminal_image_generation_output(
+                                                        event.response
+                                                    ):
+                                                        return ""
 
                                                     with tracer.start_as_current_span(
                                                         "llm.turn.check_for_termination"
@@ -4073,8 +4218,7 @@ class MCPTool(OpenAIResponsesTool):
             if server.allowed_tools is not None:
                 opts["allowed_tools"] = server.allowed_tools
 
-            if server.authorization is not None:
-                opts["authorization"] = server.authorization
+            opts["authorization"] = server.authorization
 
             if server.headers is not None:
                 opts["headers"] = {

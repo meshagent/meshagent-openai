@@ -15,9 +15,10 @@ from meshagent.api.messaging import ensure_content
 from meshagent.agents.adapter import (
     DEFAULT_MAX_TOOL_CALL_LENGTH,
     DEFAULT_MAX_TOOL_CALL_LINES,
-    ToolResponseAdapter,
     LLMAdapter,
+    LLMModelInfo,
     SteeringCallback,
+    ToolResponseAdapter,
 )
 from meshagent.agents.agent_event_reader import (
     AccumulatingAgentEventReader,
@@ -28,7 +29,10 @@ from meshagent.agents.agent_event_reader import (
 from meshagent.agents.messages import ToolChoice
 from meshagent.api.http import llm_annotation_headers, normalize_llm_annotations
 import json
+import base64
+import mimetypes
 from typing import List
+from dataclasses import dataclass
 
 from openai import AsyncOpenAI, APIStatusError
 from openai.types.chat import ChatCompletion, ChatCompletionMessageToolCall
@@ -41,6 +45,7 @@ import copy
 import logging
 import re
 import asyncio
+from urllib.parse import unquote, unquote_to_bytes, urlparse
 
 from meshagent.openai.proxy import (
     get_client,
@@ -56,6 +61,61 @@ from meshagent.openai.tools.usage import (
 from html_to_markdown import convert
 
 logger = logging.getLogger("openai_agent")
+_OPENAI_COMPLETIONS_MAX_INLINE_IMAGE_BYTES = 20 * 1024 * 1024
+_OPENAI_COMPLETIONS_MAX_INLINE_TEXT_BYTES = 1 * 1024 * 1024
+_OPENAI_COMPLETIONS_ACCEPTED_ATTACHMENT_TYPES = (
+    "image/*",
+    "text/*",
+    "application/json",
+    "application/xhtml+xml",
+)
+
+
+@dataclass(frozen=True)
+class _DataUrlAttachment:
+    filename: str
+    mime_type: str
+    data: bytes
+
+
+def _decode_data_url_attachment(url: str) -> _DataUrlAttachment | None:
+    if not url.startswith("data:"):
+        return None
+    header, separator, payload = url[5:].partition(",")
+    if separator == "":
+        return None
+
+    parts = [part.strip() for part in header.split(";") if part.strip()]
+    mime_type = "text/plain"
+    parameter_parts = parts
+    if parts and "/" in parts[0]:
+        mime_type = parts[0].lower()
+        parameter_parts = parts[1:]
+
+    is_base64 = False
+    filename = "attachment"
+    for part in parameter_parts:
+        lower = part.lower()
+        if lower == "base64":
+            is_base64 = True
+            continue
+        key, key_separator, value = part.partition("=")
+        if key_separator != "=":
+            continue
+        if key.strip().lower() in {"name", "filename"}:
+            decoded = unquote(value.strip().strip('"'))
+            if decoded:
+                filename = decoded
+
+    try:
+        data = (
+            base64.b64decode(payload, validate=False)
+            if is_base64
+            else unquote_to_bytes(payload)
+        )
+    except Exception:
+        return None
+    return _DataUrlAttachment(filename=filename, mime_type=mime_type, data=data)
 
 
 def _replace_non_matching(text: str, allowed_chars: str, replacement: str) -> str:
@@ -230,6 +290,107 @@ def safe_tool_name(name: str):
 def _is_html_mime_type(mime_type: str | None) -> bool:
     normalized = (mime_type or "").strip().lower()
     return normalized in {"text/html", "application/xhtml+xml"}
+
+
+def _decode_text(data: bytes) -> str:
+    return data.decode("utf-8", errors="replace")
+
+
+class OpenAICompletionsSessionContext(AgentSessionContext):
+    @property
+    def supports_images(self) -> bool:
+        return True
+
+    @property
+    def supports_files(self) -> bool:
+        return True
+
+    def append_image_message(self, *, mime_type: str, data: bytes) -> dict:
+        normalized_mime_type = (mime_type or "application/octet-stream").lower()
+        if not normalized_mime_type.startswith("image/"):
+            return self._append_attachment_note(
+                f"the user attached an unsupported image with mime type {normalized_mime_type}"
+            )
+        if len(data) > _OPENAI_COMPLETIONS_MAX_INLINE_IMAGE_BYTES:
+            return self._append_attachment_note(
+                f"the user attached an image ({normalized_mime_type}) that was too large to include"
+            )
+        return self.append_image_url(
+            url=f"data:{normalized_mime_type};base64,{base64.b64encode(data).decode()}"
+        )
+
+    def append_image_url(self, *, url: str) -> dict:
+        data_url = _decode_data_url_attachment(url)
+        if (
+            data_url is not None
+            and len(data_url.data) > _OPENAI_COMPLETIONS_MAX_INLINE_IMAGE_BYTES
+        ):
+            return self._append_attachment_note(
+                f"the user attached {data_url.filename} ({data_url.mime_type}) but it was too large to include"
+            )
+        message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": url},
+                },
+            ],
+        }
+        self.messages.append(message)
+        return message
+
+    def append_file_message(
+        self, *, filename: str, mime_type: str, data: bytes
+    ) -> dict:
+        normalized_mime_type = (mime_type or "application/octet-stream").lower()
+        if normalized_mime_type.startswith("image/"):
+            return self.append_image_message(mime_type=normalized_mime_type, data=data)
+
+        if (
+            normalized_mime_type.startswith("text/")
+            or normalized_mime_type == "application/json"
+            or normalized_mime_type == "application/xhtml+xml"
+        ):
+            if len(data) > _OPENAI_COMPLETIONS_MAX_INLINE_TEXT_BYTES:
+                return self._append_attachment_note(
+                    f"the user attached {filename} ({normalized_mime_type}) but it was too large to include"
+                )
+            text = (
+                convert(_decode_text(data))
+                if _is_html_mime_type(normalized_mime_type)
+                else _decode_text(data)
+            )
+            return self._append_attachment_note(
+                f"attached file {filename} ({normalized_mime_type}):\n{text}"
+            )
+
+        return self._append_attachment_note(
+            f"the user attached {filename} with unsupported mime type {normalized_mime_type}"
+        )
+
+    def append_file_url(self, *, url: str) -> dict:
+        data_url = _decode_data_url_attachment(url)
+        if data_url is not None:
+            return self.append_file_message(
+                filename=data_url.filename,
+                mime_type=data_url.mime_type,
+                data=data_url.data,
+            )
+
+        parsed_url = urlparse(url)
+        guessed_mime_type, _ = mimetypes.guess_type(parsed_url.path)
+        normalized_mime_type = (guessed_mime_type or "application/octet-stream").lower()
+        if normalized_mime_type.startswith("image/"):
+            return self.append_image_url(url=url)
+        return self._append_attachment_note(
+            f"the user attached a file available at {url}"
+        )
+
+    def _append_attachment_note(self, text: str) -> dict:
+        message = {"role": "user", "content": text}
+        self.messages.append(message)
+        return message
 
 
 async def _consume_streaming_tool_result(
@@ -475,6 +636,23 @@ class OpenAICompletionsAdapter(LLMAdapter):
             max_tool_call_lines=self._max_tool_call_lines,
         )
 
+    def default_model(self) -> str:
+        return self._model
+
+    def list_models(self) -> list[LLMModelInfo]:
+        model = self.default_model()
+        context_window = self.context_window_size(model)
+        return [
+            LLMModelInfo(
+                name=model,
+                context_window=(
+                    int(context_window) if context_window != float("inf") else None
+                ),
+                supports_attachments=True,
+                accepts=_OPENAI_COMPLETIONS_ACCEPTED_ATTACHMENT_TYPES,
+            )
+        ]
+
     def create_session(
         self, *, usage_callback: SessionUsageCallback | None = None
     ) -> AgentSessionContext:
@@ -486,7 +664,7 @@ class OpenAICompletionsAdapter(LLMAdapter):
         elif self._model.startswith("o4"):
             system_role = "developer"
 
-        context = AgentSessionContext(
+        context = OpenAICompletionsSessionContext(
             system_role=system_role,
             usage_callback=usage_callback,
         )

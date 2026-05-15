@@ -79,6 +79,14 @@ from meshagent.openai.tools.responses_adapter import (
 from meshagent.tools import FunctionTool, Toolkit, ToolContext
 
 
+def test_list_models_advertises_attachment_capabilities() -> None:
+    model = OpenAIResponsesAdapter(model="gpt-5.2").list_models()[0]
+
+    assert model.supports_attachments is True
+    assert "image/*" in model.accepts
+    assert "application/pdf" in model.accepts
+
+
 class _FakeDeveloper:
     def log_nowait(self, *, type: str, data: dict) -> None:
         del type
@@ -821,7 +829,14 @@ class _FakeResponse:
 class _FakeImageGenerationOutputItem(OpenAIBaseModel):
     type: str
     id: str
-    usage: dict
+    usage: dict | None = None
+    status: str | None = None
+    result: str | None = None
+    output_format: str | None = None
+    size: str | None = None
+    quality: str | None = None
+    background: str | None = None
+    images: list[dict[str, object]] | None = None
 
 
 class _InstructionalOpenAIResponsesAdapter(OpenAIResponsesAdapter):
@@ -937,6 +952,36 @@ def test_openai_mcp_tool_coerces_headers_dict_to_strict_header_entries() -> None
     tool = MCPTool(servers=[server])
     definitions = tool.get_open_ai_tool_definitions()
     assert definitions[0]["headers"] == {"Authorization": "Bearer token"}
+
+
+def test_openai_mcp_tool_sets_explicit_null_authorization_by_default() -> None:
+    server = MCPServer.model_validate(
+        {
+            "server_label": "deepwiki",
+            "server_url": "https://mcp.deepwiki.com/mcp",
+        }
+    )
+
+    tool = MCPTool(servers=[server])
+    definitions = tool.get_open_ai_tool_definitions()
+
+    assert "authorization" in definitions[0]
+    assert definitions[0]["authorization"] is None
+
+
+def test_openai_mcp_tool_preserves_configured_authorization() -> None:
+    server = MCPServer.model_validate(
+        {
+            "server_label": "docs",
+            "server_url": "https://example.com/mcp",
+            "authorization": "Bearer token",
+        }
+    )
+
+    tool = MCPTool(servers=[server])
+    definitions = tool.get_open_ai_tool_definitions()
+
+    assert definitions[0]["authorization"] == "Bearer token"
 
 
 def test_image_generation_tool_defaults_to_gpt_image_2() -> None:
@@ -1569,6 +1614,57 @@ async def test_next_uses_websocket_path_when_mode_is_websocket(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_next_completes_image_generation_only_websocket_response(
+    monkeypatch,
+) -> None:
+    encoded_image = base64.b64encode(b"fake-image").decode("ascii")
+    adapter = OpenAIResponsesAdapter(
+        mode="websocket",
+        client=_FakeOpenAIClient(outcomes=[]),
+    )
+    context = adapter.create_session()
+    context.append_user_message("generate an image")
+
+    call_count = {"count": 0}
+
+    async def _fake_create_response_websocket_stream(**kwargs):
+        del kwargs
+        call_count["count"] += 1
+        return _CompletedStream(
+            event=_FakeCompletedEvent(
+                response=_FakeResponse(
+                    response_id="resp_image_ws",
+                    output=[
+                        _FakeImageGenerationOutputItem(
+                            type="image_generation_call",
+                            id="ig_1",
+                            status="completed",
+                            result=encoded_image,
+                            output_format="png",
+                            size="1024x1024",
+                        )
+                    ],
+                )
+            )
+        )
+
+    monkeypatch.setattr(
+        adapter,
+        "_create_response_websocket_stream",
+        _fake_create_response_websocket_stream,
+    )
+
+    result = await adapter.create_response(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        toolkits=[Toolkit(name="image_generation", tools=[ImageGenerationTool()])],
+    )
+
+    assert result == ""
+    assert call_count["count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_next_tracks_usage_for_non_streaming_request_mode():
     adapter = OpenAIResponsesAdapter(
         mode="request",
@@ -1608,6 +1704,42 @@ async def test_next_tracks_usage_for_non_streaming_request_mode():
         context_window_used=11,
         context_window_size=400000,
     )
+
+
+@pytest.mark.asyncio
+async def test_next_completes_image_generation_only_request_response() -> None:
+    encoded_image = base64.b64encode(b"fake-image").decode("ascii")
+    adapter = OpenAIResponsesAdapter(
+        mode="request",
+        client=_FakeOpenAIClient(
+            outcomes=[
+                _FakeResponse(
+                    response_id="resp_image",
+                    output=[
+                        _FakeImageGenerationOutputItem(
+                            type="image_generation_call",
+                            id="ig_1",
+                            status="completed",
+                            result=encoded_image,
+                            output_format="png",
+                            size="1024x1024",
+                        )
+                    ],
+                )
+            ]
+        ),
+    )
+    context = adapter.create_session()
+    context.append_user_message("generate an image")
+
+    result = await adapter.create_response(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        toolkits=[Toolkit(name="image_generation", tools=[ImageGenerationTool()])],
+    )
+
+    assert result == ""
+    assert adapter.get_openai_client().responses.calls == 1
 
 
 @pytest.mark.asyncio
@@ -2694,6 +2826,44 @@ def test_session_context_appends_remote_image_and_file_urls() -> None:
     assert file_message["content"][0] == {
         "type": "input_file",
         "file_url": "https://example.com/report.pdf",
+    }
+
+
+def test_session_context_appends_data_url_file_as_inline_file() -> None:
+    context = OpenAIResponsesSessionContext(system_role=None)
+
+    message = context.append_file_url(
+        url="data:text/plain;name=note.txt;base64,aGVsbG8="
+    )
+
+    assert message["content"][0] == {
+        "type": "input_file",
+        "filename": "note.txt",
+        "file_data": "data:text/plain;base64,aGVsbG8=",
+    }
+
+
+def test_session_context_appends_data_url_image_as_inline_image() -> None:
+    context = OpenAIResponsesSessionContext(system_role=None)
+
+    message = context.append_file_url(url="data:image/png;name=image.png;base64,cG5n")
+
+    assert message["content"][0] == {
+        "type": "input_image",
+        "image_url": "data:image/png;base64,cG5n",
+    }
+
+
+def test_session_context_replaces_unsupported_data_url_file_with_note() -> None:
+    context = OpenAIResponsesSessionContext(system_role=None)
+
+    message = context.append_file_url(
+        url="data:application/octet-stream;name=blob.bin;base64,YmxvYg=="
+    )
+
+    assert message["content"][0] == {
+        "type": "input_text",
+        "text": "the user attached blob.bin with unsupported mime type application/octet-stream",
     }
 
 
@@ -4045,6 +4215,43 @@ async def test_openai_responses_adapter_persists_image_before_publishing_done_ev
     assert "result" not in payload
     assert payload["images"][0]["uri"] == "dataset://images?id=image-1"
     assert payload["images"][0]["width"] == 1024
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_adapter_inlines_image_when_images_dataset_missing() -> (
+    None
+):
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    context = OpenAIResponsesSessionContext()
+    encoded = base64.b64encode(b"fake-image-bytes").decode("ascii")
+
+    payload = await adapter._persist_image_generation_output_item(
+        context=context,
+        caller=_FakeParticipant(),
+        item={
+            "type": "image_generation_call",
+            "id": "ig_1",
+            "status": "completed",
+            "output_format": "jpeg",
+            "size": "1536x1024",
+            "result": encoded,
+        },
+    )
+
+    assert "result" not in payload
+    assert payload["images"] == [
+        {
+            "uri": f"data:image/jpeg;base64,{encoded}",
+            "mime_type": "image/jpeg",
+            "created_by": "assistant",
+            "width": 1536,
+            "height": 1024,
+            "status": "completed",
+        }
+    ]
 
 
 def test_make_agent_event_publisher_preserves_text_delta_whitespace() -> None:

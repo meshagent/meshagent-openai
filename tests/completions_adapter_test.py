@@ -28,6 +28,14 @@ from meshagent.openai.tools.completions_adapter import (
 from meshagent.tools import FunctionTool, Toolkit
 
 
+def test_list_models_advertises_attachment_capabilities() -> None:
+    model = OpenAICompletionsAdapter(model="gpt-4o").list_models()[0]
+
+    assert model.supports_attachments is True
+    assert "image/*" in model.accepts
+    assert "application/xhtml+xml" in model.accepts
+
+
 class _FakeDeveloper:
     def log_nowait(self, *, type: str, data: dict) -> None:
         del type
@@ -94,6 +102,51 @@ def test_make_agent_event_reader_accumulates_streamed_text_for_restore() -> None
     adapter.restore_context_messages(context=context, messages=restored_messages)
 
     assert context.messages == [{"role": "assistant", "content": "Hi there"}]
+
+
+def test_session_context_appends_data_url_text_file_as_text_note() -> None:
+    adapter = OpenAICompletionsAdapter(model="gpt-4o-mini", client=object())
+    context = adapter.create_session()
+
+    message = context.append_file_url(
+        url="data:text/plain;name=note.txt;base64,aGVsbG8="
+    )
+
+    assert message == {
+        "role": "user",
+        "content": "attached file note.txt (text/plain):\nhello",
+    }
+
+
+def test_session_context_appends_data_url_image_as_image_url() -> None:
+    adapter = OpenAICompletionsAdapter(model="gpt-4o-mini", client=object())
+    context = adapter.create_session()
+
+    message = context.append_file_url(url="data:image/png;name=image.png;base64,cG5n")
+
+    assert message == {
+        "role": "user",
+        "content": [
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,cG5n"},
+            }
+        ],
+    }
+
+
+def test_session_context_replaces_unsupported_data_url_file_with_note() -> None:
+    adapter = OpenAICompletionsAdapter(model="gpt-4o-mini", client=object())
+    context = adapter.create_session()
+
+    message = context.append_file_url(
+        url="data:application/octet-stream;name=blob.bin;base64,YmxvYg=="
+    )
+
+    assert message == {
+        "role": "user",
+        "content": "the user attached blob.bin with unsupported mime type application/octet-stream",
+    }
 
 
 @pytest.mark.parametrize(
