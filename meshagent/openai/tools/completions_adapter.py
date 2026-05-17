@@ -45,7 +45,7 @@ import copy
 import logging
 import re
 import asyncio
-from urllib.parse import unquote, unquote_to_bytes, urlparse
+from urllib.parse import unquote_to_bytes, urlparse
 
 from meshagent.openai.proxy import (
     get_client,
@@ -73,7 +73,6 @@ _OPENAI_COMPLETIONS_ACCEPTED_ATTACHMENT_TYPES = (
 
 @dataclass(frozen=True)
 class _DataUrlAttachment:
-    filename: str
     mime_type: str
     data: bytes
 
@@ -93,19 +92,10 @@ def _decode_data_url_attachment(url: str) -> _DataUrlAttachment | None:
         parameter_parts = parts[1:]
 
     is_base64 = False
-    filename = "attachment"
     for part in parameter_parts:
         lower = part.lower()
         if lower == "base64":
             is_base64 = True
-            continue
-        key, key_separator, value = part.partition("=")
-        if key_separator != "=":
-            continue
-        if key.strip().lower() in {"name", "filename"}:
-            decoded = unquote(value.strip().strip('"'))
-            if decoded:
-                filename = decoded
 
     try:
         data = (
@@ -115,7 +105,12 @@ def _decode_data_url_attachment(url: str) -> _DataUrlAttachment | None:
         )
     except Exception:
         return None
-    return _DataUrlAttachment(filename=filename, mime_type=mime_type, data=data)
+    return _DataUrlAttachment(mime_type=mime_type, data=data)
+
+
+def _encoded_data_url(*, mime_type: str, data: bytes) -> str:
+    normalized_mime_type = (mime_type or "application/octet-stream").lower()
+    return f"data:{normalized_mime_type};base64,{base64.b64encode(data).decode()}"
 
 
 def _replace_non_matching(text: str, allowed_chars: str, replacement: str) -> str:
@@ -158,9 +153,41 @@ class OpenAICompletionsAgentEventReader(AccumulatingAgentEventReader):
             elif item_type == "file":
                 url = item.get("url")
                 if isinstance(url, str):
-                    parts.append(
-                        {"type": "text", "text": f"the user attached a file: {url}"}
+                    filename_value = item.get("name")
+                    filename = (
+                        filename_value.strip()
+                        if isinstance(filename_value, str)
+                        and filename_value.strip() != ""
+                        else "attachment"
                     )
+                    data_url = _decode_data_url_attachment(url)
+                    if data_url is not None and data_url.mime_type.startswith("image/"):
+                        parts.append(
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": _encoded_data_url(
+                                        mime_type=data_url.mime_type,
+                                        data=data_url.data,
+                                    )
+                                },
+                            }
+                        )
+                    elif data_url is not None:
+                        parts.append(
+                            {
+                                "type": "text",
+                                "text": (
+                                    "the user attached "
+                                    f"{filename} with mime type "
+                                    f"{data_url.mime_type}"
+                                ),
+                            }
+                        )
+                    else:
+                        parts.append(
+                            {"type": "text", "text": f"the user attached a file: {url}"}
+                        )
         if not parts:
             parts.append({"type": "text", "text": json.dumps(content)})
         self._emit_context_message({"role": "user", "content": parts})
@@ -315,18 +342,29 @@ class OpenAICompletionsSessionContext(AgentSessionContext):
             return self._append_attachment_note(
                 f"the user attached an image ({normalized_mime_type}) that was too large to include"
             )
-        return self.append_image_url(
-            url=f"data:{normalized_mime_type};base64,{base64.b64encode(data).decode()}"
-        )
+        message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": _encoded_data_url(
+                            mime_type=normalized_mime_type,
+                            data=data,
+                        )
+                    },
+                },
+            ],
+        }
+        self.messages.append(message)
+        return message
 
     def append_image_url(self, *, url: str) -> dict:
         data_url = _decode_data_url_attachment(url)
-        if (
-            data_url is not None
-            and len(data_url.data) > _OPENAI_COMPLETIONS_MAX_INLINE_IMAGE_BYTES
-        ):
-            return self._append_attachment_note(
-                f"the user attached {data_url.filename} ({data_url.mime_type}) but it was too large to include"
+        if data_url is not None:
+            return self.append_image_message(
+                mime_type=data_url.mime_type,
+                data=data_url.data,
             )
         message = {
             "role": "user",
@@ -369,11 +407,11 @@ class OpenAICompletionsSessionContext(AgentSessionContext):
             f"the user attached {filename} with unsupported mime type {normalized_mime_type}"
         )
 
-    def append_file_url(self, *, url: str) -> dict:
+    def append_file_url(self, *, url: str, filename: str | None = None) -> dict:
         data_url = _decode_data_url_attachment(url)
         if data_url is not None:
             return self.append_file_message(
-                filename=data_url.filename,
+                filename=filename or "attachment",
                 mime_type=data_url.mime_type,
                 data=data_url.data,
             )

@@ -93,7 +93,7 @@ import httpx
 from pydantic import BaseModel, model_validator
 from opentelemetry import trace
 from html_to_markdown import convert
-from urllib.parse import unquote, unquote_to_bytes, urlparse, urlunparse
+from urllib.parse import unquote_to_bytes, urlparse, urlunparse
 from meshagent.openai.tools.usage import (
     add_usage_metrics,
     normalize_openai_usage,
@@ -124,7 +124,6 @@ _OPENAI_RESPONSES_ACCEPTED_ATTACHMENT_TYPES = (
 
 @dataclass(frozen=True)
 class _DataUrlAttachment:
-    filename: str
     mime_type: str
     data: bytes
 
@@ -144,19 +143,10 @@ def _decode_data_url_attachment(url: str) -> _DataUrlAttachment | None:
         parameter_parts = parts[1:]
 
     is_base64 = False
-    filename = "attachment"
     for part in parameter_parts:
         lower = part.lower()
         if lower == "base64":
             is_base64 = True
-            continue
-        key, key_separator, value = part.partition("=")
-        if key_separator != "=":
-            continue
-        if key.strip().lower() in {"name", "filename"}:
-            decoded = unquote(value.strip().strip('"'))
-            if decoded:
-                filename = decoded
 
     try:
         data = (
@@ -166,7 +156,22 @@ def _decode_data_url_attachment(url: str) -> _DataUrlAttachment | None:
         )
     except Exception:
         return None
-    return _DataUrlAttachment(filename=filename, mime_type=mime_type, data=data)
+    return _DataUrlAttachment(mime_type=mime_type, data=data)
+
+
+def _encoded_data_url(*, mime_type: str, data: bytes) -> str:
+    normalized_mime_type = (mime_type or "application/octet-stream").lower()
+    return f"data:{normalized_mime_type};base64,{base64.b64encode(data).decode()}"
+
+
+def _is_openai_responses_inline_file_mime_type(mime_type: str) -> bool:
+    normalized_mime_type = (mime_type or "application/octet-stream").lower()
+    return (
+        normalized_mime_type.startswith("text/")
+        or normalized_mime_type == "application/json"
+        or normalized_mime_type == "application/pdf"
+        or normalized_mime_type == "application/xhtml+xml"
+    )
 
 
 def _is_openai_out_of_credits_message(message: str) -> bool:
@@ -496,7 +501,10 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
             "content": [
                 {
                     "type": "input_image",
-                    "image_url": f"data:{normalized_mime_type};base64,{base64.b64encode(data).decode()}",
+                    "image_url": _encoded_data_url(
+                        mime_type=normalized_mime_type,
+                        data=data,
+                    ),
                 },
             ],
         }
@@ -528,12 +536,7 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
         normalized_mime_type = (mime_type or "application/octet-stream").lower()
         if normalized_mime_type.startswith("image/"):
             return self.append_image_message(mime_type=normalized_mime_type, data=data)
-        if not (
-            normalized_mime_type.startswith("text/")
-            or normalized_mime_type == "application/json"
-            or normalized_mime_type == "application/pdf"
-            or normalized_mime_type == "application/xhtml+xml"
-        ):
+        if not _is_openai_responses_inline_file_mime_type(normalized_mime_type):
             return self._append_attachment_note(
                 f"the user attached {filename} with unsupported mime type {normalized_mime_type}"
             )
@@ -547,18 +550,21 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
                 {
                     "type": "input_file",
                     "filename": filename,
-                    "file_data": f"data:{normalized_mime_type};base64,{base64.b64encode(data).decode()}",
+                    "file_data": _encoded_data_url(
+                        mime_type=normalized_mime_type,
+                        data=data,
+                    ),
                 }
             ],
         }
         self.messages.append(message)
         return message
 
-    def append_file_url(self, *, url: str) -> dict:
+    def append_file_url(self, *, url: str, filename: str | None = None) -> dict:
         data_url = _decode_data_url_attachment(url)
         if data_url is not None:
             return self.append_file_message(
-                filename=data_url.filename,
+                filename=filename or "attachment",
                 mime_type=data_url.mime_type,
                 data=data_url.data,
             )
@@ -604,7 +610,48 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
             elif item_type == "file":
                 url = item.get("url")
                 if isinstance(url, str):
-                    parts.append({"type": "input_file", "file_url": url})
+                    filename_value = item.get("name")
+                    filename = (
+                        filename_value.strip()
+                        if isinstance(filename_value, str)
+                        and filename_value.strip() != ""
+                        else "attachment"
+                    )
+                    data_url = _decode_data_url_attachment(url)
+                    if data_url is None:
+                        parts.append({"type": "input_file", "file_url": url})
+                    elif data_url.mime_type.startswith("image/"):
+                        parts.append(
+                            {
+                                "type": "input_image",
+                                "image_url": _encoded_data_url(
+                                    mime_type=data_url.mime_type,
+                                    data=data_url.data,
+                                ),
+                            }
+                        )
+                    elif _is_openai_responses_inline_file_mime_type(data_url.mime_type):
+                        parts.append(
+                            {
+                                "type": "input_file",
+                                "filename": filename,
+                                "file_data": _encoded_data_url(
+                                    mime_type=data_url.mime_type,
+                                    data=data_url.data,
+                                ),
+                            }
+                        )
+                    else:
+                        parts.append(
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "the user attached "
+                                    f"{filename} with unsupported mime type "
+                                    f"{data_url.mime_type}"
+                                ),
+                            }
+                        )
         if not parts:
             parts.append({"type": "input_text", "text": json.dumps(content)})
         self._emit_context_message({"role": "user", "content": parts})
