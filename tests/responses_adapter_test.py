@@ -25,6 +25,7 @@ from meshagent.agents.adapter import ToolCallApprovalRequest
 from meshagent.agents.context import SessionUsage
 from meshagent.agents.messages import (
     AGENT_EVENT_CONTEXT_COMPACTED,
+    AGENT_EVENT_IMAGE_GENERATION_COMPLETED,
     AGENT_EVENT_TEXT_CONTENT_DELTA,
     AGENT_EVENT_TEXT_CONTENT_ENDED,
     AGENT_EVENT_THREAD_EVENT,
@@ -35,6 +36,7 @@ from meshagent.agents.messages import (
     AgentAudioGenerationCompleted,
     AgentAudioGenerationDelta,
     AgentAudioGenerationStarted,
+    AgentGeneratedImage,
     AgentThreadEvent,
     AgentImageGenerationCompleted,
     AgentImageGenerationStarted,
@@ -191,6 +193,58 @@ def test_make_agent_event_reader_ignores_audio_generation_for_restore() -> None:
     adapter.restore_context_messages(context=context, messages=restored_messages)
 
     assert context.messages == []
+
+
+def test_make_agent_event_reader_restores_image_generation_with_turn_id() -> None:
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    context = adapter.create_session()
+    restored_messages: list[dict[str, object]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+
+    reader.consume(
+        AgentImageGenerationCompleted(
+            type=AGENT_EVENT_IMAGE_GENERATION_COMPLETED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="image-1",
+            call_id="call-image",
+            toolkit="openai",
+            tool="image_generation",
+            arguments={"size": "512x512"},
+            images=[
+                AgentGeneratedImage(
+                    uri="data:image/png;base64,aW1hZ2U=",
+                    mime_type="image/png",
+                    width=512,
+                    height=512,
+                    status="completed",
+                )
+            ],
+        )
+    )
+    reader.finalize()
+    adapter.restore_context_messages(context=context, messages=restored_messages)
+
+    assert context.messages == [
+        {
+            "type": "image_generation_call",
+            "id": "image-1",
+            "status": "completed",
+            "call_id": "call-image",
+            "size": "512x512",
+            "results": [
+                {
+                    "uri": "data:image/png;base64,aW1hZ2U=",
+                    "mime_type": "image/png",
+                    "created_at": None,
+                    "created_by": None,
+                    "width": 512,
+                    "height": 512,
+                    "status": "completed",
+                }
+            ],
+        }
+    ]
 
 
 def _restore_tool_lifecycle(
@@ -702,18 +756,18 @@ class _GateTool(FunctionTool):
         return {"ok": True, "tool": self.name}
 
 
-class _CallerContextTool(FunctionTool):
+class _ContextTool(FunctionTool):
     def __init__(self, name: str):
         super().__init__(
             name=name,
             input_schema={"type": "object", "additionalProperties": True},
-            description="caller context test tool",
+            description="context test tool",
         )
-        self.caller_contexts: list[dict[str, object] | None] = []
+        self.contexts: list[ToolContext] = []
 
-    async def execute(self, context, **kwargs):
+    async def execute(self, context: ToolContext, **kwargs):
         del kwargs
-        self.caller_contexts.append(context.caller_context)
+        self.contexts.append(context)
         return {"ok": True}
 
 
@@ -1994,7 +2048,7 @@ async def test_next_commits_response_state_when_stream_ends_incomplete_after_com
             "output_tokens": 3.0,
             "cached_tokens": 2.0,
         },
-        context_window_used=21,
+        context_window_used=23,
         context_window_size=400000,
     )
     assert [event["type"] for event in events] == [
@@ -3018,8 +3072,8 @@ async def test_next_drops_post_tool_response_items_before_steering_in_request_mo
 
 
 @pytest.mark.asyncio
-async def test_next_passes_thread_and_turn_ids_in_tool_caller_context() -> None:
-    tool = _CallerContextTool("context_tool")
+async def test_next_passes_typed_tool_context_without_agent_lifecycle_ids() -> None:
+    tool = _ContextTool("context_tool")
     client = _FakeOpenAIClient(
         outcomes=[
             _FakeResponse(
@@ -3056,13 +3110,10 @@ async def test_next_passes_thread_and_turn_ids_in_tool_caller_context() -> None:
     )
 
     assert result == "done"
-    assert len(tool.caller_contexts) == 1
-    caller_context = tool.caller_contexts[0]
-    assert isinstance(caller_context, dict)
-    assert caller_context["thread_id"] == "thread-1"
-    assert caller_context["turn_id"] == "turn-1"
-    assert caller_context["item_id"] == "tool-1"
-    assert isinstance(caller_context.get("chat"), dict)
+    assert len(tool.contexts) == 1
+    tool_context = tool.contexts[0]
+    assert type(tool_context) is ToolContext
+    assert tool_context.caller.id == _FakeRoom().local_participant.id
 
 
 @pytest.mark.asyncio
@@ -3806,6 +3857,66 @@ async def test_next_does_not_retry_after_websocket_out_of_credits(monkeypatch):
 
         assert exc_info.value.status_code == 402
         assert "account dashboard" in str(exc_info.value)
+        assert client_session.connect_calls == 1
+        assert sleep_calls == []
+        assert stream_events == []
+    finally:
+        await context.close()
+
+
+@pytest.mark.asyncio
+async def test_next_does_not_retry_after_websocket_invalid_schema(monkeypatch):
+    sleep_calls: list[float] = []
+
+    async def _fake_sleep(delay: float):
+        sleep_calls.append(delay)
+
+    monkeypatch.setattr(
+        "meshagent.openai.tools.responses_adapter.asyncio.sleep",
+        _fake_sleep,
+    )
+
+    adapter = OpenAIResponsesAdapter(mode="websocket", max_retries=2)
+    websocket = _QueuedLoggingWebSocket()
+    websocket.queue_json(
+        {
+            "type": "error",
+            "error": {
+                "message": "Invalid schema for function 'ask_user': "
+                "'text' is not valid under any of the given schemas.",
+            },
+            "status": 400,
+        }
+    )
+    client_session = _SequentialClientSession([websocket])
+    context = OpenAIResponsesSessionContext(
+        system_role=None,
+        session=client_session,
+        websocket_ping_interval_seconds=3600,
+        websocket_timeout=3600,
+    )
+    context.append_user_message("hello")
+    stream_events: list[dict] = []
+
+    monkeypatch.setattr(
+        adapter,
+        "get_openai_client",
+        lambda: SimpleNamespace(
+            base_url="https://example.com/openai/v1",
+            default_headers={"Authorization": "Bearer test-token"},
+        ),
+    )
+
+    try:
+        with pytest.raises(RoomException) as exc_info:
+            await adapter.create_response(
+                context=context,
+                caller=_FakeRoom().local_participant,
+                toolkits=[],
+                event_handler=stream_events.append,
+            )
+
+        assert "Invalid schema for function 'ask_user'" in str(exc_info.value)
         assert client_session.connect_calls == 1
         assert sleep_calls == []
         assert stream_events == []

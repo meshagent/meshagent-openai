@@ -34,6 +34,7 @@ from meshagent.api.messaging import (
     JsonContent,
     TextContent,
     EmptyContent,
+    ErrorContent,
     RawOutputsContent,
     _ControlContent,
 )
@@ -176,6 +177,17 @@ def _is_openai_responses_inline_file_mime_type(mime_type: str) -> bool:
 
 def _is_openai_out_of_credits_message(message: str) -> bool:
     return "out of credits" in message.lower()
+
+
+def _is_openai_non_retryable_request_error_message(message: str) -> bool:
+    normalized = message.lower()
+    return (
+        "invalid schema" in normalized
+        or "is not valid under any of the given schemas" in normalized
+        or "missing required parameter" in normalized
+        or "unknown parameter" in normalized
+        or "unsupported parameter" in normalized
+    )
 
 
 def _redact_log_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -738,6 +750,7 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
         self,
         *,
         event_type: str,
+        turn_id: str,
         item_id: str,
         call_id: str | None,
         toolkit: str,
@@ -746,7 +759,7 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
         images: list[dict[str, Any]],
         status: str,
     ) -> None:
-        del event_type, toolkit, tool
+        del event_type, turn_id, toolkit, tool
         item: dict[str, Any] = {
             "type": "image_generation_call",
             "id": item_id,
@@ -1154,6 +1167,10 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
 
         elif isinstance(response, EmptyContent):
             return "ok"
+
+        elif isinstance(response, ErrorContent):
+            code = f" (code={response.code})" if response.code is not None else ""
+            return f"Error{code}: {response.text}"
 
         # elif isinstance(response, ImageResponse):
         #     context.messages.append({
@@ -2019,6 +2036,8 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
     def _is_retryable_room_error(self, *, error: RoomException) -> bool:
         if self._is_openai_out_of_credits_error(error=error):
             return False
+        if _is_openai_non_retryable_request_error_message(str(error)):
+            return False
         return True
 
     @staticmethod
@@ -2722,7 +2741,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             )
 
         with tracer.start_as_current_span("llm.turn") as span:
-            span.set_attributes({"chat_context": context.id, "api": "responses"})
+            span.set_attributes({"session_id": context.id, "api": "responses"})
             async with contextlib.AsyncExitStack() as exit_stack:
                 if isinstance(context, OpenAIResponsesSessionContext):
                     await exit_stack.enter_async_context(context._request_lock)
@@ -2952,20 +2971,29 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                         }
                                                     )
 
-                                                    caller_context = (
-                                                        context.to_tool_caller_context(
-                                                            item_id=tool_call.id
-                                                            if isinstance(
-                                                                tool_call.id, str
-                                                            )
-                                                            else None
-                                                        )
+                                                    tool_item_id = (
+                                                        tool_call.id
+                                                        if isinstance(tool_call.id, str)
+                                                        else None
                                                     )
+
+                                                    def handle_tool_event(event: dict):
+                                                        if event_handler is None:
+                                                            return
+                                                        if (
+                                                            tool_item_id is not None
+                                                            and "item_id" not in event
+                                                        ):
+                                                            event = {
+                                                                **event,
+                                                                "item_id": tool_item_id,
+                                                            }
+                                                        event_handler(event)
+
                                                     tool_context = ToolContext(
                                                         caller=caller,
                                                         on_behalf_of=on_behalf_of,
-                                                        caller_context=caller_context,
-                                                        event_handler=event_handler,
+                                                        event_handler=handle_tool_event,
                                                     )
                                                     if event_handler is not None:
                                                         event_handler(
@@ -3150,7 +3178,6 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                         if message.type in handlers:
                                                             tool_context = ToolContext(
                                                                 caller=caller,
-                                                                caller_context=context.to_tool_caller_context(),
                                                                 event_handler=event_handler,
                                                             )
 
@@ -3589,7 +3616,6 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                                 ):
                                                                     tool_context = ToolContext(
                                                                         caller=caller,
-                                                                        caller_context=context.to_tool_caller_context(),
                                                                         event_handler=event_handler,
                                                                     )
 
@@ -4032,13 +4058,15 @@ class ShellTool(OpenAIResponsesTool):
         *,
         item_id: str,
     ) -> ToolContext:
-        caller_context = dict(context.caller_context or {})
-        caller_context["item_id"] = item_id
+        def handle_provider_event(event: dict):
+            if "item_id" not in event:
+                event = {**event, "item_id": item_id}
+            context.emit(event)
+
         return ToolContext(
             caller=context.caller,
             on_behalf_of=context.on_behalf_of,
-            caller_context=caller_context,
-            event_handler=context.emit,
+            event_handler=handle_provider_event,
         )
 
     def _require_provider(self) -> ContainerShellTool | ProcessShellTool:

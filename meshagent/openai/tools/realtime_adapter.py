@@ -654,6 +654,7 @@ class _OpenAIRealtimeAgentEventReader(AccumulatingAgentEventReader):
         self,
         *,
         event_type: str,
+        turn_id: str,
         item_id: str,
         call_id: str | None,
         toolkit: str,
@@ -665,6 +666,7 @@ class _OpenAIRealtimeAgentEventReader(AccumulatingAgentEventReader):
         item = {
             "type": "image_generation",
             "event_type": event_type,
+            "turn_id": turn_id,
             "item_id": item_id,
             "call_id": call_id,
             "toolkit": toolkit,
@@ -1152,12 +1154,18 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
             max_tool_call_lines=DEFAULT_MAX_TOOL_CALL_LINES,
         )
         for tool_call in tool_calls:
+            tool_item_id = tool_call.get("id")
+
+            def handle_tool_event(event: dict):
+                if event_handler is None:
+                    return
+                if isinstance(tool_item_id, str) and "item_id" not in event:
+                    event = {**event, "item_id": tool_item_id}
+                event_handler(event)
+
             tool_context = ToolContext(
                 caller=caller,
-                caller_context=context.to_tool_caller_context(
-                    item_id=tool_call.get("id")
-                ),
-                event_handler=event_handler,
+                event_handler=handle_tool_event,
             )
             if event_handler is not None:
                 event_handler(
@@ -1754,12 +1762,18 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
 
             tool_bundle = ResponsesToolBundle(toolkits=[*toolkits])
             for tool_call in tool_calls:
+                tool_item_id = tool_call.get("id")
+
+                def handle_tool_event(event: dict):
+                    if event_handler is None:
+                        return
+                    if isinstance(tool_item_id, str) and "item_id" not in event:
+                        event = {**event, "item_id": tool_item_id}
+                    event_handler(event)
+
                 tool_context = ToolContext(
                     caller=caller,
-                    caller_context=context.to_tool_caller_context(
-                        item_id=tool_call.get("id")
-                    ),
-                    event_handler=event_handler,
+                    event_handler=handle_tool_event,
                 )
                 if event_handler is not None:
                     event_handler(

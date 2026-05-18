@@ -25,7 +25,7 @@ from meshagent.openai.tools.completions_adapter import (
     OpenAICompletionsToolResponseAdapter,
     _consume_streaming_tool_result,
 )
-from meshagent.tools import FunctionTool, Toolkit
+from meshagent.tools import FunctionTool, Toolkit, ToolContext
 
 
 def test_list_models_advertises_attachment_capabilities() -> None:
@@ -383,18 +383,18 @@ class _BlockingTool(FunctionTool):
         await asyncio.Future()
 
 
-class _CallerContextTool(FunctionTool):
+class _ContextTool(FunctionTool):
     def __init__(self, name: str):
         super().__init__(
             name=name,
             input_schema={"type": "object", "additionalProperties": True},
-            description="caller context test tool",
+            description="context test tool",
         )
-        self.caller_contexts: list[dict[str, Any] | None] = []
+        self.contexts: list[ToolContext] = []
 
-    async def execute(self, context, **kwargs):
+    async def execute(self, context: ToolContext, **kwargs):
         del kwargs
-        self.caller_contexts.append(context.caller_context)
+        self.contexts.append(context)
         return {"ok": True}
 
 
@@ -684,8 +684,8 @@ async def test_next_consumes_streaming_tool_events_and_uses_final_item_result():
     assert context.turn_count == 1
     assert context.last_usage == SessionUsage(
         model="gpt-4o-mini",
-        usage={"input_tokens": 7.0, "output_tokens": 4.0},
-        context_window_used=11,
+        usage={"input_tokens": 2.0, "output_tokens": 3.0},
+        context_window_used=5,
     )
     assert events == [{"type": "agent.event", "headline": "working"}]
 
@@ -749,8 +749,8 @@ async def test_next_accumulates_cached_usage_across_tool_loop_calls() -> None:
 
 
 @pytest.mark.asyncio
-async def test_next_passes_thread_and_turn_ids_in_tool_caller_context() -> None:
-    tool = _CallerContextTool("context_tool")
+async def test_next_passes_typed_tool_context_without_agent_lifecycle_ids() -> None:
+    tool = _ContextTool("context_tool")
     adapter = OpenAICompletionsAdapter(
         model="gpt-4o-mini",
         client=_FakeOpenAIClient(
@@ -785,13 +785,10 @@ async def test_next_passes_thread_and_turn_ids_in_tool_caller_context() -> None:
     )
 
     assert result == "done"
-    assert len(tool.caller_contexts) == 1
-    caller_context = tool.caller_contexts[0]
-    assert isinstance(caller_context, dict)
-    assert caller_context["thread_id"] == "thread-1"
-    assert caller_context["turn_id"] == "turn-1"
-    assert caller_context["item_id"] == "call_1"
-    assert isinstance(caller_context.get("chat"), dict)
+    assert len(tool.contexts) == 1
+    tool_context = tool.contexts[0]
+    assert type(tool_context) is ToolContext
+    assert tool_context.caller.id == _FakeRoom().local_participant.id
 
 
 @pytest.mark.asyncio

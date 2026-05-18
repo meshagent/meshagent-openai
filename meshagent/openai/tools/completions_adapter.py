@@ -9,6 +9,7 @@ from meshagent.api.messaging import (
     JsonContent,
     TextContent,
     EmptyContent,
+    ErrorContent,
     _ControlContent,
 )
 from meshagent.api.messaging import ensure_content
@@ -255,6 +256,7 @@ class OpenAICompletionsAgentEventReader(AccumulatingAgentEventReader):
         self,
         *,
         event_type: str,
+        turn_id: str,
         item_id: str,
         call_id: str | None,
         toolkit: str,
@@ -266,6 +268,7 @@ class OpenAICompletionsAgentEventReader(AccumulatingAgentEventReader):
         item = {
             "type": "image_generation",
             "event_type": event_type,
+            "turn_id": turn_id,
             "item_id": item_id,
             "call_id": call_id,
             "toolkit": toolkit,
@@ -581,6 +584,10 @@ class OpenAICompletionsToolResponseAdapter(ToolResponseAdapter):
 
         elif isinstance(response, EmptyContent):
             return "ok"
+
+        elif isinstance(response, ErrorContent):
+            code = f" (code={response.code})" if response.code is not None else ""
+            return f"Error{code}: {response.text}"
 
         # elif isinstance(response, ImageResponse):
         #     context.messages.append({
@@ -908,16 +915,21 @@ class OpenAICompletionsAdapter(LLMAdapter):
 
                     async def do_tool_call(tool_call: ChatCompletionMessageToolCall):
                         try:
-                            caller_context = context.to_tool_caller_context(
-                                item_id=tool_call.id
-                                if isinstance(tool_call.id, str)
-                                else None
+                            tool_item_id = (
+                                tool_call.id if isinstance(tool_call.id, str) else None
                             )
+
+                            def handle_tool_event(event: dict):
+                                if event_handler is None:
+                                    return
+                                if tool_item_id is not None and "item_id" not in event:
+                                    event = {**event, "item_id": tool_item_id}
+                                event_handler(event)
+
                             tool_context = ToolContext(
                                 caller=caller,
                                 on_behalf_of=on_behalf_of,
-                                caller_context=caller_context,
-                                event_handler=event_handler,
+                                event_handler=handle_tool_event,
                             )
                             tool_response = await tool_bundle.execute(
                                 context=tool_context, tool_call=tool_call
