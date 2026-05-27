@@ -121,6 +121,19 @@ _OPENAI_RESPONSES_ACCEPTED_ATTACHMENT_TYPES = (
     "application/pdf",
     "application/xhtml+xml",
 )
+_OPENAI_RESPONSES_IMAGE_GENERATION_CALL_INPUT_FIELDS = frozenset(
+    {
+        "background",
+        "input_image_mask",
+        "model",
+        "moderation",
+        "output_compression",
+        "output_format",
+        "partial_images",
+        "quality",
+        "size",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -767,10 +780,16 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
         }
         if call_id is not None:
             item["call_id"] = call_id
-        if arguments is not None:
-            item.update(copy.deepcopy(arguments))
-        if images:
-            item["results"] = copy.deepcopy(images)
+        result = self._image_generation_result_from_images(images=images)
+        if result is None:
+            if status == "completed":
+                return
+            if arguments is not None:
+                for key in _OPENAI_RESPONSES_IMAGE_GENERATION_CALL_INPUT_FIELDS:
+                    if key in arguments:
+                        item[key] = copy.deepcopy(arguments[key])
+        else:
+            item["result"] = result
         self._emit_context_message(item)
 
     def _append_audio_generation_event(self, *, message: AgentMessage) -> None:
@@ -786,6 +805,21 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
     def _restore_compacted_messages(self, *, messages: list[dict[str, Any]]) -> None:
         for message in messages:
             self._emit_context_message(message)
+
+    @staticmethod
+    def _image_generation_result_from_images(
+        *,
+        images: list[dict[str, Any]],
+    ) -> str | None:
+        for image in images:
+            uri = image.get("uri")
+            if not isinstance(uri, str):
+                continue
+            attachment = _decode_data_url_attachment(uri)
+            if attachment is None:
+                continue
+            return base64.b64encode(attachment.data).decode("ascii")
+        return None
 
     @staticmethod
     def _response_item_type(*, tool_call: _BufferedToolCall) -> str:

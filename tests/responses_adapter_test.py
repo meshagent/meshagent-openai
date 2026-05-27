@@ -231,20 +231,83 @@ def test_make_agent_event_reader_restores_image_generation_with_turn_id() -> Non
             "id": "image-1",
             "status": "completed",
             "call_id": "call-image",
-            "size": "512x512",
-            "results": [
-                {
-                    "uri": "data:image/png;base64,aW1hZ2U=",
-                    "mime_type": "image/png",
-                    "created_at": None,
-                    "created_by": None,
-                    "width": 512,
-                    "height": 512,
-                    "status": "completed",
-                }
-            ],
+            "result": "aW1hZ2U=",
         }
     ]
+
+
+def test_make_agent_event_reader_filters_invalid_image_generation_arguments() -> None:
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    context = adapter.create_session()
+    restored_messages: list[dict[str, object]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+
+    reader.consume(
+        AgentImageGenerationCompleted(
+            type=AGENT_EVENT_IMAGE_GENERATION_COMPLETED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="image-1",
+            call_id="call-image",
+            toolkit="openai",
+            tool="image_generation",
+            arguments={
+                "action": {"commands": ["invalid"]},
+                "quality": "high",
+                "size": "1024x1024",
+            },
+            images=[
+                AgentGeneratedImage(
+                    uri="data:image/png;base64,aW1hZ2U=",
+                    mime_type="image/png",
+                    width=1024,
+                    height=1024,
+                    status="completed",
+                )
+            ],
+        )
+    )
+    reader.finalize()
+    adapter.restore_context_messages(context=context, messages=restored_messages)
+
+    assert context.messages[0]["type"] == "image_generation_call"
+    assert "action" not in context.messages[0]
+    assert "quality" not in context.messages[0]
+    assert "size" not in context.messages[0]
+    assert context.messages[0]["result"] == "aW1hZ2U="
+
+
+def test_make_agent_event_reader_drops_unhydrated_completed_image_generation() -> None:
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    context = adapter.create_session()
+    restored_messages: list[dict[str, object]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+
+    reader.consume(
+        AgentImageGenerationCompleted(
+            type=AGENT_EVENT_IMAGE_GENERATION_COMPLETED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="image-1",
+            call_id="call-image",
+            toolkit="openai",
+            tool="image_generation",
+            arguments={"size": "1024x1024"},
+            images=[
+                AgentGeneratedImage(
+                    uri="dataset://images?id=image-1",
+                    mime_type="image/png",
+                    width=1024,
+                    height=1024,
+                    status="completed",
+                )
+            ],
+        )
+    )
+    reader.finalize()
+    adapter.restore_context_messages(context=context, messages=restored_messages)
+
+    assert context.messages == []
 
 
 def _restore_tool_lifecycle(
