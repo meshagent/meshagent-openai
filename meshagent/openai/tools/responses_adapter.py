@@ -79,6 +79,7 @@ from openai.types.responses import (
     Response,
     ResponseFunctionToolCall,
     ResponseStreamEvent,
+    ResponseToolSearchCall,
 )
 import os
 from typing import Optional, Callable
@@ -134,12 +135,36 @@ _OPENAI_RESPONSES_IMAGE_GENERATION_CALL_INPUT_FIELDS = frozenset(
         "size",
     }
 )
+OpenAIResponsesToolSearchMode = Literal["server", "client"]
+OpenAIResponsesToolSearchConfig = OpenAIResponsesToolSearchMode | bool | None
 
 
 @dataclass(frozen=True)
 class _DataUrlAttachment:
     mime_type: str
     data: bytes
+
+
+@dataclass(frozen=True)
+class OpenAIResponsesToolSearchRequest:
+    item_id: str
+    call_id: str | None
+    query: str | None
+    arguments: Mapping[str, Any]
+
+    @classmethod
+    def from_call(
+        cls, call: ResponseToolSearchCall
+    ) -> "OpenAIResponsesToolSearchRequest":
+        arguments = call.arguments if isinstance(call.arguments, dict) else {}
+        query_value = arguments.get("query")
+        query = query_value if isinstance(query_value, str) else None
+        return cls(
+            item_id=call.id,
+            call_id=call.call_id,
+            query=query,
+            arguments=arguments,
+        )
 
 
 def _decode_data_url_attachment(url: str) -> _DataUrlAttachment | None:
@@ -1053,15 +1078,21 @@ class ResponsesToolBundle:
         toolkits: List[Toolkit],
         *,
         tool_call_approval_handler: ToolCallApprovalHandler | None = None,
+        tool_search: OpenAIResponsesToolSearchMode | None = None,
     ):
         self._toolkits = toolkits
-        self._executors = dict[str, Toolkit]()
-        self._safe_names = {}
-        self._tools_by_name = {}
+        self._executors = dict[tuple[str | None, str], Toolkit]()
+        self._safe_names = dict[tuple[str | None, str], str]()
+        self._unqualified_safe_names = dict[str, tuple[str | None, str]]()
+        self._tools_by_name = dict[tuple[str | None, str], BaseTool]()
+        self._function_tool_definitions: list[dict[str, Any]] = []
 
         open_ai_tools = []
+        has_deferred_function_tools = False
 
         for toolkit in toolkits:
+            namespace_tools: list[dict[str, Any]] = []
+            function_namespace_tools: list[dict[str, Any]] = []
             for tool in toolkit.tools:
                 if isinstance(tool, MCPTool):
                     tool = tool.with_tool_call_approval_handler(
@@ -1072,16 +1103,19 @@ class ResponsesToolBundle:
                 k = v.name
 
                 name = safe_tool_name(k)
+                namespace = safe_tool_name(toolkit.name) if toolkit.name else None
+                tool_key = (namespace, name)
 
-                if k in self._executors:
+                if tool_key in self._executors:
                     raise Exception(
-                        f"duplicate in bundle '{k}', tool names must be unique."
+                        f"duplicate in bundle '{toolkit.name}.{k}', tool names must be unique within a toolkit."
                     )
 
-                self._executors[k] = toolkit
-
-                self._safe_names[name] = k
-                self._tools_by_name[name] = v
+                self._executors[tool_key] = toolkit
+                self._safe_names[tool_key] = k
+                self._tools_by_name[tool_key] = v
+                if name not in self._unqualified_safe_names:
+                    self._unqualified_safe_names[name] = tool_key
 
                 if isinstance(v, OpenAIResponsesTool):
                     fns = v.get_open_ai_tool_definitions()
@@ -1102,31 +1136,87 @@ class ResponsesToolBundle:
                     if v.defs is not None:
                         fn["parameters"]["$defs"] = v.defs
 
-                    open_ai_tools.append(fn)
+                    if tool_search is not None:
+                        fn["defer_loading"] = True
+                        has_deferred_function_tools = True
+
+                    function_namespace_tools.append(fn)
+
+                    if tool_search == "client":
+                        continue
+                    if namespace is None:
+                        open_ai_tools.append(fn)
+                    else:
+                        namespace_tools.append(fn)
 
                 else:
                     raise RoomException(f"unsupported tool type {type(v)}")
+
+            if namespace_tools:
+                open_ai_tools.append(self._namespace_tool(toolkit, namespace_tools))
+
+            if function_namespace_tools:
+                self._function_tool_definitions.append(
+                    self._namespace_tool(toolkit, function_namespace_tools)
+                )
+
+        if has_deferred_function_tools or tool_search == "client":
+            tool_search_tool: dict[str, Any] = {"type": "tool_search"}
+            if tool_search == "client":
+                tool_search_tool.update(
+                    {
+                        "execution": "client",
+                        "description": "Search available MeshAgent tools.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}},
+                            "required": ["query"],
+                            "additionalProperties": False,
+                        },
+                    }
+                )
+            open_ai_tools.insert(0, tool_search_tool)
 
         if len(open_ai_tools) == 0:
             open_ai_tools = None
 
         self._open_ai_tools = open_ai_tools
 
+    @staticmethod
+    def _namespace_tool(
+        toolkit: Toolkit, tools: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        return {
+            "type": "namespace",
+            "name": safe_tool_name(toolkit.name),
+            "description": toolkit.description or toolkit.title or toolkit.name,
+            "tools": tools,
+        }
+
+    def function_tool_definitions(self) -> list[dict[str, Any]]:
+        return copy.deepcopy(self._function_tool_definitions)
+
     async def execute(
         self, *, context: ToolContext, tool_call: ResponseFunctionToolCall
     ) -> Content | AsyncIterable[Any]:
         name = tool_call.name
+        namespace = safe_tool_name(tool_call.namespace) if tool_call.namespace else None
         arguments = json.loads(tool_call.arguments)
+        tool_key = (namespace, name)
 
-        if name not in self._safe_names:
+        if tool_key not in self._safe_names:
+            if namespace is None:
+                tool_key = self._unqualified_safe_names.get(name, tool_key)
+
+        if tool_key not in self._safe_names:
             raise RoomException(f"Invalid tool name {name}, check the name of the tool")
 
-        name = self._safe_names[name]
+        name = self._safe_names[tool_key]
 
-        if name not in self._executors:
+        if tool_key not in self._executors:
             raise Exception(f"Unregistered tool name {name}")
 
-        proxy = self._executors[name]
+        proxy = self._executors[tool_key]
         result = await proxy.execute(
             context=context,
             name=name,
@@ -1137,14 +1227,25 @@ class ResponsesToolBundle:
         return ensure_content(result)
 
     def get_tool(self, name: str) -> BaseTool | None:
-        return self._tools_by_name.get(name, None)
+        tool_key = self._unqualified_safe_names.get(name)
+        if tool_key is None:
+            return None
+        return self._tools_by_name.get(tool_key, None)
 
-    def resolve_function_tool_name(self, safe_name: str) -> tuple[str, str] | None:
-        original_name = self._safe_names.get(safe_name)
+    def resolve_function_tool_name(
+        self, safe_name: str, namespace: str | None
+    ) -> tuple[str, str] | None:
+        tool_key = (safe_tool_name(namespace), safe_name) if namespace else None
+        if tool_key is None or tool_key not in self._safe_names:
+            tool_key = self._unqualified_safe_names.get(safe_name)
+        if tool_key is None:
+            return None
+
+        original_name = self._safe_names.get(tool_key)
         if original_name is None:
             return None
 
-        toolkit = self._executors.get(original_name)
+        toolkit = self._executors.get(tool_key)
         if toolkit is None:
             return None
 
@@ -1363,6 +1464,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         websocket_timeout: float = _default_websocket_timeout_seconds,
         context_management: Literal["auto", "standalone", "none"] = "auto",
         compaction_threshold: Optional[int | float] = None,
+        tool_search: OpenAIResponsesToolSearchConfig = None,
         *,
         base_url: str | None = None,
         api_key: str | None = None,
@@ -1387,6 +1489,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             )
         if compaction_threshold is not None and isinstance(compaction_threshold, bool):
             raise ValueError("compaction_threshold must be an integer or infinity")
+        resolved_tool_search = self._normalize_tool_search_mode(tool_search)
         resolved_compaction_threshold: Optional[int] = None
         if compaction_threshold is None:
             if self.context_window_size(model) != float("inf"):
@@ -1425,6 +1528,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         self._max_retries = max_retries
         self._mode = mode
         self._websocket_timeout = websocket_timeout
+        self._tool_search = resolved_tool_search
         self._max_tool_call_length = max_tool_call_length
         self._max_tool_call_lines = max_tool_call_lines
         self._images_dataset = images_dataset
@@ -1434,6 +1538,20 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             list(allowed_models) if allowed_models is not None else None
         )
         self._tool_call_approval_handler: ToolCallApprovalHandler | None = None
+
+    @staticmethod
+    def _normalize_tool_search_mode(
+        tool_search: OpenAIResponsesToolSearchConfig,
+    ) -> OpenAIResponsesToolSearchMode | None:
+        if tool_search is None or tool_search is False:
+            return None
+        if tool_search is True:
+            return "server"
+        if isinstance(tool_search, str):
+            normalized = tool_search.strip().lower()
+            if normalized in {"server", "client"}:
+                return cast(OpenAIResponsesToolSearchMode, normalized)
+        raise ValueError("tool_search must be one of None, 'server', or 'client'")
 
     def default_model(self) -> str:
         return self._model
@@ -1472,6 +1590,78 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
     ) -> None:
         self._tool_call_approval_handler = handler
 
+    async def search_toolkits(
+        self,
+        *,
+        context: AgentSessionContext,
+        caller: Participant,
+        request: OpenAIResponsesToolSearchRequest,
+        toolkits: list[Toolkit],
+        on_behalf_of: Participant | None = None,
+    ) -> list[Toolkit]:
+        del context, caller, on_behalf_of
+        query = request.query or json.dumps(request.arguments)
+        terms = [term.casefold() for term in re.findall(r"[a-zA-Z0-9_/-]+", query)]
+        if not terms:
+            return []
+
+        matches: list[Toolkit] = []
+        for toolkit in toolkits:
+            searchable_parts = [
+                toolkit.name,
+                toolkit.title,
+                toolkit.description,
+                *toolkit.rules,
+            ]
+            for tool in toolkit.tools:
+                searchable_parts.extend([tool.name, tool.title, tool.description])
+                searchable_parts.extend(tool.rules)
+            haystack = " ".join(
+                part for part in searchable_parts if isinstance(part, str)
+            ).casefold()
+            if any(term in haystack for term in terms):
+                matches.append(toolkit)
+        return matches
+
+    async def _client_tool_search_output(
+        self,
+        *,
+        context: AgentSessionContext,
+        caller: Participant,
+        tool_search_call: ResponseToolSearchCall,
+        toolkits: list[Toolkit],
+        on_behalf_of: Participant | None,
+    ) -> tuple[dict[str, Any], list[Toolkit]]:
+        request = OpenAIResponsesToolSearchRequest.from_call(tool_search_call)
+        found_toolkits = await self.search_toolkits(
+            context=context,
+            caller=caller,
+            request=request,
+            toolkits=toolkits,
+            on_behalf_of=on_behalf_of,
+        )
+        found_bundle = ResponsesToolBundle(
+            toolkits=found_toolkits,
+            tool_call_approval_handler=self._tool_call_approval_handler,
+            tool_search="server",
+        )
+        output: dict[str, Any] = {
+            "type": "tool_search_output",
+            "tools": found_bundle.function_tool_definitions(),
+            "execution": "client",
+            "status": "completed",
+        }
+        if tool_search_call.call_id is not None:
+            output["call_id"] = tool_search_call.call_id
+        output["id"] = self._tool_search_output_id(tool_search_call.id)
+        return output, found_toolkits
+
+    @staticmethod
+    def _tool_search_output_id(tool_search_call_id: str) -> str:
+        if tool_search_call_id.startswith("tsc_"):
+            return f"tso_{tool_search_call_id.removeprefix('tsc_')}"
+        return f"tso_{safe_tool_name(tool_search_call_id)}"
+
     def with_runtime_api_key(self, *, api_key: str | None) -> "OpenAIResponsesAdapter":
         resolved_api_key = resolve_api_key(api_key)
         if (
@@ -1498,6 +1688,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                 if self._compaction_threshold is not None
                 else float("inf")
             ),
+            tool_search=self._tool_search,
             base_url=self._base_url,
             api_key=resolved_api_key,
             user_agent=self._user_agent,
@@ -1889,7 +2080,8 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         tool_bundle = ResponsesToolBundle(
             toolkits=[
                 *(toolkits or []),
-            ]
+            ],
+            tool_search=self._tool_search,
         )
         open_ai_tools = tool_bundle.to_json()
 
@@ -2786,6 +2978,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                     context.previous_messages
                 )
                 context_previous_response_id_snapshot = context.previous_response_id
+                loaded_toolkits: list[Toolkit] = []
                 iteration_committed = False
 
                 def restore_context_snapshot() -> None:
@@ -2816,14 +3009,16 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                             )
 
                             response_name = "response"
+                            effective_toolkits = [*toolkits, *loaded_toolkits]
 
                             # We need to do this inside the loop because tools can change mid loop
                             # for example computer use adds goto tools after the first interaction
                             tool_bundle = ResponsesToolBundle(
                                 toolkits=[
-                                    *toolkits,
+                                    *effective_toolkits,
                                 ],
                                 tool_call_approval_handler=self._tool_call_approval_handler,
+                                tool_search=self._tool_search,
                             )
                             self._set_function_tool_name_resolver(
                                 event_handler=event_handler,
@@ -2912,7 +3107,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                 "input": context.messages,
                                 "tools": open_ai_tools,
                                 "tool_choice": self._resolve_tool_choice(
-                                    toolkits=toolkits,
+                                    toolkits=effective_toolkits,
                                     tool_choice=tool_choice,
                                 ),
                                 "text": text,
@@ -2983,6 +3178,51 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                             "message": safe_model_dump(message),
                                         }
                                     )
+
+                                    if (
+                                        message.type == "tool_search_call"
+                                        and self._tool_search == "client"
+                                        and isinstance(
+                                            message,
+                                            ResponseToolSearchCall,
+                                        )
+                                    ):
+                                        (
+                                            output,
+                                            found_toolkits,
+                                        ) = await self._client_tool_search_output(
+                                            context=context,
+                                            caller=caller,
+                                            tool_search_call=message,
+                                            toolkits=effective_toolkits,
+                                            on_behalf_of=on_behalf_of,
+                                        )
+                                        existing_toolkit_signatures = {
+                                            (
+                                                toolkit.name,
+                                                tuple(
+                                                    tool.name for tool in toolkit.tools
+                                                ),
+                                            )
+                                            for toolkit in effective_toolkits
+                                        }
+                                        for found_toolkit in found_toolkits:
+                                            found_signature = (
+                                                found_toolkit.name,
+                                                tuple(
+                                                    tool.name
+                                                    for tool in found_toolkit.tools
+                                                ),
+                                            )
+                                            if (
+                                                found_signature
+                                                not in existing_toolkit_signatures
+                                            ):
+                                                loaded_toolkits.append(found_toolkit)
+                                                existing_toolkit_signatures.add(
+                                                    found_signature
+                                                )
+                                        return [output], False
 
                                     if message.type == "function_call":
                                         tasks = []

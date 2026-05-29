@@ -19,6 +19,7 @@ from openai.types.responses.response_function_shell_tool_call import (
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai.types.responses.response_output_message import ResponseOutputMessage
 from openai.types.responses.response_output_text import ResponseOutputText
+from openai.types.responses.response_tool_search_call import ResponseToolSearchCall
 from yarl import URL
 
 from meshagent.agents.adapter import ToolCallApprovalRequest
@@ -72,6 +73,7 @@ from meshagent.openai.tools.responses_adapter import (
     OpenAIResponsesAdapter,
     OpenAIResponsesToolResponseAdapter,
     OpenAIResponsesSessionContext,
+    OpenAIResponsesToolSearchRequest,
     ResponsesToolBundle,
     ShellTool,
     WebSearchTool,
@@ -961,6 +963,26 @@ class _InstructionalOpenAIResponsesAdapter(OpenAIResponsesAdapter):
         return "extra adapter instructions"
 
 
+class _HookedToolSearchAdapter(OpenAIResponsesAdapter):
+    def __init__(self, *, found_toolkits: list[Toolkit], **kwargs):
+        super().__init__(**kwargs)
+        self.found_toolkits = found_toolkits
+        self.search_requests: list[OpenAIResponsesToolSearchRequest] = []
+
+    async def search_toolkits(
+        self,
+        *,
+        context,
+        caller,
+        request: OpenAIResponsesToolSearchRequest,
+        toolkits: list[Toolkit],
+        on_behalf_of=None,
+    ) -> list[Toolkit]:
+        del context, caller, toolkits, on_behalf_of
+        self.search_requests.append(request)
+        return self.found_toolkits
+
+
 @pytest.mark.asyncio
 async def test_openai_responses_tool_response_adapter_truncates_text_output() -> None:
     adapter = OpenAIResponsesToolResponseAdapter(
@@ -1158,6 +1180,178 @@ async def test_openai_mcp_tool_bundle_threads_tool_call_approval_handler() -> No
     assert request.toolkit == "docs"
     assert request.tool == "read_wiki_structure"
     assert request.arguments == {"path": "/data"}
+
+
+@pytest.mark.asyncio
+async def test_responses_tool_bundle_uses_toolkit_namespaces_for_function_tools() -> (
+    None
+):
+    alpha_tool = _AnyArgsTool("lookup")
+    beta_tool = _AnyArgsTool("lookup")
+    bundle = ResponsesToolBundle(
+        toolkits=[
+            Toolkit(name="alpha", description="Alpha tools.", tools=[alpha_tool]),
+            Toolkit(name="beta", description="Beta tools.", tools=[beta_tool]),
+        ]
+    )
+
+    assert bundle.to_json() == [
+        {
+            "type": "namespace",
+            "name": "alpha",
+            "description": "Alpha tools.",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "test tool",
+                    "parameters": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    },
+                    "strict": True,
+                }
+            ],
+        },
+        {
+            "type": "namespace",
+            "name": "beta",
+            "description": "Beta tools.",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "test tool",
+                    "parameters": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    },
+                    "strict": True,
+                }
+            ],
+        },
+    ]
+    assert bundle.resolve_function_tool_name("lookup", "alpha") == ("alpha", "lookup")
+    assert bundle.resolve_function_tool_name("lookup", "beta") == ("beta", "lookup")
+
+    alpha_result = await bundle.execute(
+        context=ToolContext(caller=_FakeParticipant()),
+        tool_call=ResponseFunctionToolCall(
+            id="call-alpha",
+            name="lookup",
+            namespace="alpha",
+            call_id="call-alpha",
+            arguments='{"value":"alpha"}',
+            type="function_call",
+            status="completed",
+        ),
+    )
+    beta_result = await bundle.execute(
+        context=ToolContext(caller=_FakeParticipant()),
+        tool_call=ResponseFunctionToolCall(
+            id="call-beta",
+            name="lookup",
+            namespace="beta",
+            call_id="call-beta",
+            arguments='{"value":"beta"}',
+            type="function_call",
+            status="completed",
+        ),
+    )
+
+    assert isinstance(alpha_result, JsonContent)
+    assert isinstance(beta_result, JsonContent)
+    assert alpha_result.json == {"ok": True, "args": {"value": "alpha"}}
+    assert beta_result.json == {"ok": True, "args": {"value": "beta"}}
+
+
+def test_responses_tool_bundle_defers_function_tools_when_tool_search_enabled() -> None:
+    bundle = ResponsesToolBundle(
+        toolkits=[
+            Toolkit(
+                name="alpha",
+                description="Alpha tools.",
+                tools=[_AnyArgsTool("lookup")],
+            ),
+            Toolkit(name="openai", tools=[WebSearchTool()]),
+            Toolkit(name="shell", tools=[ShellTool()]),
+        ],
+        tool_search="server",
+    )
+
+    tools = bundle.to_json()
+    assert tools == [
+        {"type": "tool_search"},
+        {
+            "type": "namespace",
+            "name": "alpha",
+            "description": "Alpha tools.",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "test tool",
+                    "parameters": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    },
+                    "strict": True,
+                    "defer_loading": True,
+                }
+            ],
+        },
+        {"type": "web_search"},
+        {"type": "shell"},
+    ]
+    assert bundle.function_tool_definitions() == [
+        {
+            "type": "namespace",
+            "name": "alpha",
+            "description": "Alpha tools.",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "test tool",
+                    "parameters": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    },
+                    "strict": True,
+                    "defer_loading": True,
+                }
+            ],
+        }
+    ]
+
+
+def test_responses_tool_bundle_client_tool_search_exposes_only_search_tool() -> None:
+    bundle = ResponsesToolBundle(
+        toolkits=[
+            Toolkit(
+                name="alpha",
+                description="Alpha tools.",
+                tools=[_AnyArgsTool("lookup")],
+            ),
+            Toolkit(name="openai", tools=[WebSearchTool()]),
+        ],
+        tool_search="client",
+    )
+
+    assert bundle.to_json() == [
+        {
+            "type": "tool_search",
+            "execution": "client",
+            "description": "Search available MeshAgent tools.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+        {"type": "web_search"},
+    ]
 
 
 class _FakeCompletedEvent:
@@ -1510,15 +1704,19 @@ def _make_function_tool_call(
     tool_name: str,
     call_id: str,
     arguments: dict[str, object],
+    namespace: str | None = None,
 ) -> ResponseFunctionToolCall:
-    return ResponseFunctionToolCall(
-        id=item_id,
-        name=tool_name,
-        call_id=call_id,
-        arguments=json.dumps(arguments),
-        type="function_call",
-        status="completed",
-    )
+    kwargs: dict[str, object] = {
+        "id": item_id,
+        "name": tool_name,
+        "call_id": call_id,
+        "arguments": json.dumps(arguments),
+        "type": "function_call",
+        "status": "completed",
+    }
+    if namespace is not None:
+        kwargs["namespace"] = namespace
+    return ResponseFunctionToolCall(**kwargs)
 
 
 def _make_shell_tool_call(
@@ -1618,6 +1816,7 @@ def test_openai_responses_adapter_with_runtime_api_key_returns_bound_clone(
     adapter = OpenAIResponsesAdapter(
         model="gpt-4o",
         response_options={"metadata": {"tag": "original"}},
+        tool_search="client",
     )
     approval_handler = lambda request: request  # noqa: E731
     adapter.set_tool_call_approval_handler(approval_handler)
@@ -1626,6 +1825,7 @@ def test_openai_responses_adapter_with_runtime_api_key_returns_bound_clone(
 
     assert bound is not adapter
     assert bound._api_key == "runtime-token"
+    assert bound._tool_search == "client"
     assert bound._response_options == {"metadata": {"tag": "original"}}
     assert bound._response_options is not adapter._response_options
     assert bound._tool_call_approval_handler is approval_handler
@@ -3132,6 +3332,119 @@ async def test_next_drops_post_tool_response_items_before_steering_in_request_mo
             "content": "steer now",
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_client_tool_search_hook_loads_toolkits_for_later_function_call() -> None:
+    discovered_toolkit = Toolkit(
+        name="alpha",
+        description="Alpha tools.",
+        tools=[_AnyArgsTool("lookup")],
+    )
+    client = _FakeOpenAIClient(
+        outcomes=[
+            _FakeResponse(
+                response_id="resp_search",
+                output=[
+                    ResponseToolSearchCall(
+                        id="tool-search-1",
+                        call_id="call_search_1",
+                        arguments={"query": "lookup"},
+                        execution="client",
+                        status="completed",
+                        type="tool_search_call",
+                    )
+                ],
+            ),
+            _FakeResponse(
+                response_id="resp_tool",
+                output=[
+                    _make_function_tool_call(
+                        item_id="tool-1",
+                        tool_name="lookup",
+                        namespace="alpha",
+                        call_id="call_1",
+                        arguments={"value": "found"},
+                    )
+                ],
+            ),
+            _FakeResponse(
+                response_id="resp_done",
+                output=[_make_output_message(message_id="msg_1", text="done")],
+            ),
+        ]
+    )
+    adapter = _HookedToolSearchAdapter(
+        found_toolkits=[discovered_toolkit],
+        mode="request",
+        client=client,
+        model="gpt-4.1-mini",
+        tool_search="client",
+    )
+    context = adapter.create_session()
+    context.append_user_message("find and run tool")
+
+    result = await adapter.create_response(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        toolkits=[],
+    )
+
+    assert result == "done"
+    assert len(adapter.search_requests) == 1
+    assert adapter.search_requests[0] == OpenAIResponsesToolSearchRequest(
+        item_id="tool-search-1",
+        call_id="call_search_1",
+        query="lookup",
+        arguments={"query": "lookup"},
+    )
+    assert client.responses.create_kwargs[0]["tools"] == [
+        {
+            "type": "tool_search",
+            "execution": "client",
+            "description": "Search available MeshAgent tools.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        }
+    ]
+    second_input = client.responses.create_kwargs[1]["input"]
+    assert second_input[-1] == {
+        "type": "tool_search_output",
+        "tools": [
+            {
+                "type": "namespace",
+                "name": "alpha",
+                "description": "Alpha tools.",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "lookup",
+                        "description": "test tool",
+                        "parameters": {
+                            "type": "object",
+                            "additionalProperties": True,
+                        },
+                        "strict": True,
+                        "defer_loading": True,
+                    }
+                ],
+            }
+        ],
+        "execution": "client",
+        "status": "completed",
+        "call_id": "call_search_1",
+        "id": "tso_tool-search-1",
+    }
+    third_input = client.responses.create_kwargs[2]["input"]
+    assert third_input[-1] == {
+        "output": json.dumps({"ok": True, "args": {"value": "found"}}),
+        "call_id": "call_1",
+        "type": "function_call_output",
+    }
 
 
 @pytest.mark.asyncio

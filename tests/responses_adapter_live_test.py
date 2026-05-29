@@ -24,6 +24,7 @@ from meshagent.computers.operator import Operator
 from meshagent.openai.tools.responses_adapter import (
     ApplyPatchTool,
     OpenAIResponsesAdapter,
+    OpenAIResponsesToolSearchRequest,
     ShellTool,
 )
 from meshagent.tools import FunctionTool, Toolkit
@@ -247,6 +248,26 @@ class _RecordingOpenAIResponsesAdapter(OpenAIResponsesAdapter):
         )
 
 
+class _LiveClientToolSearchAdapter(_RecordingOpenAIResponsesAdapter):
+    def __init__(self, *, found_toolkits: list[Toolkit], **kwargs):
+        super().__init__(**kwargs)
+        self.found_toolkits = found_toolkits
+        self.search_requests: list[OpenAIResponsesToolSearchRequest] = []
+
+    async def search_toolkits(
+        self,
+        *,
+        context,
+        caller,
+        request: OpenAIResponsesToolSearchRequest,
+        toolkits: list[Toolkit],
+        on_behalf_of=None,
+    ) -> list[Toolkit]:
+        del context, caller, toolkits, on_behalf_of
+        self.search_requests.append(request)
+        return self.found_toolkits
+
+
 class _LiveBrowserComputer:
     environment = "browser"
     dimensions = (1440, 900)
@@ -437,6 +458,190 @@ async def test_live_openai_adapter_receives_tool_preamble_message():
         default=str,
     )
     assert _message_text(preamble).strip() != ""
+
+
+@pytest.mark.asyncio
+async def test_live_openai_adapter_uses_duplicate_tool_names_in_different_namespaces():
+    room = _FakeRoom()
+    alpha_tool = _SteeringProbeTool(name="identity", wait_for_release=False)
+    beta_tool = _SteeringProbeTool(name="identity", wait_for_release=False)
+    adapter = _RecordingOpenAIResponsesAdapter(
+        model=os.getenv("OPENAI_NAMESPACE_TEST_MODEL", "gpt-5.2"),
+        mode="request",
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        reasoning_effort=os.getenv("OPENAI_NAMESPACE_TEST_REASONING_EFFORT", "none"),
+        max_output_tokens=2048,
+        max_retries=2,
+    )
+    context = adapter.create_session()
+    context.instructions = (
+        "Use tools when asked. Tool names may repeat across namespaces; use the "
+        "namespace named by the user."
+    )
+    context.append_user_message(
+        "Call the alpha namespace identity tool exactly once with note='alpha-live'. "
+        "Call the beta namespace identity tool exactly once with note='beta-live'. "
+        "After both tool results return, reply with exactly DONE and nothing else."
+    )
+
+    result = await asyncio.wait_for(
+        adapter.create_response(
+            context=context,
+            caller=room.local_participant,
+            toolkits=[
+                Toolkit(name="alpha", tools=[alpha_tool]),
+                Toolkit(name="beta", tools=[beta_tool]),
+            ],
+        ),
+        timeout=180.0,
+    )
+
+    tools = adapter.recorded_create_kwargs[0]["tools"]
+    assert isinstance(tools, list)
+    assert [
+        tool.get("name")
+        for tool in tools
+        if isinstance(tool, dict) and tool.get("type") == "namespace"
+    ] == ["alpha", "beta"]
+    assert alpha_tool.calls == ["alpha-live"]
+    assert beta_tool.calls == ["beta-live"]
+    assert isinstance(result, str)
+    assert result.strip() == "DONE"
+    assert any(
+        item.get("type") == "function_call" and item.get("namespace") == "alpha"
+        for item in context.previous_messages
+    )
+    assert any(
+        item.get("type") == "function_call" and item.get("namespace") == "beta"
+        for item in context.previous_messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_openai_adapter_finds_deferred_function_tools_with_tool_search():
+    room = _FakeRoom()
+    tool = _SteeringProbeTool(name="identity", wait_for_release=False)
+    adapter = _RecordingOpenAIResponsesAdapter(
+        model=os.getenv("OPENAI_TOOL_SEARCH_TEST_MODEL", "gpt-5.2"),
+        mode="request",
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        reasoning_effort=os.getenv("OPENAI_TOOL_SEARCH_TEST_REASONING_EFFORT", "none"),
+        max_output_tokens=2048,
+        max_retries=2,
+        tool_search="server",
+    )
+    context = adapter.create_session()
+    context.instructions = "Use tool search to find tools before calling them."
+    context.append_user_message(
+        "Find the tool that echoes notes and call it exactly once with "
+        "note='search-live'. After the tool result returns, reply with exactly DONE."
+    )
+
+    result = await asyncio.wait_for(
+        adapter.create_response(
+            context=context,
+            caller=room.local_participant,
+            toolkits=[
+                Toolkit(
+                    name="alpha",
+                    description="Contains a tool that echoes notes.",
+                    tools=[tool],
+                )
+            ],
+        ),
+        timeout=180.0,
+    )
+
+    tools = adapter.recorded_create_kwargs[0]["tools"]
+    assert isinstance(tools, list)
+    assert tools[0] == {"type": "tool_search"}
+    namespace_tool = next(
+        tool
+        for tool in tools
+        if isinstance(tool, dict) and tool.get("type") == "namespace"
+    )
+    namespace_tools = namespace_tool["tools"]
+    assert isinstance(namespace_tools, list)
+    assert namespace_tools[0].get("defer_loading") is True
+    assert tool.calls == ["search-live"]
+    assert isinstance(result, str)
+    assert result.strip() == "DONE"
+    assert any(
+        item.get("type") == "tool_search_call" for item in context.previous_messages
+    )
+    assert any(
+        item.get("type") == "tool_search_output" for item in context.previous_messages
+    )
+    assert any(
+        item.get("type") == "function_call" and item.get("namespace") == "alpha"
+        for item in context.previous_messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_openai_adapter_client_tool_search_loads_toolkits_from_hook():
+    room = _FakeRoom()
+    tool = _SteeringProbeTool(name="identity", wait_for_release=False)
+    adapter = _LiveClientToolSearchAdapter(
+        found_toolkits=[
+            Toolkit(
+                name="alpha",
+                description="Contains a tool that echoes notes.",
+                tools=[tool],
+            )
+        ],
+        model=os.getenv("OPENAI_TOOL_SEARCH_TEST_MODEL", "gpt-5.2"),
+        mode="request",
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        reasoning_effort=os.getenv("OPENAI_TOOL_SEARCH_TEST_REASONING_EFFORT", "none"),
+        max_output_tokens=2048,
+        max_retries=2,
+        tool_search="client",
+    )
+    context = adapter.create_session()
+    context.instructions = "Use tool search to find tools before calling them."
+    context.append_user_message(
+        "Find the tool that echoes notes and call it exactly once with "
+        "note='client-search-live'. After the tool result returns, reply with exactly DONE."
+    )
+
+    result = await asyncio.wait_for(
+        adapter.create_response(
+            context=context,
+            caller=room.local_participant,
+            toolkits=[],
+        ),
+        timeout=180.0,
+    )
+
+    first_tools = adapter.recorded_create_kwargs[0]["tools"]
+    assert first_tools == [
+        {
+            "type": "tool_search",
+            "execution": "client",
+            "description": "Search available MeshAgent tools.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        }
+    ]
+    assert len(adapter.search_requests) >= 1
+    assert tool.calls == ["client-search-live"]
+    assert isinstance(result, str)
+    assert result.strip() == "DONE"
+    assert any(
+        item.get("type") == "tool_search_call" for item in context.previous_messages
+    )
+    assert any(
+        item.get("type") == "tool_search_output" for item in context.previous_messages
+    )
+    assert any(
+        item.get("type") == "function_call" and item.get("namespace") == "alpha"
+        for item in context.previous_messages
+    )
 
 
 @pytest.mark.asyncio
