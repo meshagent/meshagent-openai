@@ -604,7 +604,13 @@ class _OpenAIRealtimeAgentEventReader(AccumulatingAgentEventReader):
             }
         )
 
-    def _append_assistant_reasoning(self, *, text: str) -> None:
+    def _append_assistant_reasoning(
+        self,
+        *,
+        text: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        del metadata
         self._append_assistant_text(text=f"Reasoning: {text}", phase=None)
 
     def _append_assistant_file(self, *, url: str) -> None:
@@ -886,10 +892,8 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
             raise RoomException(
                 "OpenAIRealtimeAdapter requires OpenAIRealtimeSessionContext from create_session()"
             )
-        context.previous_messages.clear()
-        context.previous_messages.extend(copy.deepcopy(messages))
         context.messages.clear()
-        context.previous_response_id = None
+        context.messages.extend(copy.deepcopy(messages))
         context._synced_message_count = 0
 
     def make_agent_event_publisher(
@@ -1178,6 +1182,7 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
                 id=tool_call.get("id"),
                 call_id=tool_call.get("call_id"),
                 name=tool_call["name"],
+                namespace=tool_call.get("namespace"),
                 arguments=tool_call["arguments"],
             )
             tool_result = await tool_bundle.execute(
@@ -1189,12 +1194,12 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
                 tool_call=realtime_tool_call,
                 response=tool_result,
             )
-            context.previous_messages.append(dict(tool_call))
+            context.messages.append(dict(tool_call))
             for output_message in tool_output_messages:
                 await self._send_conversation_item(
                     context=context, message=output_message
                 )
-                context.previous_messages.append(output_message)
+                context.messages.append(output_message)
                 if event_handler is not None:
                     event_handler(
                         {
@@ -1202,9 +1207,7 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
                             "item": dict(output_message),
                         }
                     )
-            context._synced_message_count = len(
-                [*context.previous_messages, *context.messages]
-            )
+            context._synced_message_count = len(context.messages)
 
         await self._send_response_create(
             context=context,
@@ -1556,6 +1559,11 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
                     "id": item_id if isinstance(item_id, str) else call_id,
                     "call_id": call_id if isinstance(call_id, str) else item_id,
                     "name": name,
+                    "namespace": (
+                        item.get("namespace")
+                        if isinstance(item.get("namespace"), str)
+                        else None
+                    ),
                     "arguments": arguments if isinstance(arguments, str) else "{}",
                     "status": "completed",
                 }
@@ -1565,10 +1573,7 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
     async def _sync_text_messages(
         self, *, context: OpenAIRealtimeSessionContext
     ) -> None:
-        messages: list[dict[str, Any]] = [
-            *context.previous_messages,
-            *context.messages,
-        ]
+        messages = context.messages
         if context._synced_message_count > len(messages):
             context._synced_message_count = 0
 
@@ -1741,23 +1746,15 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
                     raise
 
             terminal_event = await future
-            response_id = self._response_id(terminal_event)
-            if response_id is not None:
-                context.track_response(response_id)
-            else:
-                context.previous_messages.extend(context.messages)
-                context.messages.clear()
             assistant_text = self._response_text(terminal_event)
             if assistant_text != "":
-                context.previous_messages.append(
+                context.messages.append(
                     {"role": "assistant", "content": assistant_text}
                 )
 
             tool_calls = self._response_function_calls(terminal_event)
             if not tool_calls:
-                context._synced_message_count = len(
-                    [*context.previous_messages, *context.messages]
-                )
+                context._synced_message_count = len(context.messages)
                 break
 
             tool_bundle = ResponsesToolBundle(toolkits=[*toolkits])
@@ -1786,6 +1783,7 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
                     id=tool_call.get("id"),
                     call_id=tool_call.get("call_id"),
                     name=tool_call["name"],
+                    namespace=tool_call.get("namespace"),
                     arguments=tool_call["arguments"],
                 )
                 tool_result = await tool_bundle.execute(
@@ -1797,12 +1795,12 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
                     tool_call=realtime_tool_call,
                     response=tool_result,
                 )
-                context.previous_messages.append(tool_call)
+                context.messages.append(tool_call)
                 for output_message in tool_output_messages:
                     await self._send_conversation_item(
                         context=context, message=output_message
                     )
-                    context.previous_messages.append(output_message)
+                    context.messages.append(output_message)
                     if event_handler is not None:
                         event_handler(
                             {
@@ -1810,9 +1808,7 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
                                 "item": dict(output_message),
                             }
                         )
-                context._synced_message_count = len(
-                    [*context.previous_messages, *context.messages]
-                )
+                context._synced_message_count = len(context.messages)
 
         if terminal_event is None:
             raise RoomException(

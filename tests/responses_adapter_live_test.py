@@ -7,18 +7,25 @@ import struct
 import zlib
 
 import aiohttp
+import pyarrow as pa
 import pytest
 from openai import AsyncOpenAI
 from openai.types.responses.response_computer_tool_call import ResponseComputerToolCall
 
+from meshagent.agents.dataset_thread_storage import DatasetThreadStorage
 from meshagent.agents.messages import (
+    AGENT_EVENT_CONTEXT_COMPACTED,
     AGENT_MESSAGE_TURN_START,
+    AgentContextCompacted,
     AgentMessage,
+    AgentThreadMessage,
     AgentToolCallArgumentsDelta,
     ToolChoice,
     TurnStart,
 )
 from meshagent.agents.process import AgentSupervisor, LLMAgentProcess, Message
+from meshagent.api import DatasetJson, Participant, RoomException
+from meshagent.anthropic.messages_adapter import AnthropicMessagesAdapter
 from meshagent.computers.agent import ComputerToolkit
 from meshagent.computers.operator import Operator
 from meshagent.openai.tools.responses_adapter import (
@@ -43,6 +50,19 @@ pytestmark = pytest.mark.skipif(
     not _should_run_live_openai_tests(),
     reason="set RUN_OPENAI_LIVE_TESTS=1 and OPENAI_API_KEY to run live OpenAI tests",
 )
+
+
+def _anthropic_client_if_key_set():
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if api_key is None or api_key.strip() == "":
+        pytest.skip("ANTHROPIC_API_KEY not set")
+
+    try:
+        from anthropic import AsyncAnthropic
+    except Exception as error:
+        pytest.skip(f"anthropic SDK unavailable: {error}")
+
+    return AsyncAnthropic(api_key=api_key)
 
 
 def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
@@ -84,6 +104,136 @@ class _FakeParticipant:
 class _FakeRoom:
     local_participant = _FakeParticipant()
     developer = _FakeDeveloper()
+
+
+class _FakeDatasets:
+    def __init__(self) -> None:
+        self.schemas: dict[tuple[tuple[str, ...], str], pa.Schema] = {}
+        self.rows: dict[tuple[tuple[str, ...], str], list[dict[str, object]]] = {}
+
+    @staticmethod
+    def _key(
+        *,
+        table: str | None = None,
+        name: str | None = None,
+        namespace: list[str] | None,
+    ) -> tuple[tuple[str, ...], str]:
+        table_name = table if table is not None else name
+        assert table_name is not None
+        return (tuple(namespace or []), table_name)
+
+    async def create_table_with_schema(
+        self,
+        *,
+        name: str,
+        schema: pa.Schema,
+        mode: str,
+        namespace: list[str] | None = None,
+    ) -> None:
+        del mode
+        key = self._key(name=name, namespace=namespace)
+        self.schemas.setdefault(key, schema)
+        self.rows.setdefault(key, [])
+
+    async def inspect(
+        self,
+        *,
+        table: str,
+        namespace: list[str] | None = None,
+    ) -> pa.Schema:
+        return self.schemas[self._key(table=table, namespace=namespace)]
+
+    async def add_columns(
+        self,
+        *,
+        table: str,
+        new_columns: dict[str, pa.Field],
+        namespace: list[str] | None = None,
+    ) -> None:
+        key = self._key(table=table, namespace=namespace)
+        self.schemas[key] = pa.schema([*self.schemas[key], *new_columns.values()])
+
+    async def search(
+        self,
+        *,
+        table: str,
+        namespace: list[str] | None = None,
+        where: str | dict[str, object] | None = None,
+        limit: int | None = None,
+        select: list[str] | None = None,
+    ) -> pa.Table:
+        key = self._key(table=table, namespace=namespace)
+        rows = list(self.rows.get(key, []))
+        if isinstance(where, dict):
+            rows = [
+                row
+                for row in rows
+                if all(row.get(field) == value for field, value in where.items())
+            ]
+        if limit is not None:
+            rows = rows[:limit]
+        if select is not None:
+            rows = [{field: row.get(field) for field in select} for row in rows]
+        return pa.Table.from_pylist(rows)
+
+    async def insert(
+        self,
+        *,
+        table: str,
+        records: list[dict[str, object]],
+        namespace: list[str] | None = None,
+    ) -> None:
+        key = self._key(table=table, namespace=namespace)
+        self.rows.setdefault(key, []).extend(
+            self._stored_record(record) for record in records
+        )
+
+    async def update(
+        self,
+        *,
+        table: str,
+        where: str,
+        values: dict[str, object],
+        namespace: list[str] | None = None,
+    ) -> None:
+        prefix = "sequence = "
+        assert where.startswith(prefix)
+        sequence = int(where[len(prefix) :])
+        key = self._key(table=table, namespace=namespace)
+        stored_values = self._stored_record(values)
+        for row in self.rows.setdefault(key, []):
+            if row.get("sequence") == sequence:
+                row.update(stored_values)
+                return
+        raise AssertionError(f"row not found for {where}")
+
+    async def optimize(
+        self,
+        *,
+        table: str,
+        namespace: list[str] | None = None,
+        config: object = None,
+    ) -> None:
+        del table
+        del namespace
+        del config
+
+    @staticmethod
+    def _stored_record(record: dict[str, object]) -> dict[str, object]:
+        return {
+            key: value.to_json() if isinstance(value, DatasetJson) else value
+            for key, value in record.items()
+        }
+
+
+class _FakeDatasetRoom:
+    def __init__(self) -> None:
+        self.datasets = _FakeDatasets()
+        self.local_participant = Participant(
+            id="local",
+            attributes={"name": "agent"},
+        )
+        self.developer = _FakeDeveloper()
 
 
 class _RecordingSupervisor(AgentSupervisor):
@@ -186,6 +336,50 @@ def _message_text(item: dict[str, object]) -> str:
     return "".join(parts)
 
 
+def _has_item_type(messages: list[dict[str, object]], item_type: str) -> bool:
+    return any(item.get("type") == item_type for item in messages)
+
+
+def _has_encrypted_reasoning(messages: list[dict[str, object]]) -> bool:
+    return any(
+        item.get("type") == "reasoning"
+        and isinstance(item.get("encrypted_content"), str)
+        and item["encrypted_content"] != ""
+        for item in messages
+    )
+
+
+def _has_restored_tool_transcript_fallback(messages: list[dict[str, object]]) -> bool:
+    for item in messages:
+        content = item.get("content")
+        if isinstance(content, str) and content.startswith("Tool result from "):
+            return True
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if isinstance(text, str) and text.startswith("Called tool "):
+                return True
+    return False
+
+
+def _restore_agent_messages_with_adapter(
+    *,
+    adapter,
+    messages: list[AgentMessage],
+):
+    context = adapter.create_session()
+    restored_messages: list[dict[str, object]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+    for message in messages:
+        reader.consume(message)
+    reader.finalize()
+    adapter.restore_context_messages(context=context, messages=restored_messages)
+    return context
+
+
 async def _wait_until(predicate, *, interval: float = 0.05) -> None:
     while not await predicate():
         await asyncio.sleep(interval)
@@ -246,6 +440,44 @@ class _RecordingOpenAIResponsesAdapter(OpenAIResponsesAdapter):
             create_kwargs=create_kwargs,
             extra_headers=extra_headers,
         )
+
+
+class _InterruptingWebsocketOpenAIResponsesAdapter(_RecordingOpenAIResponsesAdapter):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.interruptions = 0
+
+    async def _create_response_websocket_stream(
+        self,
+        *,
+        context,
+        openai,
+        create_kwargs: dict,
+        extra_headers: dict[str, str],
+    ):
+        stream = await super()._create_response_websocket_stream(
+            context=context,
+            openai=openai,
+            create_kwargs=create_kwargs,
+            extra_headers=extra_headers,
+        )
+        if self.interruptions > 0:
+            return stream
+
+        self.interruptions += 1
+
+        async def interrupted_stream():
+            saw_event = False
+            async for event in stream:
+                saw_event = True
+                yield event
+                await context.close_websocket()
+                raise RoomException("OpenAI websocket interrupted by test")
+            if not saw_event:
+                await context.close_websocket()
+                raise RoomException("OpenAI websocket interrupted by test")
+
+        return interrupted_stream()
 
 
 class _LiveClientToolSearchAdapter(_RecordingOpenAIResponsesAdapter):
@@ -377,6 +609,15 @@ async def test_live_openai_auto_compaction_threshold_reports_compacted_next_call
     assert context.last_usage is not None
     assert context.last_usage.context_window_used is not None
     assert context.last_usage.context_window_used <= threshold
+    assert context.messages
+    assert context.messages[0].get("type") == "compaction"
+    assert (
+        "durable context used only for a compaction threshold probe"
+        not in json.dumps(
+            context.messages,
+            default=str,
+        )
+    )
 
     context.append_user_message("Reply with OK only.")
     second_result = await asyncio.wait_for(
@@ -392,6 +633,206 @@ async def test_live_openai_auto_compaction_threshold_reports_compacted_next_call
     assert context.last_usage is not None
     second_input_tokens = context.last_usage.usage["input_tokens"]
     assert second_input_tokens <= threshold
+
+
+@pytest.mark.asyncio
+async def test_live_openai_dataset_restore_uses_context_since_last_compaction():
+    thread_id = "dataset://threads/live-openai-compaction-restore"
+    threshold = int(os.getenv("OPENAI_COMPACTION_TEST_THRESHOLD", "1000"))
+    model = os.getenv("OPENAI_COMPACTION_TEST_MODEL", "gpt-5.2")
+    room = _FakeDatasetRoom()
+    storage = DatasetThreadStorage(
+        room=room,
+        path=thread_id,
+        max_append_message_count=1,
+        optimize_after_append_count=1000,
+        persist_deltas=True,
+    )
+    await storage.start()
+    try:
+        await storage.wait_until_ready()
+        adapter = _RecordingOpenAIResponsesAdapter(
+            model=model,
+            mode="request",
+            client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+            context_management="auto",
+            compaction_threshold=threshold,
+            max_output_tokens=2048,
+            max_retries=2,
+        )
+        context = adapter.create_session()
+        marker = "PRE_COMPACTION_MARKER_DO_NOT_RESTORE"
+        context.append_user_message("Store synthetic notes and reply OK only.")
+        for index in range(20):
+            context.append_assistant_message(
+                f"{marker} block {index}: "
+                + ("alpha bravo charlie delta echo foxtrot " * 100)
+            )
+        context.append_user_message("Reply with OK only.")
+
+        published_messages: list[AgentMessage] = []
+
+        def publish_message(message: AgentMessage) -> None:
+            published_messages.append(message)
+            if isinstance(message, AgentThreadMessage):
+                storage.push_message(message=message, sender=room.local_participant)
+
+        event_handler = adapter.make_agent_event_publisher(
+            turn_id="turn-1",
+            thread_id=thread_id,
+            callback=publish_message,
+        )
+        result = await asyncio.wait_for(
+            adapter.create_response(
+                context=context,
+                caller=room.local_participant,
+                toolkits=[],
+                event_handler=event_handler,
+            ),
+            timeout=180.0,
+        )
+        await storage.flush()
+
+        assert isinstance(result, str)
+        compacted_messages = [
+            message
+            for message in published_messages
+            if isinstance(message, AgentContextCompacted)
+        ]
+        assert compacted_messages
+        assert compacted_messages[-1].messages is not None
+
+        restored_context = adapter.create_session()
+        await storage.restore_session_context_async(
+            context=restored_context,
+            llm_adapter=adapter,
+        )
+        restored_payload = json.dumps(restored_context.messages, default=str)
+        assert marker not in restored_payload
+        assert restored_context.messages
+        assert restored_context.messages[0].get("type") == "compaction"
+        assert AGENT_EVENT_CONTEXT_COMPACTED not in restored_payload
+        assert "created_by" not in restored_payload
+
+        restored_context.append_user_message("Reply with OK only.")
+        restored_result = await asyncio.wait_for(
+            adapter.create_response(
+                context=restored_context,
+                caller=room.local_participant,
+                toolkits=[],
+            ),
+            timeout=180.0,
+        )
+        assert isinstance(restored_result, str)
+        restored_request = adapter.recorded_create_kwargs[-1]
+        assert "previous_response_id" not in restored_request
+        assert restored_request["store"] is False
+        restored_input = restored_request["input"]
+        assert isinstance(restored_input, list)
+        assert restored_input[0].get("type") == "compaction"
+        restored_request_payload = json.dumps(restored_input, default=str)
+        assert marker not in restored_request_payload
+        assert AGENT_EVENT_CONTEXT_COMPACTED not in restored_request_payload
+        assert "created_by" not in restored_request_payload
+    finally:
+        await storage.stop()
+
+
+@pytest.mark.asyncio
+async def test_live_openai_websocket_reconnect_resends_current_context_after_midstream_interrupt():
+    prompt = (
+        "This is a websocket retry test. Reply with exactly WEBSOCKET_RESTORED "
+        "and nothing else."
+    )
+    adapter = _InterruptingWebsocketOpenAIResponsesAdapter(
+        model=os.getenv("OPENAI_WEBSOCKET_RECONNECT_TEST_MODEL", "gpt-5.2"),
+        mode="websocket",
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        max_output_tokens=512,
+        max_retries=2,
+    )
+    context = adapter.create_session()
+    context.append_user_message(prompt)
+
+    try:
+        result = await asyncio.wait_for(
+            adapter.create_response(
+                context=context,
+                caller=_FakeRoom().local_participant,
+                toolkits=[],
+                event_handler=lambda event: None,
+            ),
+            timeout=180.0,
+        )
+    finally:
+        await context.close()
+
+    assert adapter.interruptions == 1
+    assert isinstance(result, str)
+    assert "WEBSOCKET_RESTORED" in result
+    assert len(adapter.recorded_create_kwargs) >= 2
+    first_request = adapter.recorded_create_kwargs[0]
+    retry_request = adapter.recorded_create_kwargs[1]
+    assert "previous_response_id" not in first_request
+    assert "previous_response_id" not in retry_request
+    assert first_request["store"] is False
+    assert retry_request["store"] is False
+    assert first_request["input"] == [{"role": "user", "content": prompt}]
+    assert retry_request["input"] == first_request["input"]
+
+
+@pytest.mark.asyncio
+async def test_live_openai_multiturn_resends_full_stateless_context():
+    marker = "stateless-context-blue-47"
+    adapter = _RecordingOpenAIResponsesAdapter(
+        model=os.getenv("OPENAI_MULTITURN_TEST_MODEL", "gpt-5.2"),
+        mode="request",
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        reasoning_effort=os.getenv("OPENAI_MULTITURN_TEST_REASONING_EFFORT", "none"),
+        max_output_tokens=512,
+        max_retries=2,
+    )
+    context = adapter.create_session()
+    context.append_user_message(
+        f"The marker in this conversation transcript is {marker}. Reply with OK only."
+    )
+    first_result = await asyncio.wait_for(
+        adapter.create_response(
+            context=context,
+            caller=_FakeRoom().local_participant,
+            toolkits=[],
+        ),
+        timeout=120.0,
+    )
+    assert isinstance(first_result, str)
+
+    context.append_user_message(
+        "Read the conversation transcript. What is the marker? Reply with the marker only."
+    )
+    second_result = await asyncio.wait_for(
+        adapter.create_response(
+            context=context,
+            caller=_FakeRoom().local_participant,
+            toolkits=[],
+        ),
+        timeout=120.0,
+    )
+
+    assert len(adapter.recorded_create_kwargs) >= 2
+    second_request = adapter.recorded_create_kwargs[1]
+    second_input = second_request["input"]
+    assert "previous_response_id" not in second_request
+    assert second_request["store"] is False
+    second_request_payload = json.dumps(second_input, default=str)
+    assert marker in second_request_payload
+    assert "previous_response_id" not in second_request_payload
+    assert marker in second_result
+    assert isinstance(second_input, list)
+    assert any(
+        item.get("role") == "user" and marker in str(item.get("content"))
+        for item in second_input
+    )
+    assert any(item.get("role") == "assistant" for item in second_input)
 
 
 @pytest.mark.asyncio
@@ -430,7 +871,7 @@ async def test_live_openai_adapter_receives_tool_preamble_message():
     function_call_index = next(
         (
             index
-            for index, item in enumerate(context.previous_messages)
+            for index, item in enumerate(context.messages)
             if item.get("type") == "function_call"
         ),
         None,
@@ -441,7 +882,7 @@ async def test_live_openai_adapter_receives_tool_preamble_message():
         else next(
             (
                 item
-                for item in reversed(context.previous_messages[:function_call_index])
+                for item in reversed(context.messages[:function_call_index])
                 if item.get("type") == "message" and item.get("role") == "assistant"
             ),
             None,
@@ -453,11 +894,239 @@ async def test_live_openai_adapter_receives_tool_preamble_message():
     assert preamble is not None, json.dumps(
         {
             "event_types": _event_type_summary(events),
-            "previous_messages": context.previous_messages,
+            "messages": context.messages,
         },
         default=str,
     )
     assert _message_text(preamble).strip() != ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reasoning_effort", "response_options", "expects_encrypted_reasoning"),
+    [
+        ("none", None, False),
+        ("low", None, True),
+    ],
+)
+async def test_live_openai_adapter_restores_saved_tool_call_context(
+    reasoning_effort: str,
+    response_options: dict[str, object] | None,
+    expects_encrypted_reasoning: bool,
+):
+    room = _FakeRoom()
+    model = os.getenv("OPENAI_RESTORE_TEST_MODEL", "gpt-5.2")
+    first_tool = _SteeringProbeTool(name="restore_probe", wait_for_release=False)
+    first_adapter = _RecordingOpenAIResponsesAdapter(
+        model=model,
+        mode="request",
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        reasoning_effort=reasoning_effort,
+        response_options=response_options,
+        max_output_tokens=1024,
+        max_retries=2,
+    )
+    first_context = first_adapter.create_session()
+    first_context.append_user_message(
+        "Call restore_probe exactly once with note='saved-restore'. "
+        "After the tool returns, reply with exactly SAVED and nothing else."
+    )
+
+    first_result = await asyncio.wait_for(
+        first_adapter.create_response(
+            context=first_context,
+            caller=room.local_participant,
+            toolkits=[Toolkit(name="test", tools=[first_tool])],
+        ),
+        timeout=180.0,
+    )
+
+    saved_messages = copy.deepcopy(first_context.messages)
+    assert isinstance(first_result, str)
+    assert first_tool.calls == ["saved-restore"]
+    first_include = first_adapter.recorded_create_kwargs[0].get("include")
+    if expects_encrypted_reasoning:
+        assert first_include is not None
+        assert "reasoning.encrypted_content" in first_include
+    else:
+        assert first_include is None
+    assert _has_item_type(saved_messages, "function_call"), json.dumps(
+        saved_messages,
+        default=str,
+    )
+    assert _has_encrypted_reasoning(saved_messages) is expects_encrypted_reasoning
+
+    second_tool = _SteeringProbeTool(name="restore_probe", wait_for_release=False)
+    second_adapter = _RecordingOpenAIResponsesAdapter(
+        model=model,
+        mode="request",
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        reasoning_effort=reasoning_effort,
+        response_options=response_options,
+        max_output_tokens=512,
+        max_retries=2,
+    )
+    restored_context = second_adapter.create_session()
+    second_adapter.restore_context_messages(
+        context=restored_context,
+        messages=saved_messages,
+    )
+
+    assert _has_item_type(restored_context.messages, "function_call")
+    assert not _has_restored_tool_transcript_fallback(restored_context.messages)
+
+    restored_context.append_user_message(
+        "Using the restored conversation, reply with exactly RESTORED and do not call tools."
+    )
+    second_result = await asyncio.wait_for(
+        second_adapter.create_response(
+            context=restored_context,
+            caller=room.local_participant,
+            toolkits=[Toolkit(name="test", tools=[second_tool])],
+        ),
+        timeout=180.0,
+    )
+
+    assert isinstance(second_result, str)
+    assert "RESTORED" in second_result
+    assert second_adapter.recorded_create_kwargs
+    restored_input = second_adapter.recorded_create_kwargs[0]["input"]
+    assert isinstance(restored_input, list)
+    assert _has_item_type(restored_input, "function_call")
+    assert not _has_restored_tool_transcript_fallback(restored_input)
+    assert _has_encrypted_reasoning(restored_input) is expects_encrypted_reasoning
+
+
+@pytest.mark.asyncio
+async def test_live_openai_tool_call_restores_into_anthropic():
+    anthropic_client = _anthropic_client_if_key_set()
+    room = _FakeRoom()
+    source_messages: list[AgentMessage] = []
+    openai_adapter = OpenAIResponsesAdapter(
+        model=os.getenv("OPENAI_RESTORE_TEST_MODEL", "gpt-5.2"),
+        mode="request",
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        reasoning_effort="none",
+        max_output_tokens=1024,
+        max_retries=2,
+    )
+    publisher = openai_adapter.make_agent_event_publisher(
+        turn_id="turn-openai",
+        thread_id="thread-cross-provider",
+        callback=source_messages.append,
+    )
+    tool = _SteeringProbeTool(name="restore_probe", wait_for_release=False)
+    source_context = openai_adapter.create_session()
+    source_context.append_user_message(
+        "Call restore_probe exactly once with note='openai-to-claude'. "
+        "After the tool returns, reply with exactly SAVED and nothing else."
+    )
+
+    source_result = await asyncio.wait_for(
+        openai_adapter.create_response(
+            context=source_context,
+            caller=room.local_participant,
+            toolkits=[Toolkit(name="test", tools=[tool])],
+            event_handler=publisher,
+        ),
+        timeout=180.0,
+    )
+
+    assert isinstance(source_result, str)
+    assert tool.calls == ["openai-to-claude"]
+    assert any(message.provider == "openai" for message in source_messages)
+
+    anthropic_adapter = AnthropicMessagesAdapter(
+        model=os.getenv("ANTHROPIC_RESTORE_TEST_MODEL", "claude-sonnet-4-5"),
+        client=anthropic_client,
+        max_tokens=512,
+        max_retries=2,
+    )
+    restored_context = _restore_agent_messages_with_adapter(
+        adapter=anthropic_adapter,
+        messages=source_messages,
+    )
+    restored_context.append_user_message(
+        "Using the restored conversation, reply with exactly RESTORED and do not call tools."
+    )
+
+    restored_result = await asyncio.wait_for(
+        anthropic_adapter.create_response(
+            context=restored_context,
+            caller=room.local_participant,
+            toolkits=[],
+        ),
+        timeout=180.0,
+    )
+
+    assert isinstance(restored_result, str)
+    assert "RESTORED" in restored_result
+
+
+@pytest.mark.asyncio
+async def test_live_anthropic_tool_call_restores_into_openai():
+    anthropic_client = _anthropic_client_if_key_set()
+    room = _FakeRoom()
+    source_messages: list[AgentMessage] = []
+    anthropic_adapter = AnthropicMessagesAdapter(
+        model=os.getenv("ANTHROPIC_RESTORE_TEST_MODEL", "claude-sonnet-4-5"),
+        client=anthropic_client,
+        max_tokens=1024,
+        max_retries=2,
+    )
+    publisher = anthropic_adapter.make_agent_event_publisher(
+        turn_id="turn-anthropic",
+        thread_id="thread-cross-provider",
+        callback=source_messages.append,
+    )
+    tool = _SteeringProbeTool(name="restore_probe", wait_for_release=False)
+    source_context = anthropic_adapter.create_session()
+    source_context.append_user_message(
+        "Call restore_probe exactly once with note='claude-to-openai'. "
+        "After the tool returns, reply with exactly SAVED and nothing else."
+    )
+
+    source_result = await asyncio.wait_for(
+        anthropic_adapter.create_response(
+            context=source_context,
+            caller=room.local_participant,
+            toolkits=[Toolkit(name="test", tools=[tool])],
+            event_handler=publisher,
+        ),
+        timeout=180.0,
+    )
+
+    assert isinstance(source_result, str)
+    assert tool.calls == ["claude-to-openai"]
+    assert any(message.provider == "anthropic" for message in source_messages)
+
+    openai_adapter = OpenAIResponsesAdapter(
+        model=os.getenv("OPENAI_RESTORE_TEST_MODEL", "gpt-5.2"),
+        mode="request",
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        reasoning_effort="none",
+        max_output_tokens=512,
+        max_retries=2,
+    )
+    restored_context = _restore_agent_messages_with_adapter(
+        adapter=openai_adapter,
+        messages=source_messages,
+    )
+    restored_context.append_user_message(
+        "Using the restored conversation, reply with exactly RESTORED and do not call tools."
+    )
+
+    restored_result = await asyncio.wait_for(
+        openai_adapter.create_response(
+            context=restored_context,
+            caller=room.local_participant,
+            toolkits=[],
+        ),
+        timeout=180.0,
+    )
+
+    assert isinstance(restored_result, str)
+    assert "RESTORED" in restored_result
 
 
 @pytest.mark.asyncio
@@ -509,11 +1178,11 @@ async def test_live_openai_adapter_uses_duplicate_tool_names_in_different_namesp
     assert result.strip() == "DONE"
     assert any(
         item.get("type") == "function_call" and item.get("namespace") == "alpha"
-        for item in context.previous_messages
+        for item in context.messages
     )
     assert any(
         item.get("type") == "function_call" and item.get("namespace") == "beta"
-        for item in context.previous_messages
+        for item in context.messages
     )
 
 
@@ -566,15 +1235,11 @@ async def test_live_openai_adapter_finds_deferred_function_tools_with_tool_searc
     assert tool.calls == ["search-live"]
     assert isinstance(result, str)
     assert result.strip() == "DONE"
-    assert any(
-        item.get("type") == "tool_search_call" for item in context.previous_messages
-    )
-    assert any(
-        item.get("type") == "tool_search_output" for item in context.previous_messages
-    )
+    assert any(item.get("type") == "tool_search_call" for item in context.messages)
+    assert any(item.get("type") == "tool_search_output" for item in context.messages)
     assert any(
         item.get("type") == "function_call" and item.get("namespace") == "alpha"
-        for item in context.previous_messages
+        for item in context.messages
     )
 
 
@@ -632,15 +1297,11 @@ async def test_live_openai_adapter_client_tool_search_loads_toolkits_from_hook()
     assert tool.calls == ["client-search-live"]
     assert isinstance(result, str)
     assert result.strip() == "DONE"
-    assert any(
-        item.get("type") == "tool_search_call" for item in context.previous_messages
-    )
-    assert any(
-        item.get("type") == "tool_search_output" for item in context.previous_messages
-    )
+    assert any(item.get("type") == "tool_search_call" for item in context.messages)
+    assert any(item.get("type") == "tool_search_output" for item in context.messages)
     assert any(
         item.get("type") == "function_call" and item.get("namespace") == "alpha"
-        for item in context.previous_messages
+        for item in context.messages
     )
 
 
@@ -1080,11 +1741,11 @@ async def test_openai_gpt_54_adapter_uses_native_computer_tool():
     assert "goto" not in computer.calls
     assert any(
         isinstance(item, dict) and item.get("type") == "computer_call"
-        for item in context.previous_messages
+        for item in context.messages
     )
     assert not any(
         isinstance(item, dict) and item.get("type") == "function_call"
-        for item in context.previous_messages
+        for item in context.messages
     )
 
 

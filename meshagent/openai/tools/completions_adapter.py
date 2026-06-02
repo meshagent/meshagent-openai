@@ -197,7 +197,13 @@ class OpenAICompletionsAgentEventReader(AccumulatingAgentEventReader):
         del phase
         self._emit_context_message({"role": "assistant", "content": text})
 
-    def _append_assistant_reasoning(self, *, text: str) -> None:
+    def _append_assistant_reasoning(
+        self,
+        *,
+        text: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        del metadata
         self._emit_context_message(
             {"role": "assistant", "content": f"Reasoning: {text}"}
         )

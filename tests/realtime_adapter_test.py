@@ -390,16 +390,23 @@ async def test_start_realtime_session_advertises_function_tools() -> None:
 
     assert websocket.sent[0]["session"]["tools"] == [
         {
-            "type": "function",
-            "name": "write_file",
-            "description": "test tool",
-            "parameters": {
-                "type": "object",
-                "additionalProperties": True,
-            },
+            "type": "namespace",
+            "name": "storage",
+            "description": "storage",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "write_file",
+                    "description": "test tool",
+                    "parameters": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    },
+                    "strict": True,
+                }
+            ],
         }
     ]
-    assert "strict" not in websocket.sent[0]["session"]["tools"][0]
 
     await adapter.disconnect(context=context)
 
@@ -720,13 +727,21 @@ async def test_create_response_advertises_and_executes_function_tools() -> None:
             "output_modalities": ["text"],
             "tools": [
                 {
-                    "type": "function",
-                    "name": "write_file",
-                    "description": "test tool",
-                    "parameters": {
-                        "type": "object",
-                        "additionalProperties": True,
-                    },
+                    "type": "namespace",
+                    "name": "storage",
+                    "description": "storage",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "write_file",
+                            "description": "test tool",
+                            "parameters": {
+                                "type": "object",
+                                "additionalProperties": True,
+                            },
+                            "strict": True,
+                        }
+                    ],
                 }
             ],
         },
@@ -764,8 +779,10 @@ async def test_create_response_advertises_and_executes_function_tools() -> None:
         "id": "call-1",
     }
     response_creates = await _wait_for_sent_count(websocket, "response.create", 2)
-    assert response_creates[1]["response"]["tools"][0]["name"] == "write_file"
-    assert "strict" not in response_creates[1]["response"]["tools"][0]
+    namespace_tool = response_creates[1]["response"]["tools"][0]
+    assert namespace_tool["name"] == "storage"
+    assert namespace_tool["tools"][0]["name"] == "write_file"
+    assert namespace_tool["tools"][0]["strict"] is True
 
     await websocket.messages.put(
         _text_message(
@@ -911,9 +928,7 @@ async def test_create_response_syncs_text_messages_and_tracks_assistant_response
 
     await task
 
-    assert context.previous_response_id == "resp-1"
-    assert context.messages == []
-    assert context.previous_messages == [
+    assert context.messages == [
         {"role": "user", "content": "hello"},
         {"role": "assistant", "content": "hi"},
     ]
@@ -926,7 +941,7 @@ async def test_create_response_syncs_text_messages_and_tracks_assistant_response
 async def test_create_response_replays_assistant_messages_as_output_text() -> None:
     websocket = _FakeWebSocket()
     context = _context(websocket)
-    context.previous_messages.append({"role": "assistant", "content": "previous reply"})
+    context.messages.append({"role": "assistant", "content": "previous reply"})
     adapter = _adapter(response_options={"modalities": ["text"]})
     await adapter.connect(context=context)
 
@@ -1008,8 +1023,7 @@ async def test_make_agent_event_reader_accumulates_text_for_realtime_replay() ->
     reader.finalize()
     adapter.restore_context_messages(context=context, messages=restored_messages)
 
-    assert context.messages == []
-    assert context.previous_messages == [
+    assert context.messages == [
         {"role": "assistant", "content": [{"type": "output_text", "text": "Hi there"}]}
     ]
 
@@ -1100,8 +1114,7 @@ async def test_make_agent_event_reader_restores_tool_lifecycle_for_realtime_repl
     reader.finalize()
     adapter.restore_context_messages(context=context, messages=restored_messages)
 
-    assert context.messages == []
-    assert context.previous_messages == [
+    assert context.messages == [
         {
             "type": "function_call",
             "id": "tool-1",
@@ -1139,8 +1152,8 @@ async def test_make_agent_event_reader_restores_tool_lifecycle_for_realtime_repl
     else:
         raise AssertionError("restored tool call items were not replayed")
 
-    assert conversation_items[0]["item"] == context.previous_messages[0]
-    assert conversation_items[1]["item"] == context.previous_messages[1]
+    assert conversation_items[0]["item"] == context.messages[0]
+    assert conversation_items[1]["item"] == context.messages[1]
 
     await websocket.messages.put(
         _text_message(

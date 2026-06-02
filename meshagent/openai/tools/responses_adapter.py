@@ -641,6 +641,16 @@ OpenAIResponsesChatContext = OpenAIResponsesSessionContext
 
 
 class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
+    def __init__(
+        self,
+        *,
+        emit_message: Callable[[dict[str, Any]], None],
+        callbacks: AgentEventReaderCallbacks | None = None,
+        provider: str | None = None,
+    ) -> None:
+        super().__init__(emit_message=emit_message, callbacks=callbacks)
+        self._provider = provider
+
     def _append_user_text(self, text: str) -> None:
         self._emit_context_message(
             {
@@ -716,13 +726,21 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
             }
         )
 
-    def _append_assistant_reasoning(self, *, text: str) -> None:
-        self._emit_context_message(
-            {
-                "type": "reasoning",
-                "summary": [{"type": "summary_text", "text": text}],
-            }
-        )
+    def _append_assistant_reasoning(
+        self,
+        *,
+        text: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        message: dict[str, Any] = {"type": "reasoning"}
+        if text != "":
+            message["summary"] = [{"type": "summary_text", "text": text}]
+        openai_metadata = metadata.get("openai")
+        if isinstance(openai_metadata, dict):
+            encrypted_content = openai_metadata.get("encrypted_content")
+            if isinstance(encrypted_content, str) and encrypted_content != "":
+                message["encrypted_content"] = encrypted_content
+        self._emit_context_message(message)
 
     def _append_assistant_file(self, *, url: str) -> None:
         self._append_assistant_text(text=f"Generated file: {url}", phase=None)
@@ -743,6 +761,13 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
         item_type = self._response_item_type(tool_call=tool_call)
         call_id = tool_call.call_id or tool_call.item_id
         if item_type == "function_call":
+            if tool_call.provider != self._provider:
+                self._append_cross_provider_tool_call(
+                    tool_call=tool_call,
+                    result=result,
+                    error=error,
+                )
+                return
             self._emit_context_message(
                 {
                     "type": "function_call",
@@ -783,6 +808,39 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
         )
         if output is not None:
             self._emit_context_message(output)
+
+    def _append_cross_provider_tool_call(
+        self,
+        *,
+        tool_call: _BufferedToolCall,
+        result: dict[str, Any] | None,
+        error: dict[str, Any] | None,
+    ) -> None:
+        tool_name = self._function_name(tool_call=tool_call)
+        arguments = tool_call.arguments_json()
+        self._emit_context_message(
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": f"Called tool {tool_name} with arguments: {arguments}",
+                    }
+                ],
+            }
+        )
+        if result is not None or error is not None or tool_call.logs:
+            self._emit_context_message(
+                {
+                    "role": "user",
+                    "content": self._result_text(
+                        result=result,
+                        error=error,
+                        logs=tool_call.logs,
+                    ),
+                }
+            )
 
     def _append_image_generation_event(
         self,
@@ -1717,6 +1775,8 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             thread_id=thread_id,
             callback=callback,
             custom_event_callback=custom_event_callback,
+            provider=self._provider,
+            model=self._model,
         )
 
     def _set_function_tool_name_resolver(
@@ -1747,6 +1807,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         return OpenAIResponsesAgentEventReader(
             emit_message=emit_message,
             callbacks=callbacks,
+            provider=self._provider,
         )
 
     def _make_tool_response_adapter(self) -> OpenAIResponsesToolResponseAdapter:
@@ -1754,6 +1815,28 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             max_tool_call_length=self._max_tool_call_length,
             max_tool_call_lines=self._max_tool_call_lines,
         )
+
+    @staticmethod
+    def _reasoning_enabled(response_options: dict[str, Any]) -> bool:
+        reasoning = response_options.get("reasoning")
+        if not isinstance(reasoning, dict):
+            return False
+        effort = reasoning.get("effort")
+        return not (isinstance(effort, str) and effort == "none")
+
+    @staticmethod
+    def _ensure_encrypted_reasoning_include(response_options: dict[str, Any]) -> None:
+        if not OpenAIResponsesAdapter._reasoning_enabled(response_options):
+            return
+        include = response_options.get("include")
+        if include is None:
+            response_options["include"] = ["reasoning.encrypted_content"]
+            return
+        if isinstance(include, list):
+            if "reasoning.encrypted_content" not in include:
+                include.append("reasoning.encrypted_content")
+            return
+        response_options["include"] = [include, "reasoning.encrypted_content"]
 
     def _compose_instructions(self, *, context: AgentSessionContext) -> str | None:
         instruction_parts = [
@@ -1880,6 +1963,23 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         return False
 
     @staticmethod
+    def _response_output_item_to_context_message(output_item: Any) -> dict[str, Any]:
+        return output_item.model_dump(mode="json", exclude_none=True)
+
+    @staticmethod
+    def _commit_response_context_messages(
+        *,
+        context: AgentSessionContext,
+        response_output_messages: list[dict[str, Any]],
+        next_messages: list[Any],
+        compacted: bool,
+    ) -> None:
+        if compacted:
+            context.messages.clear()
+        context.messages.extend(response_output_messages)
+        context.messages.extend(next_messages)
+
+    @staticmethod
     def _response_has_terminal_image_generation_output(response: Response) -> bool:
         for output_item in response.output:
             item = output_item.model_dump(mode="json", exclude_none=True)
@@ -1903,27 +2003,19 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
     ) -> None:
         if model is None:
             model = self.default_model()
-        if not context.messages and not context.previous_messages:
+        if not context.messages:
             return
         instructions = self._compose_instructions(context=context)
-        previous_response_id = (
-            context.previous_response_id
-            if context.previous_response_id is not None
-            else NOT_GIVEN
-        )
         openai = self.get_openai_client()
         response = await openai.responses.compact(
             model=model,
             input=[*context.messages],
             instructions=instructions or NOT_GIVEN,
-            previous_response_id=previous_response_id,
         )
         context.messages.clear()
         context.messages.extend(
             [*(x.model_dump(mode="json", exclude_none=True) for x in response.output)]
         )
-        context.previous_messages.clear()
-        context.previous_response_id = None
         context.last_usage = None
         context.pending_supplemental_usage = None
 
@@ -2108,27 +2200,27 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             instructions=self._compose_instructions(context=context),
             input=context.messages,
             text=text,
-            previous_response_id=context.previous_response_id,
         )
 
         return response.input_tokens
 
     async def check_for_termination(self, *, context: AgentSessionContext) -> bool:
-        for message in context.messages:
-            if message.get("type", "message") != "message":
-                return False
-
         latest_phase = self._get_latest_response_phase_from_messages(context=context)
         if latest_phase is not None:
             return latest_phase == "final_answer"
 
-        return True
+        for message in reversed(context.messages):
+            if message.get("type", "message") != "message":
+                return False
+            return True
+
+        return False
 
     @staticmethod
     def _get_latest_response_phase_from_messages(
         *, context: AgentSessionContext
     ) -> str | None:
-        for message in reversed(context.previous_messages):
+        for message in reversed(context.messages):
             if message.get("type") != "message":
                 break
 
@@ -2391,7 +2483,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         caller: Participant,
         event: ResponseStreamEvent,
     ) -> dict[str, Any]:
-        payload = event.model_dump(mode="json")
+        payload = event.model_dump(mode="json", exclude_none=True)
         if event.type != "response.output_item.done":
             return payload
         item = payload.get("item")
@@ -2974,21 +3066,12 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
 
                 tool_adapter = self._make_tool_response_adapter()
                 context_messages_snapshot = copy.deepcopy(context.messages)
-                context_previous_messages_snapshot = copy.deepcopy(
-                    context.previous_messages
-                )
-                context_previous_response_id_snapshot = context.previous_response_id
                 loaded_toolkits: list[Toolkit] = []
                 iteration_committed = False
 
                 def restore_context_snapshot() -> None:
                     context.messages.clear()
                     context.messages.extend(copy.deepcopy(context_messages_snapshot))
-                    context.previous_messages.clear()
-                    context.previous_messages.extend(
-                        copy.deepcopy(context_previous_messages_snapshot)
-                    )
-                    context.previous_response_id = context_previous_response_id_snapshot
 
                 def commit_local_tool_boundary(
                     *,
@@ -3051,21 +3134,12 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                             else:
                                 span.set_attribute("response_format", "text")
 
-                            previous_response_id = NOT_GIVEN
                             instructions = self._compose_instructions(context=context)
-                            if context.previous_response_id is not None:
-                                previous_response_id = context.previous_response_id
 
                             stream = (
                                 self._mode == "websocket" or event_handler is not None
                             )
                             context_messages_snapshot = copy.deepcopy(context.messages)
-                            context_previous_messages_snapshot = copy.deepcopy(
-                                context.previous_messages
-                            )
-                            context_previous_response_id_snapshot = (
-                                context.previous_response_id
-                            )
                             iteration_committed = False
 
                         with tracer.start_as_current_span("llm.invoke") as span:
@@ -3078,6 +3152,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                     "effort": self._reasoning_effort,
                                     "summary": "detailed",
                                 }
+                            self._ensure_encrypted_reasoning_include(response_options)
                             request_options = copy.deepcopy(options or {})
                             request_options.pop("output_modalities", None)
                             request_options.pop("voice", None)
@@ -3111,12 +3186,12 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                     tool_choice=tool_choice,
                                 ),
                                 "text": text,
-                                "previous_response_id": previous_response_id,
                                 "instructions": instructions or NOT_GIVEN,
                                 "max_output_tokens": self.max_output_tokens,
                                 **response_options,
                                 **request_options,
                             }
+                            create_kwargs["store"] = False
                             normalized_extra_headers = llm_annotation_headers(
                                 self._annotations
                             )
@@ -3582,7 +3657,11 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                 restart_after_tool_boundary = False
 
                                 for output_index, message in enumerate(response.output):
-                                    response_output_messages.append(message.to_dict())
+                                    response_output_messages.append(
+                                        self._response_output_item_to_context_message(
+                                            message
+                                        )
+                                    )
                                     outputs, done = await handle_message(
                                         message=message
                                     )
@@ -3612,12 +3691,23 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                 if restart_after_tool_boundary:
                                     continue
 
-                                context.track_response(response.id)
-                                context.previous_messages.extend(
-                                    response_output_messages
+                                response_compacted = (
+                                    self._response_has_compaction_output(response)
                                 )
-                                context.messages.extend(next_messages)
+                                self._commit_response_context_messages(
+                                    context=context,
+                                    response_output_messages=response_output_messages,
+                                    next_messages=next_messages,
+                                    compacted=response_compacted,
+                                )
                                 iteration_committed = True
+
+                                if (
+                                    response_compacted
+                                    and len(final_outputs) == 0
+                                    and len(next_messages) == 0
+                                ):
+                                    return ""
 
                                 if (
                                     steering_callback is not None
@@ -3752,15 +3842,12 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                             ),
                                                         )
                                                         break
-                                                    context.track_response(
-                                                        event.response.id
-                                                    )
-                                                    context.previous_messages.extend(
-                                                        [
-                                                            output.to_dict()
-                                                            for output in event.response.output
-                                                        ]
-                                                    )
+                                                    response_output_messages = [
+                                                        self._response_output_item_to_context_message(
+                                                            output
+                                                        )
+                                                        for output in event.response.output
+                                                    ]
                                                     response_compacted = self._response_has_compaction_output(
                                                         event.response
                                                     )
@@ -3779,8 +3866,20 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                         ),
                                                     )
 
-                                                    context.messages.extend(all_outputs)
+                                                    self._commit_response_context_messages(
+                                                        context=context,
+                                                        response_output_messages=response_output_messages,
+                                                        next_messages=all_outputs,
+                                                        compacted=response_compacted,
+                                                    )
                                                     iteration_committed = True
+
+                                                    if (
+                                                        response_compacted
+                                                        and len(final_outputs) == 0
+                                                        and len(all_outputs) == 0
+                                                    ):
+                                                        return ""
 
                                                     if (
                                                         steering_callback is not None
@@ -3839,7 +3938,9 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                     == "response.output_item.done"
                                                 ):
                                                     response_output_messages.append(
-                                                        event.item.to_dict()
+                                                        self._response_output_item_to_context_message(
+                                                            event.item
+                                                        )
                                                     )
                                                     (
                                                         outputs,
@@ -3904,15 +4005,12 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                     return final_outputs[0]
 
                                                 if event.type == "response.incomplete":
-                                                    context.track_response(
-                                                        event.response.id
-                                                    )
-                                                    context.previous_messages.extend(
-                                                        [
-                                                            output.to_dict()
-                                                            for output in event.response.output
-                                                        ]
-                                                    )
+                                                    response_output_messages = [
+                                                        self._response_output_item_to_context_message(
+                                                            output
+                                                        )
+                                                        for output in event.response.output
+                                                    ]
                                                     response_compacted = self._response_has_compaction_output(
                                                         event.response
                                                     )
@@ -3930,7 +4028,12 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                             model=model
                                                         ),
                                                     )
-                                                    context.messages.extend(all_outputs)
+                                                    self._commit_response_context_messages(
+                                                        context=context,
+                                                        response_output_messages=response_output_messages,
+                                                        next_messages=all_outputs,
+                                                        compacted=response_compacted,
+                                                    )
                                                     iteration_committed = True
                                                     return ""
                                         if restart_after_tool_boundary:

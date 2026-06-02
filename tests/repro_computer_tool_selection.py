@@ -165,11 +165,12 @@ def run_trial(
     first_output_types: list[str] = []
     step_output_types: list[list[str]] = []
     terminal_text: str | None = None
+    input_messages: str | list[dict] = prompt
 
     try:
         response = client.responses.create(
             model=model,
-            input=prompt,
+            input=input_messages,
             tools=[COMPUTER_TOOL, DUMMY_TOOL],
             max_output_tokens=max_output_tokens,
         )
@@ -254,11 +255,19 @@ def run_trial(
             )
 
         follow_up_requests += 1
+        input_messages = [
+            *(
+                input_messages
+                if isinstance(input_messages, list)
+                else [{"role": "user", "content": input_messages}]
+            ),
+            *items,
+            *function_outputs,
+        ]
         try:
             response = client.responses.create(
                 model=model,
-                previous_response_id=response.id,
-                input=function_outputs,
+                input=input_messages,
                 tools=[COMPUTER_TOOL, DUMMY_TOOL],
                 max_output_tokens=max_output_tokens,
             )

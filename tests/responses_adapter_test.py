@@ -27,6 +27,9 @@ from meshagent.agents.context import SessionUsage
 from meshagent.agents.messages import (
     AGENT_EVENT_CONTEXT_COMPACTED,
     AGENT_EVENT_IMAGE_GENERATION_COMPLETED,
+    AGENT_EVENT_REASONING_CONTENT_DELTA,
+    AGENT_EVENT_REASONING_CONTENT_ENDED,
+    AGENT_EVENT_REASONING_CONTENT_STARTED,
     AGENT_EVENT_TEXT_CONTENT_DELTA,
     AGENT_EVENT_TEXT_CONTENT_ENDED,
     AGENT_EVENT_THREAD_EVENT,
@@ -156,6 +159,162 @@ def test_make_agent_event_reader_accumulates_streamed_text_for_restore() -> None
             "role": "assistant",
             "content": [{"type": "output_text", "text": "Hi there"}],
         }
+    ]
+
+
+def test_restore_context_messages_replays_raw_messages_exactly() -> None:
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    context = adapter.create_session()
+    messages = [
+        {"role": "user", "content": "what's up"},
+        {
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": "opaque-reasoning",
+        },
+        {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "search_memories",
+            "arguments": "{}",
+            "status": "completed",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "tool result",
+        },
+    ]
+
+    adapter.restore_context_messages(context=context, messages=messages)
+
+    assert context.messages == messages
+    assert context.messages is not messages
+
+
+def test_make_agent_event_reader_converts_cross_provider_function_calls() -> None:
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    restored_messages: list[dict[str, object]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+
+    reader.consume(
+        AgentToolCallStarted(
+            type=AGENT_EVENT_TOOL_CALL_STARTED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="tool-1",
+            namespace="meshagent",
+            call_id="call-1",
+            toolkit="test",
+            tool="restore_probe",
+            arguments={"note": "from-claude"},
+            provider="anthropic",
+            model="claude-sonnet-4-5",
+        )
+    )
+    reader.consume(
+        AgentToolCallEnded(
+            type=AGENT_EVENT_TOOL_CALL_ENDED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="tool-1",
+            namespace="meshagent",
+            call_id="call-1",
+            result=TextContent(text="tool result"),
+            provider="anthropic",
+            model="claude-sonnet-4-5",
+        )
+    )
+    reader.finalize()
+
+    assert restored_messages == [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": (
+                        "Called tool test_restore_probe with arguments: "
+                        '{"note":"from-claude"}'
+                    ),
+                }
+            ],
+        },
+        {"role": "user", "content": "tool result"},
+    ]
+
+
+def test_make_agent_event_reader_restores_openai_encrypted_reasoning_metadata() -> None:
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    restored_messages: list[dict[str, object]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+
+    reader.consume(
+        AgentReasoningContentStarted(
+            type=AGENT_EVENT_REASONING_CONTENT_STARTED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="rs_1",
+            provider="openai",
+            model="gpt-5-mini",
+        )
+    )
+    reader.consume(
+        AgentReasoningContentDelta(
+            type=AGENT_EVENT_REASONING_CONTENT_DELTA,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="rs_1",
+            text="Need memories.",
+            provider="openai",
+            model="gpt-5-mini",
+        )
+    )
+    reader.consume(
+        AgentReasoningContentEnded(
+            type=AGENT_EVENT_REASONING_CONTENT_ENDED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="rs_1",
+            provider="openai",
+            model="gpt-5-mini",
+            metadata={"openai": {"encrypted_content": "opaque-reasoning"}},
+        )
+    )
+    reader.finalize()
+
+    assert restored_messages == [
+        {
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "Need memories."}],
+            "encrypted_content": "opaque-reasoning",
+        }
+    ]
+
+
+def test_response_options_add_encrypted_reasoning_include() -> None:
+    response_options: dict[str, object] = {
+        "reasoning": {"effort": "low", "summary": "detailed"}
+    }
+
+    OpenAIResponsesAdapter._ensure_encrypted_reasoning_include(response_options)
+
+    assert response_options["include"] == ["reasoning.encrypted_content"]
+
+
+def test_response_options_preserve_existing_reasoning_includes() -> None:
+    response_options: dict[str, object] = {
+        "reasoning": {"effort": "medium"},
+        "include": ["file_search_call.results"],
+    }
+
+    OpenAIResponsesAdapter._ensure_encrypted_reasoning_include(response_options)
+
+    assert response_options["include"] == [
+        "file_search_call.results",
+        "reasoning.encrypted_content",
     ]
 
 
@@ -342,6 +501,8 @@ def _restore_tool_lifecycle(
                 namespace=namespace,
                 call_id="call-1",
                 delta=delta,
+                provider="openai",
+                model="gpt-5-mini",
             )
         )
     reader.consume(
@@ -355,6 +516,8 @@ def _restore_tool_lifecycle(
             toolkit=toolkit,
             tool=tool,
             arguments=arguments,
+            provider="openai",
+            model="gpt-5-mini",
         )
     )
     reader.consume(
@@ -368,6 +531,8 @@ def _restore_tool_lifecycle(
             toolkit=toolkit,
             tool=tool,
             result=TextContent(text="tool result"),
+            provider="openai",
+            model="gpt-5-mini",
         )
     )
     reader.finalize()
@@ -1359,8 +1524,9 @@ class _FakeCompletedEvent:
         self.type = "response.completed"
         self.response = response
 
-    def model_dump(self, *, mode: str = "json") -> dict:
+    def model_dump(self, *, mode: str = "json", **kwargs) -> dict:
         del mode
+        del kwargs
         return {
             "type": self.type,
             "response": self.response.to_dict(),
@@ -1375,8 +1541,9 @@ class _FakeIncompleteEvent:
         self.type = "response.incomplete"
         self.response = response
 
-    def model_dump(self, *, mode: str = "json") -> dict:
+    def model_dump(self, *, mode: str = "json", **kwargs) -> dict:
         del mode
+        del kwargs
         return {
             "type": self.type,
             "response": self.response.to_dict(),
@@ -1393,7 +1560,10 @@ class _FakeOutputItem:
 
     def model_dump(self, *, mode: str = "json", **kwargs) -> dict:
         del mode
-        del kwargs
+        if kwargs.get("exclude_none") is True:
+            return {
+                key: value for key, value in self._payload.items() if value is not None
+            }
         return dict(self._payload)
 
     def to_dict(self, *, mode: str = "json") -> dict:
@@ -1435,8 +1605,9 @@ class _FakeOutputItemDoneEvent:
         self.type = "response.output_item.done"
         self.item = item
 
-    def model_dump(self, *, mode: str = "json") -> dict:
+    def model_dump(self, *, mode: str = "json", **kwargs) -> dict:
         del mode
+        del kwargs
         return {
             "type": self.type,
             "item": self.item.to_dict(mode="json"),
@@ -2089,6 +2260,32 @@ async def test_create_response_drops_process_audio_selection_options() -> None:
     assert "output_modalities" not in create_kwargs
     assert "voice" not in create_kwargs
     assert create_kwargs["metadata"] == {"tag": "kept"}
+    assert create_kwargs["store"] is False
+
+
+@pytest.mark.asyncio
+async def test_create_response_forces_store_false_when_options_request_storage() -> (
+    None
+):
+    client = _FakeOpenAIClient(outcomes=[_FakeResponse(response_id="resp_store")])
+    adapter = OpenAIResponsesAdapter(
+        mode="request",
+        client=client,
+        response_options={"store": True},
+    )
+    context = adapter.create_session()
+    context.append_user_message("hello")
+
+    result = await adapter.create_response(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        toolkits=[],
+        options={"store": True},
+    )
+
+    assert result == ""
+    assert client.responses.create_kwargs[0]["store"] is False
+    assert "previous_response_id" not in client.responses.create_kwargs[0]
 
 
 @pytest.mark.asyncio
@@ -2132,10 +2329,10 @@ async def test_next_continues_until_final_answer_when_phase_is_present():
 
     assert result == "Done."
     assert client.responses.calls == 2
-    assert (
-        client.responses.create_kwargs[1]["previous_response_id"] == "resp_commentary"
-    )
-    assert client.responses.create_kwargs[1]["input"] == []
+    second_kwargs = client.responses.create_kwargs[1]
+    assert "previous_response_id" not in second_kwargs
+    assert second_kwargs["store"] is False
+    assert any(item.get("id") == "msg_commentary" for item in second_kwargs["input"])
 
 
 @pytest.mark.asyncio
@@ -2200,10 +2397,16 @@ async def test_next_handles_openai_54_computer_output_items():
         isinstance(tool, dict) and tool.get("type") == "computer"
         for tool in client.responses.create_kwargs[0]["tools"]
     )
-    assert client.responses.create_kwargs[1]["previous_response_id"] == "resp_computer"
+    second_kwargs = client.responses.create_kwargs[1]
+    assert "previous_response_id" not in second_kwargs
+    assert second_kwargs["store"] is False
     assert any(
         isinstance(item, dict) and item.get("type") == "computer_call_output"
-        for item in context.previous_messages
+        for item in context.messages
+    )
+    assert any(
+        isinstance(item, dict) and item.get("type") == "computer_call_output"
+        for item in second_kwargs["input"]
     )
 
 
@@ -2262,6 +2465,7 @@ async def test_next_commits_response_state_when_stream_ends_incomplete_after_com
         type="compaction",
         encrypted_content="opaque",
         status="completed",
+        created_by=None,
     )
     response = _FakeResponse(
         response_id="resp_incomplete_compaction",
@@ -2297,9 +2501,7 @@ async def test_next_commits_response_state_when_stream_ends_incomplete_after_com
     )
 
     assert result == ""
-    assert context.previous_response_id == "resp_incomplete_compaction"
-    assert context.messages == []
-    assert context.previous_messages[-1] == {
+    assert context.messages[-1] == {
         "type": "compaction",
         "encrypted_content": "opaque",
         "status": "completed",
@@ -2318,6 +2520,67 @@ async def test_next_commits_response_state_when_stream_ends_incomplete_after_com
         "response.output_item.done",
         "response.incomplete",
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_next_replaces_context_when_response_contains_compaction(
+    stream: bool,
+) -> None:
+    compaction_item = _FakeOutputItem(
+        type="compaction",
+        encrypted_content="opaque",
+        status="completed",
+    )
+    final_message = _make_output_message(
+        message_id="msg_after_compaction",
+        text="Done.",
+        phase="final_answer",
+    )
+    response = _FakeResponse(
+        response_id="resp_compaction",
+        output=[
+            compaction_item,
+            final_message,
+        ],
+    )
+    outcome = (
+        _EventStream(
+            events=[
+                _FakeOutputItemDoneEvent(item=compaction_item),
+                _FakeOutputItemDoneEvent(item=final_message),
+                _FakeCompletedEvent(response=response),
+            ]
+        )
+        if stream
+        else response
+    )
+    adapter = OpenAIResponsesAdapter(
+        mode="request",
+        client=_FakeOpenAIClient(outcomes=[outcome]),
+    )
+    context = adapter.create_session()
+    context.append_user_message("old user")
+    context.append_assistant_message("old assistant")
+
+    result = await adapter.create_response(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        toolkits=[],
+        event_handler=(lambda event: None) if stream else None,
+    )
+
+    assert result == ""
+    assert context.messages[0] == {
+        "type": "compaction",
+        "encrypted_content": "opaque",
+        "status": "completed",
+    }
+    assert "created_by" not in context.messages[0]
+    assert not any(message.get("content") == "old user" for message in context.messages)
+    assert not any(
+        message.get("content") == "old assistant" for message in context.messages
+    )
 
 
 @pytest.mark.asyncio
@@ -2375,9 +2638,11 @@ async def test_next_stream_continues_until_final_answer_when_phase_is_present():
         "response.completed",
         "response.completed",
     ]
-    assert (
-        client.responses.create_kwargs[1]["previous_response_id"]
-        == "resp_stream_commentary"
+    second_kwargs = client.responses.create_kwargs[1]
+    assert "previous_response_id" not in second_kwargs
+    assert second_kwargs["store"] is False
+    assert any(
+        item.get("id") == "msg_stream_commentary" for item in second_kwargs["input"]
     )
 
 
@@ -2920,7 +3185,18 @@ async def test_next_serializes_websocket_requests_per_session(monkeypatch):
         if payload_type in {"response.completed", "response.done"}:
             response = payload.get("response", {})
             response_id = response.get("id", "resp_ws")
-            return _FakeCompletedEvent(response=_FakeResponse(response_id=response_id))
+            return _FakeCompletedEvent(
+                response=_FakeResponse(
+                    response_id=response_id,
+                    output=[
+                        _make_output_message(
+                            message_id=f"msg_{response_id}",
+                            text="done",
+                            phase="final_answer",
+                        )
+                    ],
+                )
+            )
         return SimpleNamespace(type=payload_type)
 
     monkeypatch.setattr(
@@ -2989,7 +3265,18 @@ async def test_cancelled_request_closes_websocket_and_next_request_reconnects(
         if payload_type in {"response.completed", "response.done"}:
             response = payload.get("response", {})
             response_id = response.get("id", "resp_ws")
-            return _FakeCompletedEvent(response=_FakeResponse(response_id=response_id))
+            return _FakeCompletedEvent(
+                response=_FakeResponse(
+                    response_id=response_id,
+                    output=[
+                        _make_output_message(
+                            message_id=f"msg_{response_id}",
+                            text="done",
+                            phase="final_answer",
+                        )
+                    ],
+                )
+            )
         return SimpleNamespace(type=payload_type)
 
     monkeypatch.setattr(
@@ -3232,8 +3519,19 @@ async def test_next_inserts_steering_messages_after_tool_results() -> None:
     assert result == "done"
     assert steering_calls == 1
     assert len(client.responses.create_kwargs) == 2
+    assert "previous_response_id" not in client.responses.create_kwargs[1]
+    assert client.responses.create_kwargs[1]["store"] is False
     second_input = client.responses.create_kwargs[1]["input"]
     assert second_input == [
+        {"role": "user", "content": "run tool"},
+        {
+            "id": "tool-1",
+            "name": "write_file",
+            "call_id": "call_1",
+            "arguments": json.dumps({"path": "/tmp/example.txt"}),
+            "type": "function_call",
+            "status": "completed",
+        },
         {
             "output": json.dumps(
                 {
@@ -3249,7 +3547,6 @@ async def test_next_inserts_steering_messages_after_tool_results() -> None:
             "content": "steer now",
         },
     ]
-    assert client.responses.create_kwargs[1]["previous_response_id"] == "resp_tool"
     assert second_input[-1] == {
         "role": "user",
         "content": "steer now",
@@ -3729,8 +4026,6 @@ async def test_request_mode_cancellation_restores_context_during_tool_call() -> 
         await task
 
     assert context.messages == [{"role": "user", "content": "run tool"}]
-    assert context.previous_messages == []
-    assert context.previous_response_id is None
 
 
 @pytest.mark.asyncio
@@ -5492,6 +5787,43 @@ def test_make_agent_event_publisher_emits_compaction_without_openai_item_id() ->
     ]
     assert isinstance(published[-1], AgentThreadEvent)
     assert published[-1].event["state"] == "completed"
+
+
+def test_make_agent_event_publisher_stores_openai_reasoning_encrypted_content() -> None:
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+        model="gpt-5-mini",
+    )
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    publisher(
+        {
+            "type": "response.output_item.done",
+            "response_id": "resp-1",
+            "sequence_number": 1,
+            "item": {
+                "id": "rs_1",
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "Need context."}],
+                "encrypted_content": "opaque-reasoning",
+            },
+        }
+    )
+
+    ended = next(
+        message
+        for message in published
+        if isinstance(message, AgentReasoningContentEnded)
+    )
+    assert ended.provider == "openai"
+    assert ended.model == "gpt-5-mini"
+    assert ended.metadata == {"openai": {"encrypted_content": "opaque-reasoning"}}
 
 
 def test_make_agent_event_publisher_emits_compaction_from_completed_response_snapshot() -> (
