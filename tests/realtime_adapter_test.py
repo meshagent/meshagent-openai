@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from typing import Any
 
 import aiohttp
@@ -390,21 +391,13 @@ async def test_start_realtime_session_advertises_function_tools() -> None:
 
     assert websocket.sent[0]["session"]["tools"] == [
         {
-            "type": "namespace",
-            "name": "storage",
-            "description": "storage",
-            "tools": [
-                {
-                    "type": "function",
-                    "name": "write_file",
-                    "description": "test tool",
-                    "parameters": {
-                        "type": "object",
-                        "additionalProperties": True,
-                    },
-                    "strict": True,
-                }
-            ],
+            "type": "function",
+            "name": "write_file",
+            "description": "test tool",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": True,
+            },
         }
     ]
 
@@ -727,21 +720,13 @@ async def test_create_response_advertises_and_executes_function_tools() -> None:
             "output_modalities": ["text"],
             "tools": [
                 {
-                    "type": "namespace",
-                    "name": "storage",
-                    "description": "storage",
-                    "tools": [
-                        {
-                            "type": "function",
-                            "name": "write_file",
-                            "description": "test tool",
-                            "parameters": {
-                                "type": "object",
-                                "additionalProperties": True,
-                            },
-                            "strict": True,
-                        }
-                    ],
+                    "type": "function",
+                    "name": "write_file",
+                    "description": "test tool",
+                    "parameters": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    },
                 }
             ],
         },
@@ -779,10 +764,10 @@ async def test_create_response_advertises_and_executes_function_tools() -> None:
         "id": "call-1",
     }
     response_creates = await _wait_for_sent_count(websocket, "response.create", 2)
-    namespace_tool = response_creates[1]["response"]["tools"][0]
-    assert namespace_tool["name"] == "storage"
-    assert namespace_tool["tools"][0]["name"] == "write_file"
-    assert namespace_tool["tools"][0]["strict"] is True
+    function_tool = response_creates[1]["response"]["tools"][0]
+    assert function_tool["type"] == "function"
+    assert function_tool["name"] == "write_file"
+    assert "strict" not in function_tool
 
     await websocket.messages.put(
         _text_message(
@@ -1302,4 +1287,46 @@ async def test_input_audio_helpers_send_realtime_input_buffer_events() -> None:
         {"type": "input_audio_buffer.clear"},
     ]
 
-    await adapter.disconnect(context=context)
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    os.getenv("RUN_OPENAI_LIVE_TESTS") != "1",
+    reason="set RUN_OPENAI_LIVE_TESTS=1 to run live OpenAI realtime tests",
+)
+async def test_live_openai_realtime_returns_text_response() -> None:
+    events: list[dict[str, object]] = []
+    adapter = OpenAIRealtimeAdapter(
+        model=os.getenv("OPENAI_REALTIME_LIVE_TEST_MODEL", "gpt-realtime"),
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        session_options={"output_modalities": ["text"]},
+        response_options={"output_modalities": ["text"]},
+        websocket_timeout=120,
+    )
+    context = adapter.create_session()
+    context.append_user_message("Reply with exactly REALTIME_OK and nothing else.")
+
+    try:
+        await adapter.start_realtime_session(
+            context=context,
+            event_handler=events.append,
+            caller=_FakeParticipant(),
+            toolkits=[],
+        )
+        terminal_event = await asyncio.wait_for(
+            adapter.create_response(
+                context=context,
+                caller=_FakeParticipant(),
+                toolkits=[],
+                event_handler=events.append,
+            ),
+            timeout=120.0,
+        )
+    finally:
+        await context.close()
+
+    assert terminal_event["type"] == "response.done"
+    assert any(
+        message.get("role") == "assistant"
+        and "REALTIME_OK" in str(message.get("content"))
+        for message in context.messages
+    )

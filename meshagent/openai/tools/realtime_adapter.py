@@ -155,6 +155,14 @@ def _realtime_tool_definitions(
         return None
     realtime_tools: list[dict[str, Any]] = []
     for tool in tools:
+        if tool.get("type") == "namespace":
+            namespace_tools = tool.get("tools")
+            if not isinstance(namespace_tools, list):
+                continue
+            nested_tools = _realtime_tool_definitions(namespace_tools)
+            if nested_tools is not None:
+                realtime_tools.extend(nested_tools)
+            continue
         realtime_tool = dict(tool)
         realtime_tool.pop("strict", None)
         realtime_tools.append(realtime_tool)
