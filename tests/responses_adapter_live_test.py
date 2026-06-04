@@ -837,6 +837,130 @@ async def test_live_openai_dataset_websocket_resume_preserves_encrypted_reasonin
 
 
 @pytest.mark.asyncio
+async def test_live_openai_dataset_websocket_tool_turn_restores_encrypted_reasoning():
+    thread_id = "dataset://threads/live-openai-encrypted-reasoning-tool-restore"
+    model = os.getenv("OPENAI_ENCRYPTED_REASONING_RESTORE_TEST_MODEL", "gpt-5.2")
+    room = _FakeDatasetRoom()
+    storage = DatasetThreadStorage(
+        room=room,
+        path=thread_id,
+        max_append_message_count=100,
+        optimize_after_append_count=1000,
+        persist_deltas=True,
+    )
+    await storage.start()
+
+    def publish_to_storage(message: AgentMessage) -> None:
+        if isinstance(message, AgentThreadMessage):
+            storage.push_message(message=message, sender=room.local_participant)
+
+    first_tool = _SteeringProbeTool(
+        name="encrypted_reasoning_restore_probe",
+        wait_for_release=False,
+    )
+    first_adapter = _RecordingOpenAIResponsesAdapter(
+        model=model,
+        mode="websocket",
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        reasoning_effort="low",
+        max_output_tokens=1024,
+        max_retries=0,
+    )
+    first_context = first_adapter.create_session()
+    first_context.append_user_message(
+        "Use brief reasoning, then call encrypted_reasoning_restore_probe exactly "
+        "once with note='dataset-tool-restore'. After the tool returns, reply with "
+        "exactly FIRST_TOOL_OK and nothing else."
+    )
+
+    try:
+        first_result = await asyncio.wait_for(
+            first_adapter.create_response(
+                context=first_context,
+                caller=room.local_participant,
+                toolkits=[Toolkit(name="test", tools=[first_tool])],
+                event_handler=first_adapter.make_agent_event_publisher(
+                    turn_id="turn-1",
+                    thread_id=thread_id,
+                    callback=publish_to_storage,
+                ),
+            ),
+            timeout=180.0,
+        )
+
+        assert isinstance(first_result, str)
+        assert first_tool.calls == ["dataset-tool-restore"]
+        assert _has_encrypted_reasoning(first_context.messages), json.dumps(
+            first_context.messages,
+            default=str,
+        )
+        assert _has_item_type(first_context.messages, "function_call"), json.dumps(
+            first_context.messages,
+            default=str,
+        )
+        await storage.flush()
+
+        second_tool = _SteeringProbeTool(
+            name="encrypted_reasoning_restore_probe",
+            wait_for_release=False,
+        )
+        second_adapter = _RecordingOpenAIResponsesAdapter(
+            model=model,
+            mode="websocket",
+            client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+            reasoning_effort="low",
+            max_output_tokens=512,
+            max_retries=0,
+        )
+        restored_context = second_adapter.create_session()
+        try:
+            await storage.restore_session_context_async(
+                context=restored_context,
+                llm_adapter=second_adapter,
+            )
+            assert _has_encrypted_reasoning(restored_context.messages), json.dumps(
+                restored_context.messages,
+                default=str,
+            )
+            assert _has_item_type(restored_context.messages, "function_call")
+
+            restored_context.append_user_message(
+                "Using the restored conversation, reply with exactly SECOND_TOOL_OK "
+                "and do not call tools."
+            )
+            second_result = await asyncio.wait_for(
+                second_adapter.create_response(
+                    context=restored_context,
+                    caller=room.local_participant,
+                    toolkits=[Toolkit(name="test", tools=[second_tool])],
+                    event_handler=lambda event: None,
+                ),
+                timeout=180.0,
+            )
+        finally:
+            await restored_context.close()
+
+    finally:
+        await first_context.close()
+        await storage.stop()
+
+    assert isinstance(second_result, str)
+    assert "SECOND_TOOL_OK" in second_result
+    assert second_tool.calls == []
+    restored_request = second_adapter.recorded_create_kwargs[0]
+    assert restored_request["store"] is False
+    restored_input = restored_request["input"]
+    assert isinstance(restored_input, list)
+    assert _has_encrypted_reasoning(restored_input), json.dumps(
+        restored_input,
+        default=str,
+    )
+    for item in restored_input:
+        if item.get("type") == "reasoning":
+            assert "id" not in item
+
+
+@pytest.mark.asyncio
 async def test_live_openai_websocket_reconnect_resends_current_context_after_midstream_interrupt():
     prompt = (
         "This is a websocket retry test. Reply with exactly WEBSOCKET_RESTORED "

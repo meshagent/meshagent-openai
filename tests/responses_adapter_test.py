@@ -61,6 +61,7 @@ from meshagent.agents.messages import (
     AGENT_EVENT_AUDIO_GENERATION_COMPLETED,
     AGENT_EVENT_AUDIO_GENERATION_DELTA,
     AGENT_EVENT_AUDIO_GENERATION_STARTED,
+    parse_agent_message,
 )
 from meshagent.api import RoomException
 from meshagent.api.error_codes import ErrorCode
@@ -405,6 +406,119 @@ def test_make_agent_event_reader_restores_empty_openai_encrypted_reasoning_summa
             "encrypted_content": "opaque-reasoning",
         }
     ]
+
+
+def test_make_agent_event_reader_restores_pasted_dataset_failure_without_stale_reasoning_id() -> (
+    None
+):
+    adapter = OpenAIResponsesAdapter(model="gpt-5.5", client=object())
+    restored_messages: list[dict[str, object]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+    dumped_rows = [
+        {
+            "type": "meshagent.agent.turn.start",
+            "thread_id": "dataset://agents/assistant/threads/3dbbe3cb-539c-423d-9948-f593bceb574b",
+            "turn_id": "f4dc900c-f36f-4b30-b8a4-b45892aa150b",
+            "message_id": "7bc412a0-afb9-4ab1-9230-12d37597b975",
+            "sender_name": "tula.masterman@timu.com",
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "content": [{"type": "text", "text": "Are you there?"}],
+            "instructions": "based on the previous transcript, take your turn and respond",
+            "output_modalities": ["text"],
+        },
+        {
+            "type": "meshagent.agent.turn.start.accepted",
+            "thread_id": "dataset://agents/assistant/threads/3dbbe3cb-539c-423d-9948-f593bceb574b",
+            "turn_id": "f4dc900c-f36f-4b30-b8a4-b45892aa150b",
+            "message_id": "fba086bf-ccf9-4f0d-bc23-98c2e9b59cf1",
+            "source_message_id": "7bc412a0-afb9-4ab1-9230-12d37597b975",
+            "sender_name": "assistant",
+        },
+        {
+            "type": "meshagent.agent.turn.started",
+            "thread_id": "dataset://agents/assistant/threads/3dbbe3cb-539c-423d-9948-f593bceb574b",
+            "turn_id": "f4dc900c-f36f-4b30-b8a4-b45892aa150b",
+            "message_id": "5b07b653-9c00-4269-8678-1fdb415ad077",
+            "source_message_id": "7bc412a0-afb9-4ab1-9230-12d37597b975",
+            "sender_name": "assistant",
+        },
+        {
+            "type": "meshagent.agent.reasoning_content.ended",
+            "thread_id": "dataset://agents/assistant/threads/3dbbe3cb-539c-423d-9948-f593bceb574b",
+            "turn_id": "f4dc900c-f36f-4b30-b8a4-b45892aa150b",
+            "message_id": "76f329d8-d1ac-4a9a-9974-9e17b348c621",
+            "item_id": "rs_03b3985e67f5d033016a21b2cdb1ac8195a10803ffecfe14eb",
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "sender_name": "assistant",
+            "metadata": {},
+        },
+        {
+            "type": "meshagent.agent.tool_call.started",
+            "thread_id": "dataset://agents/assistant/threads/3dbbe3cb-539c-423d-9948-f593bceb574b",
+            "turn_id": "f4dc900c-f36f-4b30-b8a4-b45892aa150b",
+            "message_id": "84c4b984-fb20-4b53-a767-d408c222e4a2",
+            "item_id": "fc_03b3985e67f5d033016a21b2cef6a48195869b5d27d38ef183",
+            "call_id": "call_JVEKubASYCughNbbOXRoKbhW",
+            "namespace": "meshagent",
+            "toolkit": "memories",
+            "tool": "search_memories",
+            "arguments": {
+                "entity_type": None,
+                "query": "user preferences greeting Tula Masterman timu.com",
+            },
+            "provider": "openai",
+            "model": "gpt-5.5",
+        },
+        {
+            "type": "meshagent.agent.tool_call.ended",
+            "thread_id": "dataset://agents/assistant/threads/3dbbe3cb-539c-423d-9948-f593bceb574b",
+            "turn_id": "f4dc900c-f36f-4b30-b8a4-b45892aa150b",
+            "message_id": "93cf91be-2d91-4ae3-b1b1-85f795cfff34",
+            "item_id": "fc_03b3985e67f5d033016a21b2cef6a48195869b5d27d38ef183",
+            "call_id": "call_JVEKubASYCughNbbOXRoKbhW",
+            "namespace": "meshagent",
+            "toolkit": "memories",
+            "tool": "search_memories",
+            "result": {
+                "type": "json",
+                "json": {
+                    "query": "user preferences greeting Tula Masterman timu.com",
+                    "memories": [
+                        {
+                            "name": "Tula Masterman",
+                            "memory": "A B2B SaaS Product Leader mentioned as being at Wayvia.",
+                        }
+                    ],
+                },
+            },
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "sender_name": "assistant",
+        },
+    ]
+
+    for row in dumped_rows:
+        reader.consume(parse_agent_message(row))
+    reader.finalize()
+
+    restored_payload = json.dumps(restored_messages, default=str)
+    assert "rs_03b3985e67f5d033016a21b2cdb1ac8195a10803ffecfe14eb" not in (
+        restored_payload
+    )
+    assert not any(message.get("type") == "reasoning" for message in restored_messages)
+    assert any(
+        message.get("type") == "function_call"
+        and message.get("id") == "fc_03b3985e67f5d033016a21b2cef6a48195869b5d27d38ef183"
+        for message in restored_messages
+    )
+    context = adapter.create_session()
+    adapter.restore_context_messages(context=context, messages=restored_messages)
+    restored_context_payload = json.dumps(context.messages, default=str)
+    assert "rs_03b3985e67f5d033016a21b2cdb1ac8195a10803ffecfe14eb" not in (
+        restored_context_payload
+    )
 
 
 def test_response_options_add_encrypted_reasoning_include() -> None:
@@ -5937,6 +6051,61 @@ def test_make_agent_event_publisher_stores_openai_reasoning_encrypted_content() 
     assert ended.provider == "openai"
     assert ended.model == "gpt-5-mini"
     assert ended.metadata == {"openai": {"encrypted_content": "opaque-reasoning"}}
+
+
+def test_make_agent_event_publisher_enriches_reasoning_from_completed_snapshot() -> (
+    None
+):
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="websocket",
+        model="gpt-5-mini",
+    )
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    publisher(
+        {
+            "type": "response.output_item.done",
+            "response_id": "resp-1",
+            "sequence_number": 1,
+            "item": {
+                "id": "rs_1",
+                "type": "reasoning",
+                "summary": [],
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp-1",
+                "output": [
+                    {
+                        "id": "rs_1",
+                        "type": "reasoning",
+                        "summary": [],
+                        "encrypted_content": "opaque-reasoning",
+                    },
+                ],
+            },
+        }
+    )
+
+    ended_messages = [
+        message
+        for message in published
+        if isinstance(message, AgentReasoningContentEnded)
+    ]
+    assert [message.metadata for message in ended_messages] == [
+        {},
+        {"openai": {"encrypted_content": "opaque-reasoning"}},
+    ]
 
 
 def test_make_agent_event_publisher_emits_compaction_from_completed_response_snapshot() -> (

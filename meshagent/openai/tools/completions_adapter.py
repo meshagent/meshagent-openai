@@ -27,7 +27,17 @@ from meshagent.agents.agent_event_reader import (
     AgentEventReaderCallbacks,
     _BufferedToolCall,
 )
-from meshagent.agents.messages import ToolChoice
+from meshagent.agents.messages import (
+    AGENT_EVENT_TEXT_CONTENT_DELTA,
+    AGENT_EVENT_TEXT_CONTENT_ENDED,
+    AGENT_EVENT_TOOL_CALL_ENDED,
+    AGENT_EVENT_TOOL_CALL_STARTED,
+    AgentTextContentDelta,
+    AgentTextContentEnded,
+    AgentToolCallEnded,
+    AgentToolCallStarted,
+    ToolChoice,
+)
 from meshagent.api.http import llm_annotation_headers, normalize_llm_annotations
 import json
 import base64
@@ -759,6 +769,116 @@ class OpenAICompletionsAdapter(LLMAdapter):
         )
 
     @staticmethod
+    def _session_metadata_string(
+        *,
+        context: AgentSessionContext,
+        key: str,
+    ) -> str | None:
+        value = context.metadata.get(key)
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        return normalized if normalized != "" else None
+
+    def _emit_assistant_text_message(
+        self,
+        *,
+        context: AgentSessionContext,
+        event_handler: Callable[[Any], None] | None,
+        text: str,
+    ) -> None:
+        if event_handler is None:
+            return
+        thread_id = self._session_metadata_string(context=context, key="thread_id")
+        turn_id = self._session_metadata_string(context=context, key="turn_id")
+        if thread_id is None or turn_id is None:
+            return
+        item_id = f"chat-completion:{turn_id}:{len(context.messages)}"
+        event_handler(
+            AgentTextContentDelta(
+                type=AGENT_EVENT_TEXT_CONTENT_DELTA,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                item_id=item_id,
+                text=text,
+                provider="openai",
+                model=self._model,
+            )
+        )
+        event_handler(
+            AgentTextContentEnded(
+                type=AGENT_EVENT_TEXT_CONTENT_ENDED,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                item_id=item_id,
+                provider="openai",
+                model=self._model,
+            )
+        )
+
+    def _emit_tool_call_started(
+        self,
+        *,
+        context: AgentSessionContext,
+        event_handler: Callable[[Any], None] | None,
+        tool_call: ChatCompletionMessageToolCall,
+    ) -> None:
+        if event_handler is None:
+            return
+        thread_id = self._session_metadata_string(context=context, key="thread_id")
+        turn_id = self._session_metadata_string(context=context, key="turn_id")
+        if thread_id is None or turn_id is None:
+            return
+        function = tool_call.function
+        event_handler(
+            AgentToolCallStarted(
+                type=AGENT_EVENT_TOOL_CALL_STARTED,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                item_id=tool_call.id,
+                namespace="openai.chat",
+                call_id=tool_call.id,
+                toolkit="tool",
+                tool=function.name,
+                arguments=json.loads(function.arguments),
+                provider="openai",
+                model=self._model,
+            )
+        )
+
+    def _emit_tool_call_ended(
+        self,
+        *,
+        context: AgentSessionContext,
+        event_handler: Callable[[Any], None] | None,
+        tool_call: ChatCompletionMessageToolCall,
+        result: Content | None,
+        error: ErrorContent | None = None,
+    ) -> None:
+        if event_handler is None:
+            return
+        thread_id = self._session_metadata_string(context=context, key="thread_id")
+        turn_id = self._session_metadata_string(context=context, key="turn_id")
+        if thread_id is None or turn_id is None:
+            return
+        function = tool_call.function
+        event_handler(
+            AgentToolCallEnded(
+                type=AGENT_EVENT_TOOL_CALL_ENDED,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                item_id=tool_call.id,
+                namespace="openai.chat",
+                call_id=tool_call.id,
+                toolkit="tool",
+                tool=function.name,
+                result=error if error is not None else result,
+                provider="openai",
+                model=self._model,
+            )
+        )
+
+    @staticmethod
     def _context_used_tokens_from_usage(usage: dict[str, float]) -> int:
         return max(
             0,
@@ -920,6 +1040,11 @@ class OpenAICompletionsAdapter(LLMAdapter):
                     tasks = []
 
                     async def do_tool_call(tool_call: ChatCompletionMessageToolCall):
+                        self._emit_tool_call_started(
+                            context=context,
+                            event_handler=event_handler,
+                            tool_call=tool_call,
+                        )
                         try:
                             tool_item_id = (
                                 tool_call.id if isinstance(tool_call.id, str) else None
@@ -947,6 +1072,12 @@ class OpenAICompletionsAdapter(LLMAdapter):
                                 )
                             else:
                                 tool_response = ensure_content(tool_response)
+                            self._emit_tool_call_ended(
+                                context=context,
+                                event_handler=event_handler,
+                                tool_call=tool_call,
+                                result=tool_response,
+                            )
                             return await tool_adapter.create_messages(
                                 context=context,
                                 tool_call=tool_call,
@@ -966,12 +1097,20 @@ class OpenAICompletionsAdapter(LLMAdapter):
                                     exc_info=e,
                                 )
 
+                            error = ErrorContent(
+                                text=f"unable to complete tool call: {e}"
+                            )
+                            self._emit_tool_call_ended(
+                                context=context,
+                                event_handler=event_handler,
+                                tool_call=tool_call,
+                                result=None,
+                                error=error,
+                            )
                             return [
                                 {
                                     "role": "tool",
-                                    "content": json.dumps(
-                                        {"error": f"unable to complete tool call: {e}"}
-                                    ),
+                                    "content": json.dumps({"error": error.text}),
                                     "tool_call_id": tool_call.id,
                                 }
                             ]
@@ -1005,6 +1144,11 @@ class OpenAICompletionsAdapter(LLMAdapter):
                     context.messages.append(message)
                     iteration_committed = True
                     content = message.content
+                    self._emit_assistant_text_message(
+                        context=context,
+                        event_handler=event_handler,
+                        text=content,
+                    )
 
                     if response_schema is None:
                         return content

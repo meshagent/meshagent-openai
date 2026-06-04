@@ -562,6 +562,103 @@ async def test_openai_completions_adapter_passes_base_url_to_get_client(monkeypa
     assert call_args["api_key"] == "test-token"
 
 
+@pytest.mark.asyncio
+async def test_openai_completions_adapter_publishes_text_events_for_restore() -> None:
+    adapter = OpenAICompletionsAdapter(
+        model="gpt-4o-mini",
+        client=_FakeOpenAIClient(
+            responses=[
+                _FakeChatCompletion(
+                    message=_FakeMessage(tool_calls=None, content="done"),
+                    usage={"prompt_tokens": 1, "completion_tokens": 1},
+                )
+            ]
+        ),
+    )
+    context = adapter.create_session()
+    context.metadata["thread_id"] = "thread-1"
+    context.metadata["turn_id"] = "turn-1"
+    context.append_user_message("hello")
+    published: list[object] = []
+
+    result = await adapter.create_response(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        toolkits=[],
+        event_handler=published.append,
+    )
+
+    assert result == "done"
+    assert [
+        type(message)
+        for message in published
+        if isinstance(message, (AgentTextContentDelta, AgentTextContentEnded))
+    ] == [AgentTextContentDelta, AgentTextContentEnded]
+    delta = next(
+        message for message in published if isinstance(message, AgentTextContentDelta)
+    )
+    assert delta.thread_id == "thread-1"
+    assert delta.turn_id == "turn-1"
+    assert delta.text == "done"
+
+
+@pytest.mark.asyncio
+async def test_openai_completions_adapter_publishes_tool_events_for_restore() -> None:
+    adapter = OpenAICompletionsAdapter(
+        model="gpt-4o-mini",
+        client=_FakeOpenAIClient(
+            responses=[
+                _FakeChatCompletion(
+                    message=_FakeMessage(
+                        tool_calls=[
+                            _FakeToolCall(
+                                tool_call_id="call_1",
+                                name="stream_tool",
+                                arguments={},
+                            )
+                        ],
+                        content=None,
+                    ),
+                    usage={"prompt_tokens": 5, "completion_tokens": 1},
+                ),
+                _FakeChatCompletion(
+                    message=_FakeMessage(tool_calls=None, content="done"),
+                    usage={"prompt_tokens": 2, "completion_tokens": 3},
+                ),
+            ]
+        ),
+    )
+    context = adapter.create_session()
+    context.metadata["thread_id"] = "thread-1"
+    context.metadata["turn_id"] = "turn-1"
+    context.append_user_message("run tool")
+    published: list[object] = []
+
+    result = await adapter.create_response(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        toolkits=[Toolkit(name="tools", tools=[_StreamingTool()])],
+        event_handler=published.append,
+    )
+
+    assert result == "done"
+    started = next(
+        message for message in published if isinstance(message, AgentToolCallStarted)
+    )
+    ended = next(
+        message for message in published if isinstance(message, AgentToolCallEnded)
+    )
+    assert started.thread_id == "thread-1"
+    assert started.turn_id == "turn-1"
+    assert started.item_id == "call_1"
+    assert started.tool == "stream_tool"
+    assert ended.thread_id == "thread-1"
+    assert ended.turn_id == "turn-1"
+    assert ended.item_id == "call_1"
+    assert isinstance(ended.result, TextContent)
+    assert ended.result.text == "tool-output"
+
+
 def test_openai_completions_adapter_reads_base_url_from_environment(monkeypatch):
     monkeypatch.setenv("OPENAI_BASE_URL", "https://env.example.test/v1")
 
