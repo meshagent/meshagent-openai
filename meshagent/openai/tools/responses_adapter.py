@@ -732,7 +732,7 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
         text: str,
         metadata: dict[str, Any],
     ) -> None:
-        message: dict[str, Any] = {"type": "reasoning"}
+        message: dict[str, Any] = {"type": "reasoning", "summary": []}
         if text != "":
             message["summary"] = [{"type": "summary_text", "text": text}]
         openai_metadata = metadata.get("openai")
@@ -1809,6 +1809,53 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             callbacks=callbacks,
             provider=self._provider,
         )
+
+    def restore_context_messages(
+        self,
+        *,
+        context: AgentSessionContext,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        context.messages.clear()
+        context.messages.extend(
+            [
+                self._normalize_restored_context_message(message=message)
+                for message in messages
+            ]
+        )
+
+    @staticmethod
+    def _normalize_restored_context_message(
+        *,
+        message: dict[str, Any],
+    ) -> dict[str, Any]:
+        restored = copy.deepcopy(message)
+        if restored.get("type") != "reasoning":
+            return restored
+
+        encrypted_content = restored.get("encrypted_content")
+        if isinstance(encrypted_content, str) and encrypted_content != "":
+            restored.pop("id", None)
+            restored.setdefault("summary", [])
+            return restored
+
+        summary = restored.get("summary")
+        summary_text_parts: list[str] = []
+        if isinstance(summary, list):
+            for part in summary:
+                if not isinstance(part, dict):
+                    continue
+                text = part.get("text")
+                if isinstance(text, str) and text.strip() != "":
+                    summary_text_parts.append(text)
+        text = "\n".join(summary_text_parts).strip()
+        if text == "":
+            text = "Restored prior reasoning item without encrypted content."
+        return {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+        }
 
     def _make_tool_response_adapter(self) -> OpenAIResponsesToolResponseAdapter:
         return OpenAIResponsesToolResponseAdapter(

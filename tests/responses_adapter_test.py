@@ -162,7 +162,9 @@ def test_make_agent_event_reader_accumulates_streamed_text_for_restore() -> None
     ]
 
 
-def test_restore_context_messages_replays_raw_messages_exactly() -> None:
+def test_restore_context_messages_normalizes_restored_reasoning_for_stateless_replay() -> (
+    None
+):
     adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
     context = adapter.create_session()
     messages = [
@@ -189,8 +191,91 @@ def test_restore_context_messages_replays_raw_messages_exactly() -> None:
 
     adapter.restore_context_messages(context=context, messages=messages)
 
-    assert context.messages == messages
+    assert context.messages == [
+        {"role": "user", "content": "what's up"},
+        {
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "opaque-reasoning",
+        },
+        {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "search_memories",
+            "arguments": "{}",
+            "status": "completed",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "tool result",
+        },
+    ]
     assert context.messages is not messages
+
+
+def test_restore_context_messages_normalizes_legacy_bare_reasoning_item() -> None:
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    context = adapter.create_session()
+
+    adapter.restore_context_messages(
+        context=context,
+        messages=[
+            {
+                "id": "rs_0bfa6f7d4fc4072d016a20ac5279bc8195961c05ca1c82c675",
+                "summary": [],
+                "type": "reasoning",
+                "content": [],
+            },
+            {
+                "arguments": '{"limit":10,"offset":0}',
+                "call_id": "call_6ICMvmUHSfuWjIJyuXPz2li4",
+                "name": "list_threads",
+                "type": "function_call",
+                "id": "fc_0bfa6f7d4fc4072d016a20ac53c2708195a5ea7848fa6aa9c8",
+                "namespace": "chat",
+                "status": "completed",
+            },
+            {
+                "output": '{"threads":[]}',
+                "call_id": "call_6ICMvmUHSfuWjIJyuXPz2li4",
+                "type": "function_call_output",
+            },
+        ],
+    )
+
+    assert context.messages == [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "Restored prior reasoning item without encrypted content.",
+                }
+            ],
+        },
+        {
+            "arguments": '{"limit":10,"offset":0}',
+            "call_id": "call_6ICMvmUHSfuWjIJyuXPz2li4",
+            "name": "list_threads",
+            "type": "function_call",
+            "id": "fc_0bfa6f7d4fc4072d016a20ac53c2708195a5ea7848fa6aa9c8",
+            "namespace": "chat",
+            "status": "completed",
+        },
+        {
+            "output": '{"threads":[]}',
+            "call_id": "call_6ICMvmUHSfuWjIJyuXPz2li4",
+            "type": "function_call_output",
+        },
+    ]
+    assert not any(
+        item.get("type") == "reasoning"
+        and item.get("id") == "rs_0bfa6f7d4fc4072d016a20ac5279bc8195961c05ca1c82c675"
+        for item in context.messages
+    )
 
 
 def test_make_agent_event_reader_converts_cross_provider_function_calls() -> None:
@@ -289,6 +374,34 @@ def test_make_agent_event_reader_restores_openai_encrypted_reasoning_metadata() 
         {
             "type": "reasoning",
             "summary": [{"type": "summary_text", "text": "Need memories."}],
+            "encrypted_content": "opaque-reasoning",
+        }
+    ]
+
+
+def test_make_agent_event_reader_restores_empty_openai_encrypted_reasoning_summary() -> (
+    None
+):
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    restored_messages: list[dict[str, object]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+
+    reader.consume(
+        AgentReasoningContentEnded(
+            type=AGENT_EVENT_REASONING_CONTENT_ENDED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="rs_1",
+            provider="openai",
+            model="gpt-5-mini",
+            metadata={"openai": {"encrypted_content": "opaque-reasoning"}},
+        )
+    )
+
+    assert restored_messages == [
+        {
+            "type": "reasoning",
+            "summary": [],
             "encrypted_content": "opaque-reasoning",
         }
     ]
