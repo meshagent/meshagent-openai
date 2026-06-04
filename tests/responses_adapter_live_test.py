@@ -15,6 +15,7 @@ from openai.types.responses.response_computer_tool_call import ResponseComputerT
 from meshagent.agents.dataset_thread_storage import DatasetThreadStorage
 from meshagent.agents.messages import (
     AGENT_EVENT_CONTEXT_COMPACTED,
+    AGENT_EVENT_TURN_ENDED,
     AGENT_MESSAGE_TURN_START,
     AgentContextCompacted,
     AgentMessage,
@@ -476,6 +477,48 @@ class _InterruptingWebsocketOpenAIResponsesAdapter(_RecordingOpenAIResponsesAdap
             if not saw_event:
                 await context.close_websocket()
                 raise RoomException("OpenAI websocket interrupted by test")
+
+        return interrupted_stream()
+
+
+class _InterruptingSecondWebsocketOpenAIResponsesAdapter(
+    _RecordingOpenAIResponsesAdapter
+):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.stream_attempts = 0
+        self.interruptions = 0
+
+    async def _create_response_websocket_stream(
+        self,
+        *,
+        context,
+        openai,
+        create_kwargs: dict,
+        extra_headers: dict[str, str],
+    ):
+        stream = await super()._create_response_websocket_stream(
+            context=context,
+            openai=openai,
+            create_kwargs=create_kwargs,
+            extra_headers=extra_headers,
+        )
+        self.stream_attempts += 1
+        if self.stream_attempts < 2 or self.interruptions > 0:
+            return stream
+
+        self.interruptions += 1
+
+        async def interrupted_stream():
+            saw_event = False
+            async for event in stream:
+                saw_event = True
+                yield event
+                await context.close_websocket()
+                raise RoomException("OpenAI websocket interrupted after tool boundary")
+            if not saw_event:
+                await context.close_websocket()
+                raise RoomException("OpenAI websocket interrupted after tool boundary")
 
         return interrupted_stream()
 
@@ -1608,6 +1651,406 @@ async def test_live_openai_process_increments_preparing_command_byte_status():
                     indent=2,
                 )
             ) from exc
+    finally:
+        await process.stop(supervisor)
+
+
+@pytest.mark.asyncio
+async def test_live_openai_process_dataset_restore_websocket_retry_uses_stateless_context():
+    room = _FakeDatasetRoom()
+    thread_id = "dataset://threads/live-openai-process-websocket-retry-restore"
+    model = os.getenv("OPENAI_PROCESS_RESTORE_RETRY_TEST_MODEL", "gpt-5.5")
+
+    first_storage = DatasetThreadStorage(
+        room=room,
+        path=thread_id,
+        max_append_message_count=1,
+        optimize_after_append_count=1000,
+        persist_deltas=True,
+    )
+    await first_storage.start()
+    first_tool = _SteeringProbeTool(
+        name="process_restore_probe",
+        wait_for_release=False,
+    )
+    first_adapter = _RecordingOpenAIResponsesAdapter(
+        model=model,
+        mode="websocket",
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        reasoning_effort="low",
+        max_output_tokens=1024,
+        max_retries=0,
+    )
+    first_supervisor = _RecordingSupervisor()
+    first_process = LLMAgentProcess(
+        thread_id=thread_id,
+        participant=room.local_participant,
+        llm_adapter=first_adapter,
+        thread_storage=first_storage,
+        toolkits=[Toolkit(name="test", tools=[first_tool])],
+    )
+
+    await first_process.start(first_supervisor)
+    try:
+        first_process.send(
+            Message(
+                data=TurnStart(
+                    type=AGENT_MESSAGE_TURN_START,
+                    message_id="process-restore-first",
+                    thread_id=thread_id,
+                    content=[
+                        {
+                            "type": "text",
+                            "text": (
+                                "Use brief reasoning, then call process_restore_probe "
+                                "exactly once with note='process-dataset-restore'. "
+                                "After the tool returns, reply with exactly FIRST_OK "
+                                "and nothing else."
+                            ),
+                        }
+                    ],
+                )
+            )
+        )
+
+        async def first_turn_finished() -> bool:
+            return any(
+                message.data.type == AGENT_EVENT_TURN_ENDED
+                for message in first_supervisor.sent
+            )
+
+        await asyncio.wait_for(_wait_until(first_turn_finished), timeout=180.0)
+        first_ended = next(
+            message.data
+            for message in reversed(first_supervisor.sent)
+            if message.data.type == AGENT_EVENT_TURN_ENDED
+        )
+        assert first_ended.error is None
+        assert first_tool.calls == ["process-dataset-restore"]
+        await first_storage.flush()
+    finally:
+        await first_process.stop(first_supervisor)
+        await first_storage.stop()
+
+    second_storage = DatasetThreadStorage(
+        room=room,
+        path=thread_id,
+        max_append_message_count=1,
+        optimize_after_append_count=1000,
+        persist_deltas=True,
+    )
+    await second_storage.start()
+    second_adapter = _InterruptingWebsocketOpenAIResponsesAdapter(
+        model=model,
+        mode="websocket",
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        reasoning_effort="low",
+        max_output_tokens=512,
+        max_retries=2,
+    )
+    second_supervisor = _RecordingSupervisor()
+    second_process = LLMAgentProcess(
+        thread_id=thread_id,
+        participant=room.local_participant,
+        llm_adapter=second_adapter,
+        thread_storage=second_storage,
+        toolkits=[],
+    )
+
+    await second_process.start(second_supervisor)
+    try:
+        second_process.send(
+            Message(
+                data=TurnStart(
+                    type=AGENT_MESSAGE_TURN_START,
+                    message_id="process-restore-second",
+                    thread_id=thread_id,
+                    content=[
+                        {
+                            "type": "text",
+                            "text": (
+                                "Using the restored conversation, reply with exactly "
+                                "SECOND_OK and nothing else."
+                            ),
+                        }
+                    ],
+                )
+            )
+        )
+
+        async def second_turn_finished() -> bool:
+            return any(
+                message.data.type == AGENT_EVENT_TURN_ENDED
+                for message in second_supervisor.sent
+            )
+
+        await asyncio.wait_for(_wait_until(second_turn_finished), timeout=180.0)
+        second_ended = next(
+            message.data
+            for message in reversed(second_supervisor.sent)
+            if message.data.type == AGENT_EVENT_TURN_ENDED
+        )
+        assert second_ended.error is None
+        assert second_adapter.interruptions == 1
+        assert len(second_adapter.recorded_create_kwargs) >= 2
+        for request in second_adapter.recorded_create_kwargs[:2]:
+            assert request["store"] is False
+            assert "previous_response_id" not in request
+            assert "previous_response_id" not in json.dumps(
+                request["input"],
+                default=str,
+            )
+        assert (
+            second_adapter.recorded_create_kwargs[1]["input"]
+            == second_adapter.recorded_create_kwargs[0]["input"]
+        )
+    finally:
+        await second_process.stop(second_supervisor)
+        await second_storage.stop()
+
+
+@pytest.mark.asyncio
+async def test_live_openai_process_dataset_tool_boundary_websocket_retry_uses_stateless_context():
+    room = _FakeDatasetRoom()
+    thread_id = "dataset://threads/live-openai-process-tool-boundary-retry"
+    storage = DatasetThreadStorage(
+        room=room,
+        path=thread_id,
+        max_append_message_count=1,
+        optimize_after_append_count=1000,
+        persist_deltas=True,
+    )
+    await storage.start()
+    tool = _SteeringProbeTool(
+        name="process_retry_probe",
+        wait_for_release=False,
+    )
+    adapter = _InterruptingSecondWebsocketOpenAIResponsesAdapter(
+        model=os.getenv("OPENAI_PROCESS_TOOL_RETRY_TEST_MODEL", "gpt-5.5"),
+        mode="websocket",
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        reasoning_effort="low",
+        max_output_tokens=1024,
+        max_retries=2,
+    )
+    supervisor = _RecordingSupervisor()
+    process = LLMAgentProcess(
+        thread_id=thread_id,
+        participant=room.local_participant,
+        llm_adapter=adapter,
+        thread_storage=storage,
+        toolkits=[Toolkit(name="test", tools=[tool])],
+    )
+
+    await process.start(supervisor)
+    try:
+        process.send(
+            Message(
+                data=TurnStart(
+                    type=AGENT_MESSAGE_TURN_START,
+                    message_id="process-tool-boundary-retry",
+                    thread_id=thread_id,
+                    content=[
+                        {
+                            "type": "text",
+                            "text": (
+                                "Use brief reasoning, then call process_retry_probe "
+                                "exactly once with note='tool-boundary-retry'. "
+                                "After the tool returns, reply with exactly RETRY_OK "
+                                "and nothing else."
+                            ),
+                        }
+                    ],
+                )
+            )
+        )
+
+        async def turn_finished() -> bool:
+            return any(
+                message.data.type == AGENT_EVENT_TURN_ENDED
+                for message in supervisor.sent
+            )
+
+        await asyncio.wait_for(_wait_until(turn_finished), timeout=180.0)
+        ended = next(
+            message.data
+            for message in reversed(supervisor.sent)
+            if message.data.type == AGENT_EVENT_TURN_ENDED
+        )
+        assert ended.error is None
+        assert tool.calls == ["tool-boundary-retry"]
+        assert adapter.interruptions == 1
+        assert len(adapter.recorded_create_kwargs) >= 3
+        first_followup = adapter.recorded_create_kwargs[1]
+        retry_followup = adapter.recorded_create_kwargs[2]
+        assert first_followup["store"] is False
+        assert retry_followup["store"] is False
+        assert isinstance(first_followup.get("previous_response_id"), str)
+        assert "previous_response_id" not in retry_followup
+        assert first_followup["input"] == [
+            item
+            for item in first_followup["input"]
+            if isinstance(item, dict)
+            and isinstance(item.get("type"), str)
+            and item["type"].endswith("_output")
+        ]
+        for item in retry_followup["input"]:
+            if isinstance(item, dict) and item.get("type") == "reasoning":
+                assert "id" not in item
+        assert len(retry_followup["input"]) > len(first_followup["input"])
+        assert any(
+            isinstance(item, dict) and item.get("type") == "function_call_output"
+            for item in retry_followup["input"]
+        )
+    finally:
+        await process.stop(supervisor)
+        await storage.stop()
+
+
+@pytest.mark.asyncio
+async def test_live_openai_process_websocket_incremental_context_across_turns_with_tools():
+    room = _FakeRoom()
+    thread_id = "thread://live-openai-process-cross-turn-incremental"
+    first_tool = _SteeringProbeTool(
+        name="cross_turn_probe_one",
+        wait_for_release=False,
+    )
+    second_tool = _SteeringProbeTool(
+        name="cross_turn_probe_two",
+        wait_for_release=False,
+    )
+    adapter = _RecordingOpenAIResponsesAdapter(
+        model=os.getenv("OPENAI_PROCESS_CROSS_TURN_INCREMENTAL_TEST_MODEL", "gpt-5.5"),
+        mode="websocket",
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        reasoning_effort="low",
+        max_output_tokens=1024,
+        max_retries=2,
+    )
+    supervisor = _RecordingSupervisor()
+    process = LLMAgentProcess(
+        thread_id=thread_id,
+        participant=room.local_participant,
+        llm_adapter=adapter,
+        toolkits=[
+            Toolkit(
+                name="test",
+                tools=[first_tool, second_tool],
+            )
+        ],
+    )
+
+    await process.start(supervisor)
+    try:
+        process.send(
+            Message(
+                data=TurnStart(
+                    type=AGENT_MESSAGE_TURN_START,
+                    message_id="cross-turn-one",
+                    thread_id=thread_id,
+                    content=[
+                        {
+                            "type": "text",
+                            "text": (
+                                "Call cross_turn_probe_one exactly once with "
+                                "note='turn-one-a' and call cross_turn_probe_two "
+                                "exactly once with note='turn-one-b'. After both "
+                                "tools return, reply with exactly FIRST_DONE and "
+                                "nothing else."
+                            ),
+                        }
+                    ],
+                )
+            )
+        )
+
+        async def first_turn_finished() -> bool:
+            return (
+                sum(
+                    1
+                    for message in supervisor.sent
+                    if message.data.type == AGENT_EVENT_TURN_ENDED
+                )
+                >= 1
+            )
+
+        await asyncio.wait_for(_wait_until(first_turn_finished), timeout=180.0)
+        first_ended = [
+            message.data
+            for message in supervisor.sent
+            if message.data.type == AGENT_EVENT_TURN_ENDED
+        ][-1]
+        assert first_ended.error is None
+        assert first_tool.calls == ["turn-one-a"]
+        assert second_tool.calls == ["turn-one-b"]
+        first_turn_request_count = len(adapter.recorded_create_kwargs)
+
+        process.send(
+            Message(
+                data=TurnStart(
+                    type=AGENT_MESSAGE_TURN_START,
+                    message_id="cross-turn-two",
+                    thread_id=thread_id,
+                    content=[
+                        {
+                            "type": "text",
+                            "text": (
+                                "For this new turn, call cross_turn_probe_one "
+                                "exactly once with note='turn-two-a' and call "
+                                "cross_turn_probe_two exactly once with "
+                                "note='turn-two-b'. After both tools return, reply "
+                                "with exactly SECOND_DONE and nothing else."
+                            ),
+                        }
+                    ],
+                )
+            )
+        )
+
+        async def second_turn_finished() -> bool:
+            return (
+                sum(
+                    1
+                    for message in supervisor.sent
+                    if message.data.type == AGENT_EVENT_TURN_ENDED
+                )
+                >= 2
+            )
+
+        await asyncio.wait_for(_wait_until(second_turn_finished), timeout=180.0)
+        second_ended = [
+            message.data
+            for message in supervisor.sent
+            if message.data.type == AGENT_EVENT_TURN_ENDED
+        ][-1]
+        assert second_ended.error is None
+        assert first_tool.calls == ["turn-one-a", "turn-two-a"]
+        assert second_tool.calls == ["turn-one-b", "turn-two-b"]
+        assert len(adapter.recorded_create_kwargs) > first_turn_request_count
+
+        second_turn_initial_request = adapter.recorded_create_kwargs[
+            first_turn_request_count
+        ]
+        assert second_turn_initial_request["store"] is False
+        assert isinstance(second_turn_initial_request.get("previous_response_id"), str)
+        second_turn_initial_input = second_turn_initial_request["input"]
+        assert isinstance(second_turn_initial_input, list)
+        assert len(second_turn_initial_input) == 1
+        assert second_turn_initial_input[0].get("role") == "user"
+        assert "turn-two-a" in json.dumps(second_turn_initial_input, default=str)
+        assert "turn-one-a" not in json.dumps(second_turn_initial_input, default=str)
+
+        second_turn_followup = adapter.recorded_create_kwargs[
+            first_turn_request_count + 1
+        ]
+        assert isinstance(second_turn_followup.get("previous_response_id"), str)
+        assert second_turn_followup["input"] == [
+            item
+            for item in second_turn_followup["input"]
+            if isinstance(item, dict)
+            and isinstance(item.get("type"), str)
+            and item["type"].endswith("_output")
+        ]
     finally:
         await process.stop(supervisor)
 

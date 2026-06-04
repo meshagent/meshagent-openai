@@ -279,6 +279,51 @@ def test_restore_context_messages_normalizes_legacy_bare_reasoning_item() -> Non
     )
 
 
+def test_response_output_item_to_context_message_normalizes_reasoning_for_stateless_replay() -> (
+    None
+):
+    class _OutputItem:
+        def model_dump(self, *, mode: str, exclude_none: bool) -> dict[str, object]:
+            assert mode == "json"
+            assert exclude_none is True
+            return {
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [],
+                "encrypted_content": "opaque-reasoning",
+            }
+
+    assert OpenAIResponsesAdapter._response_output_item_to_context_message(
+        _OutputItem()
+    ) == {
+        "type": "reasoning",
+        "summary": [],
+        "encrypted_content": "opaque-reasoning",
+    }
+
+
+def test_response_output_item_to_context_message_converts_bare_reasoning_to_text() -> (
+    None
+):
+    class _OutputItem:
+        def model_dump(self, *, mode: str, exclude_none: bool) -> dict[str, object]:
+            assert mode == "json"
+            assert exclude_none is True
+            return {
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{"type": "summary_text", "text": "Need context."}],
+            }
+
+    assert OpenAIResponsesAdapter._response_output_item_to_context_message(
+        _OutputItem()
+    ) == {
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "Need context."}],
+    }
+
+
 def test_make_agent_event_reader_converts_cross_provider_function_calls() -> None:
     adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
     restored_messages: list[dict[str, object]] = []
@@ -3467,6 +3512,193 @@ async def test_next_serializes_websocket_requests_per_session(monkeypatch):
         }
     )
     await second_task
+
+
+@pytest.mark.asyncio
+async def test_websocket_tool_followup_uses_incremental_previous_response_id(
+    monkeypatch,
+):
+    adapter = OpenAIResponsesAdapter(mode="websocket")
+    websocket = _QueuedLoggingWebSocket()
+    context = OpenAIResponsesSessionContext(
+        session=_SequentialClientSession([websocket]),
+        websocket_ping_interval_seconds=3600,
+        websocket_timeout=3600,
+    )
+    context.append_user_message("use the lookup tool")
+    tool_call = _make_function_tool_call(
+        item_id="fc_lookup",
+        tool_name="lookup",
+        call_id="call_lookup",
+        arguments={"query": "value"},
+    )
+    final_message = _make_output_message(
+        message_id="msg_final",
+        text="Done.",
+        phase="final_answer",
+    )
+
+    monkeypatch.setattr(
+        adapter,
+        "get_openai_client",
+        lambda: SimpleNamespace(
+            base_url="https://example.com/openai/v1",
+            default_headers={"Authorization": "Bearer test-token"},
+        ),
+    )
+
+    def _fake_coerce_response_stream_event(payload: dict):
+        payload_type = payload["type"]
+        if payload_type == "response.output_item.done":
+            return _FakeOutputItemDoneEvent(item=tool_call)
+        if payload_type in {"response.completed", "response.done"}:
+            response = payload.get("response", {})
+            response_id = response.get("id", "resp_ws")
+            output = [tool_call] if response_id == "resp_tool" else [final_message]
+            return _FakeCompletedEvent(
+                response=_FakeResponse(
+                    response_id=response_id,
+                    output=output,
+                )
+            )
+        return SimpleNamespace(type=payload_type)
+
+    monkeypatch.setattr(
+        adapter,
+        "_coerce_response_stream_event",
+        _fake_coerce_response_stream_event,
+    )
+
+    websocket.queue_json(
+        {
+            "type": "response.output_item.done",
+            "response_id": "resp_tool",
+            "item": tool_call.model_dump(mode="json"),
+        }
+    )
+    websocket.queue_json(
+        {
+            "type": "response.completed",
+            "response": {"id": "resp_tool", "output": [], "usage": None},
+        }
+    )
+    websocket.queue_json(
+        {
+            "type": "response.completed",
+            "response": {"id": "resp_final", "output": [], "usage": None},
+        }
+    )
+
+    try:
+        result = await adapter.create_response(
+            context=context,
+            caller=_FakeRoom().local_participant,
+            toolkits=[Toolkit(name="tools", tools=[_AnyArgsTool("lookup")])],
+        )
+    finally:
+        await context.close()
+
+    assert result == "Done."
+    assert len(websocket.sent_payloads) == 2
+    first_payload = json.loads(websocket.sent_payloads[0])
+    followup_payload = json.loads(websocket.sent_payloads[1])
+    assert "previous_response_id" not in first_payload
+    assert first_payload["input"] == [
+        {"role": "user", "content": "use the lookup tool"}
+    ]
+    assert followup_payload["previous_response_id"] == "resp_tool"
+    assert followup_payload["store"] is False
+    assert followup_payload["input"] == [
+        {
+            "type": "function_call_output",
+            "call_id": "call_lookup",
+            "output": json.dumps({"ok": True, "args": {"query": "value"}}),
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_websocket_next_turn_uses_incremental_previous_response_id(monkeypatch):
+    adapter = OpenAIResponsesAdapter(mode="websocket")
+    websocket = _QueuedLoggingWebSocket()
+    context = OpenAIResponsesSessionContext(
+        session=_SequentialClientSession([websocket]),
+        websocket_ping_interval_seconds=3600,
+        websocket_timeout=3600,
+    )
+    context.append_user_message("first turn")
+
+    monkeypatch.setattr(
+        adapter,
+        "get_openai_client",
+        lambda: SimpleNamespace(
+            base_url="https://example.com/openai/v1",
+            default_headers={"Authorization": "Bearer test-token"},
+        ),
+    )
+
+    def _fake_coerce_response_stream_event(payload: dict):
+        payload_type = payload["type"]
+        if payload_type in {"response.completed", "response.done"}:
+            response = payload.get("response", {})
+            response_id = response.get("id", "resp_ws")
+            return _FakeCompletedEvent(
+                response=_FakeResponse(
+                    response_id=response_id,
+                    output=[
+                        _make_output_message(
+                            message_id=f"msg_{response_id}",
+                            text="Done.",
+                            phase="final_answer",
+                        )
+                    ],
+                )
+            )
+        return SimpleNamespace(type=payload_type)
+
+    monkeypatch.setattr(
+        adapter,
+        "_coerce_response_stream_event",
+        _fake_coerce_response_stream_event,
+    )
+
+    try:
+        websocket.queue_json(
+            {
+                "type": "response.completed",
+                "response": {"id": "resp_first", "output": [], "usage": None},
+            }
+        )
+        first_result = await adapter.create_response(
+            context=context,
+            caller=_FakeRoom().local_participant,
+            toolkits=[],
+        )
+
+        context.append_user_message("second turn")
+        websocket.queue_json(
+            {
+                "type": "response.completed",
+                "response": {"id": "resp_second", "output": [], "usage": None},
+            }
+        )
+        second_result = await adapter.create_response(
+            context=context,
+            caller=_FakeRoom().local_participant,
+            toolkits=[],
+        )
+    finally:
+        await context.close()
+
+    assert first_result == "Done."
+    assert second_result == "Done."
+    assert len(websocket.sent_payloads) == 2
+    first_payload = json.loads(websocket.sent_payloads[0])
+    second_payload = json.loads(websocket.sent_payloads[1])
+    assert "previous_response_id" not in first_payload
+    assert first_payload["input"] == [{"role": "user", "content": "first turn"}]
+    assert second_payload["previous_response_id"] == "resp_first"
+    assert second_payload["input"] == [{"role": "user", "content": "second turn"}]
 
 
 @pytest.mark.asyncio

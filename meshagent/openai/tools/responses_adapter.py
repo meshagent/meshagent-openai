@@ -283,6 +283,8 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
         self._websocket_timeout_task: asyncio.Task[None] | None = None
         self._websocket_lock = asyncio.Lock()
         self._request_lock = asyncio.Lock()
+        self._websocket_previous_response_id: str | None = None
+        self._websocket_incremental_start_index: int | None = None
         self.pending_supplemental_usage: dict[str, float] | None = None
 
     @staticmethod
@@ -292,6 +294,46 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
     @property
     def has_valid_websocket(self) -> bool:
         return self._websocket is not None and not self._websocket.closed
+
+    def clear_websocket_incremental_state(self) -> None:
+        self._websocket_previous_response_id = None
+        self._websocket_incremental_start_index = None
+
+    def get_websocket_incremental_request(self) -> tuple[str, list[Any]] | None:
+        if not self.has_valid_websocket:
+            return None
+
+        previous_response_id = self._websocket_previous_response_id
+        incremental_start_index = self._websocket_incremental_start_index
+        if previous_response_id is None or incremental_start_index is None:
+            return None
+        if incremental_start_index < 0 or incremental_start_index > len(self.messages):
+            self.clear_websocket_incremental_state()
+            return None
+
+        incremental_input = self.messages[incremental_start_index:]
+        if len(incremental_input) == 0:
+            return None
+        return previous_response_id, copy.deepcopy(incremental_input)
+
+    def remember_websocket_response(
+        self,
+        *,
+        response_id: str | None,
+        incremental_start_index: int,
+    ) -> None:
+        if (
+            not self.has_valid_websocket
+            or response_id is None
+            or response_id.strip() == ""
+        ):
+            self.clear_websocket_incremental_state()
+            return
+        self._websocket_previous_response_id = response_id
+        self._websocket_incremental_start_index = max(
+            0,
+            min(incremental_start_index, len(self.messages)),
+        )
 
     @staticmethod
     def _header_value(
@@ -415,6 +457,7 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
         self._websocket = None
         self._websocket_url = None
         self._websocket_headers_signature = None
+        self.clear_websocket_incremental_state()
         if websocket is not None and not websocket.closed:
             await websocket.close()
 
@@ -1816,6 +1859,8 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         context: AgentSessionContext,
         messages: list[dict[str, Any]],
     ) -> None:
+        if isinstance(context, OpenAIResponsesSessionContext):
+            context.clear_websocket_incremental_state()
         context.messages.clear()
         context.messages.extend(
             [
@@ -1825,7 +1870,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         )
 
     @staticmethod
-    def _normalize_restored_context_message(
+    def _normalize_stateless_context_message(
         *,
         message: dict[str, Any],
     ) -> dict[str, Any]:
@@ -1856,6 +1901,15 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             "role": "assistant",
             "content": [{"type": "output_text", "text": text}],
         }
+
+    @staticmethod
+    def _normalize_restored_context_message(
+        *,
+        message: dict[str, Any],
+    ) -> dict[str, Any]:
+        return OpenAIResponsesAdapter._normalize_stateless_context_message(
+            message=message
+        )
 
     def _make_tool_response_adapter(self) -> OpenAIResponsesToolResponseAdapter:
         return OpenAIResponsesToolResponseAdapter(
@@ -2011,7 +2065,9 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
 
     @staticmethod
     def _response_output_item_to_context_message(output_item: Any) -> dict[str, Any]:
-        return output_item.model_dump(mode="json", exclude_none=True)
+        return OpenAIResponsesAdapter._normalize_stateless_context_message(
+            message=output_item.model_dump(mode="json", exclude_none=True)
+        )
 
     @staticmethod
     def _commit_response_context_messages(
@@ -2063,6 +2119,8 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         context.messages.extend(
             [*(x.model_dump(mode="json", exclude_none=True) for x in response.output)]
         )
+        if isinstance(context, OpenAIResponsesSessionContext):
+            context.clear_websocket_incremental_state()
         context.last_usage = None
         context.pending_supplemental_usage = None
 
@@ -3222,11 +3280,27 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                     )
 
                             openai = self.get_openai_client()
+                            incremental_input = None
+                            previous_response_id = None
+                            if self._mode == "websocket" and isinstance(
+                                context, OpenAIResponsesSessionContext
+                            ):
+                                incremental_request = (
+                                    context.get_websocket_incremental_request()
+                                )
+                                if incremental_request is not None:
+                                    previous_response_id, incremental_input = (
+                                        incremental_request
+                                    )
                             create_kwargs = {
                                 "extra_headers": extra_headers,
                                 "stream": stream,
                                 "model": model,
-                                "input": context.messages,
+                                "input": (
+                                    incremental_input
+                                    if incremental_input is not None
+                                    else context.messages
+                                ),
                                 "tools": open_ai_tools,
                                 "tool_choice": self._resolve_tool_choice(
                                     toolkits=effective_toolkits,
@@ -3238,6 +3312,10 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                 **response_options,
                                 **request_options,
                             }
+                            if previous_response_id is not None:
+                                create_kwargs["previous_response_id"] = (
+                                    previous_response_id
+                                )
                             create_kwargs["store"] = False
                             normalized_extra_headers = llm_annotation_headers(
                                 self._annotations
@@ -3920,6 +3998,17 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                         compacted=response_compacted,
                                                     )
                                                     iteration_committed = True
+                                                    if isinstance(
+                                                        context,
+                                                        OpenAIResponsesSessionContext,
+                                                    ):
+                                                        context.remember_websocket_response(
+                                                            response_id=event.response.id,
+                                                            incremental_start_index=len(
+                                                                context.messages
+                                                            )
+                                                            - len(all_outputs),
+                                                        )
 
                                                     if (
                                                         response_compacted
@@ -4132,6 +4221,13 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                         )
 
                                         restore_context_snapshot()
+                                        create_kwargs["input"] = context.messages
+                                        create_kwargs.pop("previous_response_id", None)
+                                        if isinstance(
+                                            context,
+                                            OpenAIResponsesSessionContext,
+                                        ):
+                                            context.clear_websocket_incremental_state()
                                         response = None
                                         pending_retry_completion_number = (
                                             stream_retry_number
@@ -4183,6 +4279,13 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                         )
 
                                         restore_context_snapshot()
+                                        create_kwargs["input"] = context.messages
+                                        create_kwargs.pop("previous_response_id", None)
+                                        if isinstance(
+                                            context,
+                                            OpenAIResponsesSessionContext,
+                                        ):
+                                            context.clear_websocket_incremental_state()
                                         response = None
                                         pending_retry_completion_number = (
                                             stream_retry_number
