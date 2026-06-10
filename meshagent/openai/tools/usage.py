@@ -87,6 +87,7 @@ def preprocess_openai_usage(
 
     out: dict[str, float] = {}
     saw_modal_details = False
+    output_tokens_from_aggregate = False
 
     if input_details is not None:
         cached_details = input_details.get("cached_tokens_details")
@@ -151,10 +152,13 @@ def preprocess_openai_usage(
     if saw_modal_details:
         if "output_tokens" not in out:
             aggregate_output = _to_float(usage.get("output_tokens"))
+            if aggregate_output is None:
+                aggregate_output = _to_float(usage.get("completion_tokens"))
             if aggregate_output is not None and aggregate_output > 0:
                 out["output_tokens"] = aggregate_output
+                output_tokens_from_aggregate = True
 
-        if "reasoning_tokens" in flattened:
+        if "reasoning_tokens" in flattened and not output_tokens_from_aggregate:
             out["reasoning_tokens"] = float(flattened["reasoning_tokens"])
 
         return out
@@ -171,12 +175,18 @@ def preprocess_openai_usage(
                 if uncached_input > 0:
                     out["input_tokens"] = uncached_input
 
+    has_aggregate_output = (
+        _to_float(usage.get("output_tokens")) is not None
+        or _to_float(usage.get("completion_tokens")) is not None
+    )
     for key, value in flattened.items():
         normalized_key = key
         if normalized_key == "prompt_tokens":
             normalized_key = "input_tokens"
         if normalized_key == "completion_tokens":
             normalized_key = "output_tokens"
+        if normalized_key == "reasoning_tokens" and has_aggregate_output:
+            continue
         if normalized_key in out:
             continue
         out[normalized_key] = float(value)

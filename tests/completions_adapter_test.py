@@ -916,12 +916,13 @@ async def test_next_tracks_usage_for_single_completion_response():
 
     assert result == "done"
     assert context.turn_count == 1
+    # reasoning_tokens are a subset of completion_tokens, so they are not
+    # tracked as a separate billable component when the aggregate is present.
     assert context.last_usage == SessionUsage(
         model="gpt-4o-mini",
         usage={
             "input_tokens": 6.0,
             "output_tokens": 2.0,
-            "reasoning_tokens": 1.0,
         },
         context_window_used=8,
     )
