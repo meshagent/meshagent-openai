@@ -216,6 +216,152 @@ def test_restore_context_messages_normalizes_restored_reasoning_for_stateless_re
     assert context.messages is not messages
 
 
+def test_restore_context_messages_normalizes_legacy_shell_output_string() -> None:
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    context = adapter.create_session()
+
+    adapter.restore_context_messages(
+        context=context,
+        messages=[
+            {
+                "type": "shell_call_output",
+                "call_id": "call_1",
+                "output": "hi\n",
+            },
+            {
+                "type": "local_shell_call_output",
+                "call_id": "call_2",
+                "output": "local hi\n",
+            },
+        ],
+    )
+
+    assert context.messages == [
+        {
+            "type": "shell_call_output",
+            "call_id": "call_1",
+            "output": [
+                {
+                    "outcome": {"type": "exit", "exit_code": 0},
+                    "stdout": "hi\n",
+                    "stderr": "",
+                }
+            ],
+        },
+        {
+            "type": "local_shell_call_output",
+            "call_id": "call_2",
+            "output": [
+                {
+                    "outcome": {"type": "exit", "exit_code": 0},
+                    "stdout": "local hi\n",
+                    "stderr": "",
+                }
+            ],
+        },
+    ]
+
+
+def test_restore_context_messages_preserves_legacy_shell_output_exit_code() -> None:
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    context = adapter.create_session()
+
+    adapter.restore_context_messages(
+        context=context,
+        messages=[
+            {
+                "type": "shell_call_output",
+                "call_id": "call_1",
+                "output": [
+                    {
+                        "outcome": {"type": "exit", "exit_code": 0},
+                        "stdout": "hi\n",
+                        "stderr": "",
+                    }
+                ],
+            },
+        ],
+    )
+
+    assert context.messages == [
+        {
+            "type": "shell_call_output",
+            "call_id": "call_1",
+            "output": [
+                {
+                    "outcome": {"type": "exit", "exit_code": 0},
+                    "stdout": "hi\n",
+                    "stderr": "",
+                }
+            ],
+        },
+    ]
+
+
+def test_make_agent_event_reader_roundtrips_structured_shell_output() -> None:
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    restored_messages: list[dict[str, object]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+
+    reader.consume(
+        AgentToolCallStarted(
+            type=AGENT_EVENT_TOOL_CALL_STARTED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="shell_1",
+            namespace="openai.responses",
+            call_id="call_1",
+            toolkit="openai",
+            tool="shell",
+            arguments={"action": {"commands": ["printf hi"]}},
+        )
+    )
+    reader.consume(
+        AgentToolCallEnded(
+            type=AGENT_EVENT_TOOL_CALL_ENDED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="shell_1",
+            namespace="openai.responses",
+            call_id="call_1",
+            toolkit="openai",
+            tool="shell",
+            result=JsonContent(
+                json={
+                    "output": [
+                        {
+                            "outcome": {"type": "exit", "exit_code": 0},
+                            "stdout": "hi",
+                            "stderr": "",
+                        }
+                    ]
+                }
+            ),
+        )
+    )
+
+    assert restored_messages == [
+        {
+            "type": "shell_call",
+            "id": "shell_1",
+            "status": "completed",
+            "call_id": "call_1",
+            "action": {"commands": ["printf hi"]},
+        },
+        {
+            "type": "shell_call_output",
+            "call_id": "call_1",
+            "output": [
+                {
+                    "outcome": {"type": "exit", "exit_code": 0},
+                    "stdout": "hi",
+                    "stderr": "",
+                }
+            ],
+        },
+    ]
+
+
 def test_restore_context_messages_normalizes_legacy_bare_reasoning_item() -> None:
     adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
     context = adapter.create_session()
