@@ -1035,8 +1035,19 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
     ) -> dict[str, Any] | None:
         if result is None and error is None and not logs:
             return None
+        if item_type in {"shell_call", "local_shell_call"}:
+            output = self._shell_output_from_result(
+                result=result,
+                error=error,
+                logs=logs,
+            )
+            return {
+                "type": f"{item_type}_output",
+                "call_id": call_id,
+                "output": output,
+            }
         output_text = self._result_text(result=result, error=error, logs=logs)
-        if item_type in {"shell_call", "local_shell_call", "computer_call"}:
+        if item_type == "computer_call":
             return {
                 "type": f"{item_type}_output",
                 "call_id": call_id,
@@ -1051,6 +1062,26 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
             payload["status"] = "failed" if error is not None else "completed"
             return payload
         return None
+
+    def _shell_output_from_result(
+        self,
+        *,
+        result: dict[str, Any] | None,
+        error: dict[str, Any] | None,
+        logs: list[dict[str, str]],
+    ) -> Any:
+        if error is None and result is not None:
+            result_payload = result
+            json_payload = result.get("json")
+            if result.get("type") == "json" and isinstance(json_payload, dict):
+                result_payload = json_payload
+            output = result_payload.get("output")
+            if isinstance(output, list):
+                return copy.deepcopy(output)
+            results = result_payload.get("results")
+            if isinstance(results, list):
+                return copy.deepcopy(results)
+        return self._result_text(result=result, error=error, logs=logs)
 
     def _append_assistant_structured_item(self, item: dict[str, Any]) -> None:
         self._emit_context_message(
@@ -1875,7 +1906,13 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         message: dict[str, Any],
     ) -> dict[str, Any]:
         restored = copy.deepcopy(message)
-        if restored.get("type") != "reasoning":
+        message_type = restored.get("type")
+        if message_type in {"shell_call_output", "local_shell_call_output"}:
+            OpenAIResponsesAdapter._normalize_restored_shell_call_output(
+                message=restored
+            )
+            return restored
+        if message_type != "reasoning":
             return restored
 
         encrypted_content = restored.get("encrypted_content")
@@ -1901,6 +1938,54 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             "role": "assistant",
             "content": [{"type": "output_text", "text": text}],
         }
+
+    @staticmethod
+    def _normalize_restored_shell_call_output(*, message: dict[str, Any]) -> None:
+        output = message.get("output")
+        if isinstance(output, str):
+            message["output"] = [
+                {
+                    "outcome": {"type": "exit", "exit_code": 0},
+                    "stdout": output,
+                    "stderr": "",
+                }
+            ]
+            return
+
+        if not isinstance(output, list):
+            message["output"] = [
+                {
+                    "outcome": {"type": "error"},
+                    "stdout": "",
+                    "stderr": json.dumps(output, ensure_ascii=False, default=str),
+                }
+            ]
+            return
+
+        normalized_output: list[dict[str, Any]] = []
+        for item in output:
+            if not isinstance(item, dict):
+                normalized_output.append(
+                    {
+                        "outcome": {"type": "error"},
+                        "stdout": "",
+                        "stderr": str(item),
+                    }
+                )
+                continue
+
+            normalized_item = copy.deepcopy(item)
+            outcome = normalized_item.get("outcome")
+            if isinstance(outcome, dict):
+                normalized_outcome = dict(outcome)
+                if normalized_outcome.get("type") == "exit":
+                    exit_code = normalized_outcome.get("exit_code")
+                    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+                        normalized_outcome["exit_code"] = 0
+                normalized_item["outcome"] = normalized_outcome
+            normalized_output.append(normalized_item)
+
+        message["output"] = normalized_output
 
     @staticmethod
     def _normalize_restored_context_message(

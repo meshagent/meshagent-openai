@@ -1263,6 +1263,74 @@ async def test_live_openai_adapter_restores_saved_tool_call_context(
 
 
 @pytest.mark.asyncio
+async def test_live_openai_websocket_restores_legacy_shell_output_context():
+    room = _FakeRoom()
+    adapter = _RecordingOpenAIResponsesAdapter(
+        model=os.getenv("OPENAI_SHELL_RESTORE_TEST_MODEL", "gpt-5.5"),
+        mode="websocket",
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        reasoning_effort="low",
+        max_output_tokens=256,
+        max_retries=1,
+    )
+    context = adapter.create_session()
+    adapter.restore_context_messages(
+        context=context,
+        messages=[
+            {
+                "type": "shell_call",
+                "id": "sh_legacy_restore",
+                "call_id": "call_legacy_restore",
+                "status": "completed",
+                "action": {"commands": ["printf restored-shell"]},
+            },
+            {
+                "type": "shell_call_output",
+                "call_id": "call_legacy_restore",
+                "output": "restored-shell",
+            },
+        ],
+    )
+
+    restored_output = context.messages[1]
+    assert restored_output["type"] == "shell_call_output"
+    assert restored_output["output"] == [
+        {
+            "outcome": {"type": "exit", "exit_code": 0},
+            "stdout": "restored-shell",
+            "stderr": "",
+        }
+    ]
+
+    context.append_user_message(
+        "Using the restored shell transcript, reply with exactly "
+        "RESTORED_SHELL_OK and do not call tools."
+    )
+    try:
+        result = await asyncio.wait_for(
+            adapter.create_response(
+                context=context,
+                caller=room.local_participant,
+                toolkits=[Toolkit(name="openai", tools=[ShellTool(image=None)])],
+            ),
+            timeout=180.0,
+        )
+    finally:
+        await context.close()
+
+    first_input = adapter.recorded_create_kwargs[0]["input"]
+    replayed_output = next(
+        item for item in first_input if item.get("type") == "shell_call_output"
+    )
+    assert isinstance(replayed_output["output"], list)
+    assert replayed_output["output"][0]["outcome"] == {
+        "type": "exit",
+        "exit_code": 0,
+    }
+    assert "RESTORED_SHELL_OK" in result
+
+
+@pytest.mark.asyncio
 async def test_live_openai_tool_call_restores_into_anthropic():
     anthropic_client = _anthropic_client_if_key_set()
     room = _FakeRoom()
