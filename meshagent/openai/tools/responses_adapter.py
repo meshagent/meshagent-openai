@@ -13,7 +13,11 @@ from meshagent.openai.tools.event_publisher import (
 )
 from meshagent.agents.images_dataset import ImagesDataset
 from meshagent.agents.messages import AgentMessage, ToolChoice
-from meshagent.agents.mcp import MCPServerConfig, MCPToolkitClientOptions
+from meshagent.agents.mcp import (
+    MCPServerConfig,
+    MCPToolkitClientOptions,
+    apply_mcp_proxy_config,
+)
 from meshagent.tools import (
     Toolkit,
     ToolContext,
@@ -5173,7 +5177,13 @@ def _merge_mcp_server_configs(
     options = MCPToolkitClientOptions.model_validate(client_options)
     for server in options.servers:
         merged_by_label[server.server_label] = server
-    return list(merged_by_label.values())
+    return [
+        apply_mcp_proxy_config(
+            server=server,
+            proxy_config=options.meshagent_proxy_config,
+        )
+        for server in merged_by_label.values()
+    ]
 
 
 class OpenAIResponsesMCPToolkit(Toolkit):

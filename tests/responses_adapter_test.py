@@ -75,6 +75,7 @@ from meshagent.openai.tools.responses_adapter import (
     MCPServer,
     MCPTool,
     OpenAIResponsesAdapter,
+    OpenAIResponsesMCPToolkit,
     OpenAIResponsesToolResponseAdapter,
     OpenAIResponsesSessionContext,
     OpenAIResponsesToolSearchRequest,
@@ -1704,6 +1705,41 @@ def test_openai_mcp_tool_preserves_configured_authorization() -> None:
     definitions = tool.get_open_ai_tool_definitions()
 
     assert definitions[0]["authorization"] == "Bearer token"
+
+
+def test_openai_mcp_toolkit_rewrites_proxy_secret_servers() -> None:
+    toolkit = OpenAIResponsesMCPToolkit()
+    tools = toolkit.get_tools(
+        client_options={
+            "meshagent_proxy_config": {
+                "api_url": "http://router.internal:8080/",
+                "api_key": "runtime-api-key",
+            },
+            "servers": [
+                {
+                    "server_label": "docs",
+                    "server_url": "https://mcp.example.test/mcp?existing=1",
+                    "use_proxy_secret": "secret-123",
+                    "headers": {"x-safe": "kept"},
+                }
+            ],
+        }
+    )
+
+    assert len(tools) == 1
+    assert isinstance(tools[0], MCPTool)
+    definitions = tools[0].get_open_ai_tool_definitions()
+
+    assert definitions[0]["server_url"] == (
+        "http://router.internal:8080/proxy-request?"
+        "url=https%3A%2F%2Fmcp.example.test%2Fmcp%3Fexisting%3D1&"
+        "secret-id=secret-123"
+    )
+    assert definitions[0]["headers"] == {
+        "x-safe": "kept",
+        "Authorization": "Bearer runtime-api-key",
+    }
+    assert definitions[0]["authorization"] is None
 
 
 def test_image_generation_tool_defaults_to_gpt_image_2() -> None:
