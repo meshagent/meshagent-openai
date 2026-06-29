@@ -4802,7 +4802,7 @@ class CodeInterpreterTool(OpenAIResponsesTool):
 
         for result in results:
             if result.type == "logs":
-                logs.append(results["logs"])
+                logs.append(result["logs"])
 
             elif result.type == "files":
                 files.append(

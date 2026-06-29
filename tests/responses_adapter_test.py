@@ -71,6 +71,7 @@ from meshagent.computers.operator import Operator
 import meshagent.openai.tools.responses_adapter as responses_adapter_module
 from meshagent.openai.tools.responses_adapter import (
     DEFAULT_IMAGE_GENERATION_MODEL,
+    CodeInterpreterTool,
     ImageGenerationTool,
     MCPServer,
     MCPTool,
@@ -86,6 +87,11 @@ from meshagent.openai.tools.responses_adapter import (
     safe_tool_name,
 )
 from meshagent.tools import FunctionTool, Toolkit, ToolContext
+
+
+class _AttrDict(dict):
+    def __getattr__(self, name: str):
+        return self[name]
 
 
 def test_list_models_advertises_attachment_capabilities() -> None:
@@ -1740,6 +1746,56 @@ def test_openai_mcp_toolkit_rewrites_proxy_secret_servers() -> None:
         "Authorization": "Bearer runtime-api-key",
     }
     assert definitions[0]["authorization"] is None
+
+
+@pytest.mark.asyncio
+async def test_code_interpreter_handler_collects_logs_and_files() -> None:
+    class RecordingCodeInterpreterTool(CodeInterpreterTool):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: dict | None = None
+
+        async def on_code_interpreter_result(
+            self,
+            context: ToolContext,
+            *,
+            code: str,
+            logs: list[str],
+            files: list,
+        ):
+            del context
+            self.seen = {"code": code, "logs": logs, "files": files}
+
+    tool = RecordingCodeInterpreterTool()
+    await tool.handle_code_interpreter_call(
+        ToolContext(caller=_FakeParticipant()),
+        code="print(1)",
+        id="item-1",
+        call_id="call-1",
+        status="completed",
+        type="code_interpreter_call",
+        container_id="container-1",
+        results=[
+            _AttrDict({"type": "logs", "logs": "hello\n"}),
+            _AttrDict(
+                {
+                    "type": "files",
+                    "file_id": "file-1",
+                    "mime_type": "text/plain",
+                }
+            ),
+            _AttrDict({"type": "unknown", "ignored": True}),
+        ],
+        extra="ignored",
+    )
+
+    assert tool.seen is not None
+    assert tool.seen["code"] == "print(1)"
+    assert tool.seen["logs"] == ["hello\n"]
+    assert len(tool.seen["files"]) == 1
+    assert tool.seen["files"][0].container_id == "container-1"
+    assert tool.seen["files"][0].file_id == "file-1"
+    assert tool.seen["files"][0].mime_type == "text/plain"
 
 
 def test_image_generation_tool_defaults_to_gpt_image_2() -> None:
