@@ -16,15 +16,15 @@ from .completions_adapter import (
 from .stt import OpenAIAudioFileSTT, OpenAISTTToolkit
 
 __all__ = [
-    OpenAIResponsesAdapter,
-    OpenAIResponsesToolResponseAdapter,
-    OpenAIResponsesMCPToolkit,
-    DEFAULT_OPENAI_REALTIME_TURN_DETECTION,
-    DEFAULT_OPENAI_REALTIME_TRANSCRIPTION_MODEL,
-    OpenAIRealtimeAdapter,
-    OpenAIRealtimeSessionContext,
-    OpenAICompletionsAdapter,
-    OpenAICompletionsToolResponseAdapter,
-    OpenAIAudioFileSTT,
-    OpenAISTTToolkit,
+    "OpenAIResponsesAdapter",
+    "OpenAIResponsesToolResponseAdapter",
+    "OpenAIResponsesMCPToolkit",
+    "DEFAULT_OPENAI_REALTIME_TURN_DETECTION",
+    "DEFAULT_OPENAI_REALTIME_TRANSCRIPTION_MODEL",
+    "OpenAIRealtimeAdapter",
+    "OpenAIRealtimeSessionContext",
+    "OpenAICompletionsAdapter",
+    "OpenAICompletionsToolResponseAdapter",
+    "OpenAIAudioFileSTT",
+    "OpenAISTTToolkit",
 ]

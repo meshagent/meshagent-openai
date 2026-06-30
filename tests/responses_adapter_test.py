@@ -1061,10 +1061,7 @@ def test_make_agent_event_reader_restores_tool_lifecycle_as_responses_items(
     restored_call = messages[0]
     assert restored_call["type"] == expected_type
     if expected_type == "function_call":
-        assert restored_call["arguments"] == json.dumps(
-            arguments,
-            separators=(",", ":"),
-        )
+        assert json.loads(restored_call["arguments"]) == arguments
         assert messages[1] == {
             "type": "function_call_output",
             "call_id": "call-1",

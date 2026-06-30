@@ -7,9 +7,9 @@ from .proxy import (
 )
 
 __all__ = [
-    get_client,
-    get_logging_httpx_client,
-    resolve_base_url,
-    resolve_api_key,
-    resolve_user_agent,
+    "get_client",
+    "get_logging_httpx_client",
+    "resolve_base_url",
+    "resolve_api_key",
+    "resolve_user_agent",
 ]
