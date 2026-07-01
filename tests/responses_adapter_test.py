@@ -37,6 +37,7 @@ from meshagent.agents.messages import (
     AGENT_EVENT_TOOL_CALL_ENDED,
     AGENT_EVENT_TOOL_CALL_STARTED,
     AgentContextCompacted,
+    AgentError,
     AgentAudioGenerationCompleted,
     AgentAudioGenerationDelta,
     AgentAudioGenerationStarted,
@@ -365,6 +366,61 @@ def test_make_agent_event_reader_roundtrips_structured_shell_output() -> None:
                     "stderr": "",
                 }
             ],
+        },
+    ]
+
+
+def test_make_agent_event_reader_replays_failed_shell_call_without_error_param() -> (
+    None
+):
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    restored_messages: list[dict[str, object]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+
+    reader.consume(
+        AgentToolCallStarted(
+            type=AGENT_EVENT_TOOL_CALL_STARTED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="shell_1",
+            namespace="openai.responses",
+            call_id="call_1",
+            toolkit="openai",
+            tool="shell",
+            arguments={
+                "action": {"commands": ["cat /data/agents/assistant/heartbeat.md"]}
+            },
+        )
+    )
+    reader.consume(
+        AgentToolCallEnded(
+            type=AGENT_EVENT_TOOL_CALL_ENDED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="shell_1",
+            namespace="openai.responses",
+            call_id="call_1",
+            toolkit="openai",
+            tool="shell",
+            error=AgentError(
+                message="Transport endpoint is not connected",
+                code="tool_call_failed",
+            ),
+        )
+    )
+
+    assert restored_messages == [
+        {
+            "type": "shell_call",
+            "id": "shell_1",
+            "status": "failed",
+            "call_id": "call_1",
+            "action": {"commands": ["cat /data/agents/assistant/heartbeat.md"]},
+        },
+        {
+            "type": "shell_call_output",
+            "call_id": "call_1",
+            "output": '{"error":{"message":"Transport endpoint is not connected","code":"tool_call_failed"}}',
         },
     ]
 

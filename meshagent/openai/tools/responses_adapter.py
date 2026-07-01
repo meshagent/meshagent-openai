@@ -1024,8 +1024,6 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
             "apply_patch_call",
         }:
             item["output"] = copy.deepcopy(result)
-        if error is not None:
-            item["error"] = copy.deepcopy(error)
         return item
 
     def _builtin_output_item(
