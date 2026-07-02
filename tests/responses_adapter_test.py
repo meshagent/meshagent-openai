@@ -1850,6 +1850,105 @@ async def test_code_interpreter_handler_collects_logs_and_files() -> None:
     assert tool.seen["files"][0].file_id == "file-1"
     assert tool.seen["files"][0].mime_type == "text/plain"
 
+    with pytest.raises(ValueError, match="logs field is required"):
+        await tool.handle_code_interpreter_call(
+            ToolContext(caller=_FakeParticipant()),
+            code="print(1)",
+            id="item-2",
+            call_id="call-2",
+            status="completed",
+            type="code_interpreter_call",
+            container_id="container-1",
+            results=[_AttrDict({"type": "logs"})],
+        )
+
+    with pytest.raises(ValueError, match="logs must be a string"):
+        await tool.handle_code_interpreter_call(
+            ToolContext(caller=_FakeParticipant()),
+            code="print(1)",
+            id="item-logs",
+            call_id="call-logs",
+            status="completed",
+            type="code_interpreter_call",
+            container_id="container-1",
+            results=[_AttrDict({"type": "logs", "logs": 7})],
+        )
+
+    with pytest.raises(ValueError, match="type must be a string"):
+        await tool.handle_code_interpreter_call(
+            ToolContext(caller=_FakeParticipant()),
+            code="print(1)",
+            id="item-type",
+            call_id="call-type",
+            status="completed",
+            type="code_interpreter_call",
+            container_id="container-1",
+            results=[_AttrDict({"type": 7})],
+        )
+
+    with pytest.raises(ValueError, match="file_id field is required"):
+        await tool.handle_code_interpreter_call(
+            ToolContext(caller=_FakeParticipant()),
+            code="print(1)",
+            id="item-file-id",
+            call_id="call-file-id",
+            status="completed",
+            type="code_interpreter_call",
+            container_id="container-1",
+            results=[_AttrDict({"type": "files", "mime_type": "text/plain"})],
+        )
+
+    with pytest.raises(ValueError, match="mime_type field is required"):
+        await tool.handle_code_interpreter_call(
+            ToolContext(caller=_FakeParticipant()),
+            code="print(1)",
+            id="item-3",
+            call_id="call-3",
+            status="completed",
+            type="code_interpreter_call",
+            container_id="container-1",
+            results=[
+                _AttrDict(
+                    {
+                        "type": "files",
+                        "file_id": "file-1",
+                    }
+                )
+            ],
+        )
+
+    with pytest.raises(ValueError, match="mime_type must be a string"):
+        await tool.handle_code_interpreter_call(
+            ToolContext(caller=_FakeParticipant()),
+            code="print(1)",
+            id="item-mime",
+            call_id="call-mime",
+            status="completed",
+            type="code_interpreter_call",
+            container_id="container-1",
+            results=[
+                _AttrDict(
+                    {
+                        "type": "files",
+                        "file_id": "file-1",
+                        "mime_type": 7,
+                    }
+                )
+            ],
+        )
+
+    with pytest.raises(ValueError, match="code interpreter result must be an object"):
+        await tool.handle_code_interpreter_call(
+            ToolContext(caller=_FakeParticipant()),
+            code="print(1)",
+            id="item-4",
+            call_id="call-4",
+            status="completed",
+            type="code_interpreter_call",
+            container_id="container-1",
+            results=["not an object"],
+        )
+
 
 def test_image_generation_tool_defaults_to_gpt_image_2() -> None:
     tool = ImageGenerationTool()

@@ -4742,6 +4742,20 @@ class ContainerFile:
         self.container_id = container_id
 
 
+def _required_code_interpreter_string_field(
+    result: Mapping[str, Any], field: str
+) -> str:
+    try:
+        value = result[field]
+    except KeyError:
+        raise ValueError(f"{field} field is required") from None
+
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+
+    return value
+
+
 class CodeInterpreterTool(OpenAIResponsesTool):
     def __init__(
         self,
@@ -4799,15 +4813,23 @@ class CodeInterpreterTool(OpenAIResponsesTool):
         files = []
 
         for result in results:
-            if result.type == "logs":
-                logs.append(result["logs"])
+            if not isinstance(result, Mapping):
+                raise ValueError("code interpreter result must be an object")
 
-            elif result.type == "files":
+            result_type = _required_code_interpreter_string_field(result, "type")
+            if result_type == "logs":
+                logs.append(_required_code_interpreter_string_field(result, "logs"))
+
+            elif result_type == "files":
                 files.append(
                     ContainerFile(
                         container_id=container_id,
-                        file_id=result["file_id"],
-                        mime_type=result["mime_type"],
+                        file_id=_required_code_interpreter_string_field(
+                            result, "file_id"
+                        ),
+                        mime_type=_required_code_interpreter_string_field(
+                            result, "mime_type"
+                        ),
                     )
                 )
 
