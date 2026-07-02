@@ -2086,6 +2086,80 @@ def test_openai_responses_adapter_websocket_payload_helpers_match_python() -> No
     )
 
 
+def test_openai_responses_adapter_websocket_request_log_helpers_match_python() -> None:
+    adapter = OpenAIResponsesAdapter(client=_FakeOpenAIClient(outcomes=[]))
+
+    payload = adapter._build_websocket_request_payload(  # noqa: SLF001
+        {
+            "stream": True,
+            "extra_headers": {"Authorization": "Bearer secret"},
+            "background": True,
+            "tools": responses_adapter_module.NOT_GIVEN,
+            "model": "gpt-5.2",
+            "input": [{"role": "user", "content": "hello"}],
+            "metadata": "NOT_GIVEN",
+            "store": False,
+        }
+    )
+    assert payload == {
+        "type": "response.create",
+        "model": "gpt-5.2",
+        "input": [{"role": "user", "content": "hello"}],
+        "metadata": "NOT_GIVEN",
+        "store": False,
+    }
+
+    headers = adapter._websocket_headers(  # noqa: SLF001
+        openai=SimpleNamespace(
+            default_headers={
+                "Authorization": "Bearer default",
+                "Content-Type": "application/json",
+                "Content-Length": "123",
+                "X-Number": 7,
+            }
+        ),
+        extra_headers={
+            "Authorization": "Bearer override",
+            "X-Test": "yes",
+        },
+    )
+    assert headers == {
+        "Authorization": "Bearer override",
+        "X-Test": "yes",
+    }
+
+    assert responses_adapter_module._redact_log_headers(  # noqa: SLF001
+        {
+            "Authorization": "Bearer token",
+            "x-api-key": "secret",
+            "X-Other": "visible",
+        }
+    ) == {
+        "Authorization": "***REDACTED***",
+        "x-api-key": "***REDACTED***",
+        "X-Other": "visible",
+    }
+    assert (
+        responses_adapter_module._safe_json_for_log(["é", {"ok": True}])  # noqa: SLF001
+        == '["é", {"ok": true}]'
+    )
+    oversized_payload = (
+        "x" * responses_adapter_module._MAX_LOGGED_WEBSOCKET_PAYLOAD_CHARS  # noqa: SLF001
+        + "é"
+    )
+    truncated = responses_adapter_module._truncate_log_payload(  # noqa: SLF001
+        oversized_payload
+    )
+    assert truncated.startswith(
+        "x" * responses_adapter_module._MAX_LOGGED_WEBSOCKET_PAYLOAD_CHARS  # noqa: SLF001
+    )
+    assert truncated.endswith(
+        "\n... (truncated, "
+        f"{responses_adapter_module._MAX_LOGGED_WEBSOCKET_PAYLOAD_CHARS + 1}"  # noqa: SLF001
+        " chars total)"
+    )
+
+
 def test_openai_mcp_tool_coerces_headers_dict_to_strict_header_entries() -> None:
     server = MCPServer.model_validate(
         {
