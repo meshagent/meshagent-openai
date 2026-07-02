@@ -1769,6 +1769,31 @@ async def test_openai_responses_tool_response_adapter_content_branches() -> None
         )
         == raw_outputs
     )
+    raw_object = {"type": "already-built"}
+    assert (
+        await adapter.create_messages(
+            context=None,  # type: ignore[arg-type]
+            tool_call=_AttrDict(call_id="call-raw-object"),
+            response=RawOutputsContent(outputs=raw_object),
+        )
+        == raw_object
+    )
+    assert (
+        await adapter.create_messages(
+            context=None,  # type: ignore[arg-type]
+            tool_call=_AttrDict(call_id="call-raw-text"),
+            response=RawOutputsContent(outputs="text"),
+        )
+        == "text"
+    )
+    assert (
+        await adapter.create_messages(
+            context=None,  # type: ignore[arg-type]
+            tool_call=_AttrDict(call_id="call-raw-null"),
+            response=RawOutputsContent(outputs=None),
+        )
+        is None
+    )
     assert await adapter.create_messages(
         context=None,  # type: ignore[arg-type]
         tool_call=_AttrDict(call_id="call-text"),

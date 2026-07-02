@@ -263,9 +263,20 @@ def test_websocket_headers_remove_beta_and_http_headers_case_insensitively() -> 
 
 
 def test_list_models_advertises_realtime_protocols() -> None:
-    adapter = _adapter(realtime_protocols=("webrtc", "websocket"))
+    adapter = _adapter(realtime_protocols=("webrtc", "websocket", "webrtc"))
 
     assert adapter.list_models()[0].realtime_protocols == ("webrtc", "websocket")
+
+
+def test_list_models_uses_trimmed_realtime_voice_and_transcription_defaults() -> None:
+    adapter = _adapter(
+        voice=" verse ",
+        transcription_model=" ",
+    )
+    model = adapter.list_models()[0]
+
+    assert model.default_output_voice == "verse"
+    assert adapter._transcription_model is None
 
 
 def test_list_models_advertises_realtime_context_windows() -> None:

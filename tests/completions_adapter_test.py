@@ -36,6 +36,19 @@ def test_list_models_advertises_attachment_capabilities() -> None:
     assert "application/xhtml+xml" in model.accepts
 
 
+def test_openai_completions_adapter_preserves_none_model_branch() -> None:
+    adapter = OpenAICompletionsAdapter(model=None)
+
+    assert adapter.default_model() is None
+    assert adapter.list_models()[0].name is None
+    with pytest.raises(
+        AttributeError,
+        match="'NoneType' object has no attribute 'startswith'",
+    ):
+        adapter.create_session()
+    assert adapter.with_runtime_api_key(api_key="runtime-key")._model is None
+
+
 class _FakeDeveloper:
     def log_nowait(self, *, type: str, data: dict) -> None:
         del type
