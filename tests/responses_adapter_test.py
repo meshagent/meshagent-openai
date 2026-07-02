@@ -11,7 +11,7 @@ from aiohttp.client_reqrep import RequestInfo
 from multidict import CIMultiDict, CIMultiDictProxy
 from openai._models import BaseModel as OpenAIBaseModel
 from types import SimpleNamespace
-from openai import APIError
+from openai import APIError, APIStatusError
 from openai.types.responses.response_computer_tool_call import ResponseComputerToolCall
 from openai.types.responses.response_function_shell_tool_call import (
     ResponseFunctionShellToolCall,
@@ -62,6 +62,7 @@ from meshagent.agents.messages import (
     AGENT_EVENT_AUDIO_GENERATION_COMPLETED,
     AGENT_EVENT_AUDIO_GENERATION_DELTA,
     AGENT_EVENT_AUDIO_GENERATION_STARTED,
+    ToolChoice,
     parse_agent_message,
 )
 from meshagent.api import RoomException
@@ -80,6 +81,7 @@ from meshagent.computers.agent import ComputerToolkit
 from meshagent.computers.operator import Operator
 import meshagent.openai.tools.responses_adapter as responses_adapter_module
 from meshagent.openai.tools.responses_adapter import (
+    ApplyPatchTool,
     DEFAULT_IMAGE_GENERATION_MODEL,
     CodeInterpreterTool,
     ImageGenerationTool,
@@ -98,6 +100,7 @@ from meshagent.openai.tools.responses_adapter import (
     safe_tool_name,
 )
 from meshagent.tools import FunctionTool, Toolkit, ToolContext
+from meshagent.tools.storage import StorageToolkit, StorageToolLocalMount
 
 
 class _AttrDict(dict):
@@ -1865,41 +1868,221 @@ def test_openai_responses_adapter_passes_through_tool_truncation_limits() -> Non
 def test_openai_responses_adapter_publishes_tool_argument_deltas() -> None:
     adapter = OpenAIResponsesAdapter(client=_FakeOpenAIClient(outcomes=[]))
 
-    assert adapter._should_publish_stream_event(  # noqa: SLF001
-        event=SimpleNamespace(type="response.function_call_arguments.delta")
+    for event_type in [
+        "response.function_call_arguments.delta",
+        "response.mcp_call_arguments.delta",
+        "response.mcp_call.arguments.delta",
+        "response.code_interpreter_call_code.delta",
+        "response.shell_call_command.delta",
+        "response.custom_tool_call_input.delta",
+        "response.apply_patch_call.delta",
+        "response.apply_patch_call.patch.delta",
+        "response.apply_patch_call_operation_diff.delta",
+        "response.apply_patch_call_output.delta",
+        "response.apply_patch_call.in_progress",
+        "response.apply_patch_call.completed",
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.image_generation_call.partial_image",
+        "response.reasoning_summary_text.delta",
+        "response.computer_call.in_progress",
+        "response.computer_call.completed",
+    ]:
+        assert adapter._should_publish_stream_event(  # noqa: SLF001
+            event=SimpleNamespace(type=event_type)
+        ), event_type
+
+    for event_type in [
+        "response.mcp_call.in_progress",
+        "response.mcp_list_tools.completed",
+        "response.web_search_call.searching",
+        "response.file_search_call.completed",
+        "response.apply_patch_call.failed",
+        "response.apply_patch_call_output.completed",
+        "response.code_interpreter_call.in_progress",
+        "response.custom_tool_call.completed",
+        "response.custom_tool_call_input.done",
+        "response.function_call.completed",
+        "response.function_call_arguments.done",
+    ]:
+        assert not adapter._should_publish_stream_event(  # noqa: SLF001
+            event=SimpleNamespace(type=event_type)
+        ), event_type
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_adapter_termination_helpers_match_python_branches() -> (
+    None
+):
+    adapter = OpenAIResponsesAdapter(client=_FakeOpenAIClient(outcomes=[]))
+    context = adapter.create_session()
+    context.messages.extend(
+        [
+            {"type": "message", "phase": "draft"},
+            {"type": "message", "phase": 7},
+            {"type": "message"},
+            {"type": "message", "phase": "final_answer"},
+        ]
     )
-    assert adapter._should_publish_stream_event(  # noqa: SLF001
-        event=SimpleNamespace(type="response.mcp_call_arguments.delta")
+    assert (
+        adapter._get_latest_response_phase_from_messages(context=context)  # noqa: SLF001
+        == "final_answer"
     )
-    assert adapter._should_publish_stream_event(  # noqa: SLF001
-        event=SimpleNamespace(type="response.mcp_call.arguments.delta")
+    assert await adapter.check_for_termination(context=context) is True
+
+    context = adapter.create_session()
+    context.messages.extend(
+        [
+            {"type": "message", "phase": "draft"},
+            {"type": "tool_call", "phase": "final_answer"},
+        ]
     )
-    assert adapter._should_publish_stream_event(  # noqa: SLF001
-        event=SimpleNamespace(type="response.code_interpreter_call_code.delta")
+    assert adapter._get_latest_response_phase_from_messages(context=context) is None  # noqa: SLF001
+    assert await adapter.check_for_termination(context=context) is False
+
+    context = adapter.create_session()
+    context.messages.append({"role": "assistant", "content": "done"})
+    assert await adapter.check_for_termination(context=context) is True
+
+    context = adapter.create_session()
+    assert await adapter.check_for_termination(context=context) is False
+
+    context = adapter.create_session()
+    context.messages.append("not-dict")  # type: ignore[arg-type]
+    with pytest.raises(AttributeError, match="'str' object has no attribute 'get'"):
+        adapter._get_latest_response_phase_from_messages(context=context)  # noqa: SLF001
+
+    context = adapter.create_session()
+    context.messages.append(7)  # type: ignore[arg-type]
+    with pytest.raises(AttributeError, match="'int' object has no attribute 'get'"):
+        await adapter.check_for_termination(context=context)
+
+
+def test_openai_responses_adapter_resolve_tool_choice_branches(tmp_path) -> None:
+    adapter = OpenAIResponsesAdapter(client=_FakeOpenAIClient(outcomes=[]))
+    storage = StorageToolkit(
+        mounts=[
+            StorageToolLocalMount(
+                path="/",
+                local_path=str(tmp_path),
+            )
+        ]
     )
-    assert adapter._should_publish_stream_event(  # noqa: SLF001
-        event=SimpleNamespace(type="response.shell_call_command.delta")
+    toolkits = [
+        Toolkit(name="math", tools=[_AnyArgsTool("add.one")]),
+        Toolkit(
+            name="native",
+            tools=[
+                MCPTool(
+                    servers=[
+                        MCPServer(
+                            server_label="primary",
+                            server_url="https://mcp.example.test",
+                        )
+                    ]
+                ),
+                ShellTool(image=None),
+                ApplyPatchTool(storage=storage),
+                ImageGenerationTool(),
+            ],
+        ),
+    ]
+
+    assert adapter._resolve_tool_choice(  # noqa: SLF001
+        toolkits=toolkits,
+        tool_choice=ToolChoice(toolkit_name="math", tool_name="add.one"),
+    ) == {"type": "function", "name": "add_one"}
+    assert adapter._resolve_tool_choice(  # noqa: SLF001
+        toolkits=toolkits,
+        tool_choice=ToolChoice(toolkit_name="native", tool_name="mcp"),
+    ) == {"type": "mcp", "server_label": "mcp"}
+    assert adapter._resolve_tool_choice(  # noqa: SLF001
+        toolkits=toolkits,
+        tool_choice=ToolChoice(toolkit_name="native", tool_name="shell"),
+    ) == {"type": "shell"}
+    assert adapter._resolve_tool_choice(  # noqa: SLF001
+        toolkits=toolkits,
+        tool_choice=ToolChoice(toolkit_name="native", tool_name="apply_patch"),
+    ) == {"type": "apply_patch"}
+
+    with pytest.raises(RoomException, match="unknown toolkit in tool_choice: missing"):
+        adapter._resolve_tool_choice(  # noqa: SLF001
+            toolkits=toolkits,
+            tool_choice=ToolChoice(toolkit_name="missing", tool_name="add.one"),
+        )
+    with pytest.raises(
+        RoomException, match="unknown tool in tool_choice: math.missing"
+    ):
+        adapter._resolve_tool_choice(  # noqa: SLF001
+            toolkits=toolkits,
+            tool_choice=ToolChoice(toolkit_name="math", tool_name="missing"),
+        )
+    with pytest.raises(
+        RoomException,
+        match="tool_choice is not supported for ImageGenerationTool",
+    ):
+        adapter._resolve_tool_choice(  # noqa: SLF001
+            toolkits=toolkits,
+            tool_choice=ToolChoice(
+                toolkit_name="native",
+                tool_name="image_generation",
+            ),
+        )
+
+
+def test_openai_responses_adapter_websocket_payload_helpers_match_python() -> None:
+    adapter = OpenAIResponsesAdapter(client=_FakeOpenAIClient(outcomes=[]))
+
+    assert (
+        adapter._response_id_from_payload(  # noqa: SLF001
+            {"response_id": " resp_1 ", "response": {"id": "ignored"}}
+        )
+        == "resp_1"
     )
-    assert adapter._should_publish_stream_event(  # noqa: SLF001
-        event=SimpleNamespace(type="response.custom_tool_call_input.delta")
+    assert (
+        adapter._response_id_from_payload(  # noqa: SLF001
+            {"response_id": " ", "response": {"id": " resp_2 "}}
+        )
+        == "resp_2"
     )
-    assert adapter._should_publish_stream_event(  # noqa: SLF001
-        event=SimpleNamespace(type="response.apply_patch_call.delta")
+    assert (
+        adapter._response_id_from_payload(  # noqa: SLF001
+            {"response_id": 7, "response": {"id": ""}}
+        )
+        is None
     )
-    assert adapter._should_publish_stream_event(  # noqa: SLF001
-        event=SimpleNamespace(type="response.apply_patch_call.patch.delta")
+    assert adapter._payload_matches_response(  # noqa: SLF001
+        payload={"type": "response.output_item.done"},
+        response_id="resp_1",
     )
-    assert adapter._should_publish_stream_event(  # noqa: SLF001
-        event=SimpleNamespace(type="response.apply_patch_call_operation_diff.delta")
+    assert not adapter._payload_matches_response(  # noqa: SLF001
+        payload={"response": {"id": "resp_2"}},
+        response_id="resp_1",
     )
-    assert adapter._should_publish_stream_event(  # noqa: SLF001
-        event=SimpleNamespace(type="response.apply_patch_call.in_progress")
+    assert adapter._payload_matches_response(  # noqa: SLF001
+        payload={"response": {"id": "resp_2"}},
+        response_id=None,
     )
-    assert adapter._should_publish_stream_event(  # noqa: SLF001
-        event=SimpleNamespace(type="response.apply_patch_call.completed")
+    for event_type in {
+        "response.completed",
+        "response.done",
+        "response.failed",
+        "response.incomplete",
+    }:
+        assert adapter._is_terminal_response_payload(  # noqa: SLF001
+            {"type": event_type}
+        )
+    assert not adapter._is_terminal_response_payload(  # noqa: SLF001
+        {"type": "response.output_item.done"}
     )
-    assert not adapter._should_publish_stream_event(  # noqa: SLF001
-        event=SimpleNamespace(type="response.function_call_arguments.done")
+
+    coerced_done = adapter._coerce_response_stream_event(  # noqa: SLF001
+        {"type": "response.done", "response": {"id": "resp_1"}}
+    )
+    assert coerced_done.type == "response.completed"
+    assert (
+        coerced_done.model_dump(mode="json", exclude_none=True)["response"]["id"]
+        == "resp_1"
     )
 
 
@@ -2701,6 +2884,28 @@ def _make_api_error(message: str) -> APIError:
     return APIError(message, request=request, body=None)
 
 
+def _make_api_status_error(
+    message: str,
+    *,
+    status_code: int,
+    retry_after: str | None = None,
+    request_id: str | None = None,
+) -> APIStatusError:
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    headers = {}
+    if retry_after is not None:
+        headers["retry-after"] = retry_after
+    if request_id is not None:
+        headers["x-request-id"] = request_id
+    response = httpx.Response(
+        status_code,
+        request=request,
+        headers=headers,
+        json={"error": {"message": message}},
+    )
+    return APIStatusError(message, response=response, body=None)
+
+
 def _make_output_message(
     *, message_id: str, text: str, phase: str | None = None
 ) -> ResponseOutputMessage:
@@ -2801,8 +3006,9 @@ async def test_get_openai_client_passes_optional_session(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_input_tokens_does_not_require_room() -> None:
-    adapter = OpenAIResponsesAdapter()
+    adapter = _InstructionalOpenAIResponsesAdapter()
     context = adapter.create_session()
+    context.instructions = "system"
     context.append_user_message("hello")
     counter = _FakeInputTokenCounter(input_tokens=42)
     adapter._client = SimpleNamespace(
@@ -2812,12 +3018,40 @@ async def test_get_input_tokens_does_not_require_room() -> None:
     input_tokens = await adapter.get_input_tokens(
         context=context,
         model="gpt-4o-mini",
+        toolkits=[Toolkit(name="openai", tools=[WebSearchTool()])],
+        output_schema={"type": "object"},
     )
 
     assert input_tokens == 42
     assert len(counter.calls) == 1
-    assert counter.calls[0]["model"] == "gpt-4o-mini"
-    assert counter.calls[0]["input"] == context.messages
+    assert counter.calls[0] == {
+        "model": "gpt-4o-mini",
+        "tools": [{"type": "web_search"}],
+        "instructions": "system\n\nextra adapter instructions",
+        "input": context.messages,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "response",
+                "schema": {"type": "object"},
+                "strict": True,
+            }
+        },
+    }
+
+    empty_context = adapter.create_session()
+    input_tokens = await adapter.get_input_tokens(
+        context=empty_context,
+        model="gpt-4o-mini",
+    )
+
+    assert input_tokens == 42
+    assert len(counter.calls) == 2
+    assert counter.calls[1]["model"] == "gpt-4o-mini"
+    assert counter.calls[1]["input"] == []
+    assert counter.calls[1]["tools"].__class__.__name__ == "NotGiven"
+    assert counter.calls[1]["text"].__class__.__name__ == "NotGiven"
+    assert counter.calls[1]["instructions"] == "extra adapter instructions"
 
 
 def test_openai_responses_adapter_reads_base_url_from_environment(monkeypatch):
@@ -3202,6 +3436,76 @@ async def test_create_response_drops_process_audio_selection_options() -> None:
     assert "voice" not in create_kwargs
     assert create_kwargs["metadata"] == {"tag": "kept"}
     assert create_kwargs["store"] is False
+
+
+@pytest.mark.asyncio
+async def test_create_response_output_schema_message_branches_match_python() -> None:
+    output_schema = {"type": "object", "additionalProperties": True}
+    client = _FakeOpenAIClient(
+        outcomes=[
+            _FakeResponse(
+                response_id="resp_json",
+                output=[
+                    _make_output_message(
+                        message_id="msg_json",
+                        text=json.dumps({"answer": 1}),
+                    )
+                ],
+            ),
+            _FakeResponse(
+                response_id="resp_lines",
+                output=[
+                    _make_output_message(
+                        message_id="msg_lines",
+                        text='{"answer": 1}\n{"answer": 2}',
+                    )
+                ],
+            ),
+            _FakeResponse(
+                response_id="resp_empty",
+                output=[_make_output_message(message_id="msg_empty", text="")],
+            ),
+        ]
+    )
+    adapter = OpenAIResponsesAdapter(
+        mode="request",
+        client=client,
+        context_management="none",
+    )
+    caller = _FakeRoom().local_participant
+
+    context = adapter.create_session()
+    context.append_user_message("json")
+    assert await adapter.create_response(
+        context=context,
+        caller=caller,
+        toolkits=[],
+        output_schema=output_schema,
+    ) == {"answer": 1}
+
+    context = adapter.create_session()
+    context.append_user_message("line json")
+    assert await adapter.create_response(
+        context=context,
+        caller=caller,
+        toolkits=[],
+        output_schema=output_schema,
+    ) == {"answer": 2}
+
+    context = adapter.create_session()
+    context.append_user_message("empty")
+    with pytest.raises(
+        UnboundLocalError,
+        match=(
+            "cannot access local variable 'full_response' where it is not associated"
+        ),
+    ):
+        await adapter.create_response(
+            context=context,
+            caller=caller,
+            toolkits=[],
+            output_schema=output_schema,
+        )
 
 
 @pytest.mark.asyncio
@@ -5455,6 +5759,50 @@ async def test_next_retries_after_stream_iterator_api_error(monkeypatch):
     assert stream_events[1]["headline"] == "LLM request retry succeeded"
 
 
+def test_retry_event_uses_python_api_status_error_details() -> None:
+    error = _make_api_status_error(
+        "rate limited",
+        status_code=429,
+        retry_after=" 45 ",
+        request_id="req_1",
+    )
+    adapter = OpenAIResponsesAdapter(max_retries=3, mode="request")
+    context = adapter.create_session()
+    context.metadata["turn_id"] = " turn-7 "
+    events: list[dict] = []
+
+    assert adapter._is_retryable_openai_error(error=error) is True
+    assert adapter._retry_delay_seconds(retry_number=1, error=error) == 30.0
+    adapter._emit_retry_event(
+        context=context,
+        event_handler=events.append,
+        error=error,
+        retry_number=1,
+        state="in_progress",
+        delay_seconds=0.5,
+    )
+
+    assert events == [
+        {
+            "type": "agent.event",
+            "source": "openai",
+            "name": "openai.retry",
+            "kind": "message",
+            "state": "in_progress",
+            "method": "openai.retry",
+            "summary": "Retrying the LLM request (retry 1/3)",
+            "headline": "Retrying the LLM request (retry 1/3)",
+            "details": [
+                "Retry 1 of 3 in 0.50s.",
+                "Last error: rate limited",
+            ],
+            "correlation_key": "llm.retry:turn-7",
+            "append_details": True,
+            "turn_id": "turn-7",
+        }
+    ]
+
+
 @pytest.mark.asyncio
 async def test_next_omits_on_behalf_of_header_when_name_is_missing() -> None:
     client = _FakeOpenAIClient(
@@ -6271,8 +6619,8 @@ async def test_openai_responses_adapter_persists_image_before_publishing_done_ev
         images_dataset=images_dataset,  # type: ignore[arg-type]
     )
     context = OpenAIResponsesSessionContext()
-    context.metadata["thread_id"] = "dataset://threads/main"
-    context.metadata["turn_id"] = "turn-1"
+    context.metadata["thread_id"] = " dataset://threads/main "
+    context.metadata["turn_id"] = " turn-1 "
     encoded = base64.b64encode(b"fake-image-bytes").decode("ascii")
 
     payload = await adapter._persist_image_generation_output_item(
@@ -6280,20 +6628,38 @@ async def test_openai_responses_adapter_persists_image_before_publishing_done_ev
         caller=_FakeParticipant(),
         item={
             "type": "image_generation_call",
-            "id": "ig_1",
-            "status": "completed",
-            "output_format": "png",
-            "quality": "high",
-            "size": "1024x1024",
+            "id": " ig_1 ",
+            "background": " transparent ",
+            "status": " completed ",
+            "output_format": "JPG",
+            "quality": " high ",
+            "size": " 1024 x 1024 ",
             "result": encoded,
         },
     )
 
     assert len(images_dataset.save_calls) == 1
     assert images_dataset.save_calls[0]["data"] == b"fake-image-bytes"
+    assert images_dataset.save_calls[0]["mime_type"] == "image/jpeg"
+    assert images_dataset.save_calls[0]["created_by"] == "assistant"
+    assert images_dataset.save_calls[0]["annotations"] == {
+        "source": "openai.responses",
+        "background": "transparent",
+        "output_format": "JPG",
+        "quality": "high",
+        "size": "1024 x 1024",
+        "status": "completed",
+        "item_id": "ig_1",
+        "thread_id": "dataset://threads/main",
+        "turn_id": "turn-1",
+    }
     assert "result" not in payload
     assert payload["images"][0]["uri"] == "dataset://images?id=image-1"
+    assert payload["images"][0]["mime_type"] == "image/jpeg"
     assert payload["images"][0]["width"] == 1024
+    assert payload["images"][0]["height"] == 1024
+    assert payload["images"][0]["created_by"] == "assistant"
+    assert payload["images"][0]["created_at"] == "2026-05-05T00:00:00Z"
 
 
 @pytest.mark.asyncio
@@ -6331,6 +6697,64 @@ async def test_openai_responses_adapter_inlines_image_when_images_dataset_missin
             "status": "completed",
         }
     ]
+    lenient_payload = await adapter._persist_image_generation_output_item(
+        context=context,
+        caller=_NamelessParticipant(),
+        item={
+            "type": "image_generation_call",
+            "id": "ig_2",
+            "output_format": "png",
+            "result": "A Q I D",
+        },
+    )
+    assert lenient_payload["images"] == [
+        {
+            "uri": "data:image/png;base64,A Q I D",
+            "mime_type": "image/png",
+            "created_by": "",
+            "width": None,
+            "height": None,
+            "status": "completed",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_adapter_prepare_stream_event_image_branches() -> None:
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    context = OpenAIResponsesSessionContext()
+    passthrough_event = _FakeOutputItem(
+        type="response.output_text.delta",
+        delta="hello",
+        item=None,
+    )
+
+    assert await adapter._prepare_stream_event_for_publish(
+        context=context,
+        caller=_FakeParticipant(),
+        event=passthrough_event,  # type: ignore[arg-type]
+    ) == {"type": "response.output_text.delta", "delta": "hello"}
+
+    unchanged_event = _FakeOutputItemDoneEvent(
+        item=_FakeOutputItem(
+            type="image_generation_call",
+            id="ig_bad",
+            result="not-base64!",
+        )
+    )
+    unchanged_payload = await adapter._prepare_stream_event_for_publish(
+        context=context,
+        caller=_FakeParticipant(),
+        event=unchanged_event,  # type: ignore[arg-type]
+    )
+    assert unchanged_payload["item"] == {
+        "type": "image_generation_call",
+        "id": "ig_bad",
+        "result": "not-base64!",
+    }
 
 
 def test_make_agent_event_publisher_preserves_text_delta_whitespace() -> None:
