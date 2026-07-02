@@ -66,7 +66,16 @@ from meshagent.agents.messages import (
 )
 from meshagent.api import RoomException
 from meshagent.api.error_codes import ErrorCode
-from meshagent.api.messaging import FileContent, JsonContent, TextContent
+from meshagent.api.messaging import (
+    EmptyContent,
+    ErrorContent,
+    FileContent,
+    JsonContent,
+    LinkContent,
+    RawOutputsContent,
+    TextContent,
+    _ControlContent,
+)
 from meshagent.computers.agent import ComputerToolkit
 from meshagent.computers.operator import Operator
 import meshagent.openai.tools.responses_adapter as responses_adapter_module
@@ -78,6 +87,7 @@ from meshagent.openai.tools.responses_adapter import (
     MCPTool,
     OpenAIResponsesAdapter,
     OpenAIResponsesMCPToolkit,
+    OpenAIResponsesTool,
     OpenAIResponsesToolResponseAdapter,
     OpenAIResponsesSessionContext,
     OpenAIResponsesToolSearchRequest,
@@ -1430,6 +1440,34 @@ class _AnyArgsTool(FunctionTool):
         return {"ok": True, "args": kwargs}
 
 
+class _NativeOutputHandlerTool(OpenAIResponsesTool):
+    def __init__(self):
+        super().__init__(name="native_test")
+        self.calls: list[dict[str, object]] = []
+
+    def get_open_ai_output_handlers(self):
+        return {"native_test_call": self.handle_native_test_call}
+
+    async def handle_native_test_call(self, context, **kwargs):
+        self.calls.append({"caller": context.caller.id, "kwargs": kwargs})
+        return {"type": "native_test_output", "ok": True, "value": kwargs["value"]}
+
+
+class _FailingTool(FunctionTool):
+    def __init__(self, name: str, error: Exception):
+        super().__init__(
+            name=name,
+            input_schema={"type": "object", "additionalProperties": True},
+            description="failing test tool",
+        )
+        self.error = error
+
+    async def execute(self, context, **kwargs):
+        del context
+        del kwargs
+        raise self.error
+
+
 class _BlockingTool(FunctionTool):
     def __init__(self, name: str):
         super().__init__(
@@ -1601,6 +1639,13 @@ class _FakeImageGenerationOutputItem(OpenAIBaseModel):
     images: list[dict[str, object]] | None = None
 
 
+class _FakeNativeOutputItem(OpenAIBaseModel):
+    type: str
+    id: str
+    status: str | None = None
+    value: str | None = None
+
+
 class _InstructionalOpenAIResponsesAdapter(OpenAIResponsesAdapter):
     def get_additional_instructions(self) -> str | None:
         return "extra adapter instructions"
@@ -1662,6 +1707,147 @@ async def test_openai_responses_tool_response_adapter_truncates_text_file_output
     assert "line1\nline2" in output
     assert "line3" not in output
     assert "The tool call returned too much data and was truncated." in output
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_tool_response_adapter_content_branches() -> None:
+    adapter = OpenAIResponsesToolResponseAdapter(
+        max_tool_call_length=1024,
+        max_tool_call_lines=20,
+    )
+
+    link_text = await adapter.to_plain_text(
+        response=LinkContent(name="docs", url="https://example.com/世界"),
+    )
+    assert json.loads(link_text) == {"name": "docs", "url": "https://example.com/世界"}
+    assert '": "' in link_text
+    assert ", " in link_text
+    assert "\\u4e16\\u754c" in link_text
+
+    json_text = await adapter.to_plain_text(
+        response=JsonContent(json={"hello": "世界"})
+    )
+    assert json.loads(json_text) == {"hello": "世界"}
+    assert '": "' in json_text
+    assert "\\u4e16\\u754c" in json_text
+
+    assert (
+        await adapter.to_plain_text(
+            response=FileContent(
+                name="note.txt",
+                mime_type="text/plain",
+                data=b"file text",
+            ),
+        )
+        == "file text"
+    )
+    assert (
+        await adapter.to_plain_text(
+            response=FileContent(
+                name="page.html",
+                mime_type="text/html; charset=utf-8",
+                data=b"<html><body><h1>Title</h1><p>Hello <strong>world</strong>.</p></body></html>",
+            ),
+        )
+        == "# Title\n\nHello **world**.\n"
+    )
+    assert (
+        await adapter.to_plain_text(response=ErrorContent(text="bad", code=7))
+        == "Error (code=7): bad"
+    )
+    assert await adapter.to_plain_text(response=EmptyContent()) == "ok"
+
+    raw_outputs = [{"type": "already-built"}]
+    assert (
+        await adapter.create_messages(
+            context=None,  # type: ignore[arg-type]
+            tool_call=_AttrDict(call_id="call-raw"),
+            response=RawOutputsContent(outputs=raw_outputs),
+        )
+        == raw_outputs
+    )
+    assert await adapter.create_messages(
+        context=None,  # type: ignore[arg-type]
+        tool_call=_AttrDict(call_id="call-text"),
+        response=TextContent(text="hello"),
+    ) == [
+        {
+            "output": "hello",
+            "call_id": "call-text",
+            "type": "function_call_output",
+        }
+    ]
+    assert await adapter.create_messages(
+        context=None,  # type: ignore[arg-type]
+        tool_call=_AttrDict(call_id="call-html"),
+        response=FileContent(
+            name="page.xhtml",
+            mime_type="application/xhtml+xml",
+            data=b'<html><body><p>See <a href="https://example.com">Example</a>.</p></body></html>',
+        ),
+    ) == [
+        {
+            "output": "See [Example](https://example.com).\n",
+            "call_id": "call-html",
+            "type": "function_call_output",
+        }
+    ]
+    assert await adapter.create_messages(
+        context=None,  # type: ignore[arg-type]
+        tool_call=_AttrDict(call_id="call-image"),
+        response=FileContent(
+            name="image.png",
+            mime_type="image/png",
+            data=bytes([0, 1, 2]),
+        ),
+    ) == [
+        {
+            "output": [
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,AAEC",
+                }
+            ],
+            "call_id": "call-image",
+            "type": "function_call_output",
+        }
+    ]
+    assert await adapter.create_messages(
+        context=None,  # type: ignore[arg-type]
+        tool_call=_AttrDict(call_id="call-pdf"),
+        response=FileContent(
+            name="doc.pdf",
+            mime_type="application/pdf",
+            data=bytes([0xFF, 0x00, 0x01]),
+        ),
+    ) == [
+        {
+            "output": [
+                {
+                    "type": "input_file",
+                    "filename": "doc.pdf",
+                    "file_data": "data:application/pdf;base64,/wAB",
+                }
+            ],
+            "call_id": "call-pdf",
+            "type": "function_call_output",
+        }
+    ]
+    assert await adapter.create_messages(
+        context=None,  # type: ignore[arg-type]
+        tool_call=_AttrDict(call_id="call-unsupported"),
+        response=FileContent(
+            name="archive.zip",
+            mime_type="application/zip",
+            data=bytes([0, 1, 2]),
+        ),
+    ) == [
+        {
+            "output": "archive.zip was not in a supported format",
+            "call_id": "call-unsupported",
+            "type": "function_call_output",
+        }
+    ]
 
 
 def test_openai_responses_adapter_passes_through_tool_truncation_limits() -> None:
@@ -2890,6 +3076,99 @@ async def test_next_completes_image_generation_only_request_response() -> None:
 
     assert result == ""
     assert adapter.get_openai_client().responses.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_next_publishes_native_output_handler_events() -> None:
+    native_tool = _NativeOutputHandlerTool()
+    adapter = OpenAIResponsesAdapter(
+        mode="request",
+        client=_FakeOpenAIClient(
+            outcomes=[
+                _EventStream(
+                    events=[
+                        _FakeOutputItemDoneEvent(
+                            item=_FakeNativeOutputItem(
+                                type="native_test_call",
+                                id="native_1",
+                                status="completed",
+                                value="alpha",
+                            )
+                        ),
+                        _FakeCompletedEvent(
+                            response=_FakeResponse(
+                                response_id="resp_native",
+                                output=[
+                                    _FakeNativeOutputItem(
+                                        type="native_test_call",
+                                        id="native_1",
+                                        status="completed",
+                                        value="alpha",
+                                    )
+                                ],
+                            )
+                        ),
+                    ]
+                ),
+                _CompletedStream(
+                    event=_FakeCompletedEvent(
+                        response=_FakeResponse(
+                            response_id="resp_done",
+                            output=[
+                                _make_output_message(message_id="msg_1", text="done")
+                            ],
+                        )
+                    )
+                ),
+            ]
+        ),
+    )
+    context = adapter.create_session()
+    context.append_user_message("run native tool")
+    published_events: list[dict] = []
+
+    result = await adapter.create_response(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        toolkits=[Toolkit(name="openai", tools=[native_tool])],
+        event_handler=published_events.append,
+    )
+
+    assert result == "done"
+    assert native_tool.calls == [
+        {
+            "caller": "participant_1",
+            "kwargs": {
+                "type": "native_test_call",
+                "id": "native_1",
+                "status": "completed",
+                "value": "alpha",
+            },
+        }
+    ]
+    handler_events = [
+        event
+        for event in published_events
+        if event.get("type") in {"meshagent.handler.added", "meshagent.handler.done"}
+    ]
+    assert {
+        "type": "meshagent.handler.added",
+        "item": {
+            "type": "native_test_call",
+            "id": "native_1",
+            "status": "completed",
+            "value": "alpha",
+        },
+    } in handler_events
+    assert {
+        "type": "meshagent.handler.done",
+        "item": {"type": "native_test_output", "ok": True, "value": "alpha"},
+    } in handler_events
+    assert adapter.get_openai_client().responses.create_kwargs[1]["input"][-1] == {
+        "type": "native_test_output",
+        "ok": True,
+        "value": "alpha",
+    }
 
 
 @pytest.mark.asyncio
@@ -4731,6 +5010,95 @@ async def test_next_drops_post_tool_stream_items_before_steering() -> None:
         and event.get("item", {}).get("id") == "msg_after_tool"
         for event in published_events
     )
+    handler_events = [
+        event
+        for event in published_events
+        if event.get("type") in {"meshagent.handler.added", "meshagent.handler.done"}
+    ]
+    assert {
+        "type": "meshagent.handler.added",
+        "item": {
+            "arguments": json.dumps({"path": "/tmp/example.txt"}),
+            "call_id": "call_1",
+            "id": "tool-1",
+            "name": "write_file",
+            "namespace": None,
+            "status": "completed",
+            "type": "function_call",
+        },
+    } in handler_events
+    assert {
+        "type": "meshagent.handler.done",
+        "item_id": "tool-1",
+        "result": {"ok": True, "args": {"path": "/tmp/example.txt"}},
+    } in handler_events
+
+
+@pytest.mark.asyncio
+async def test_next_shapes_local_tool_failure_like_python() -> None:
+    tool_call = _make_function_tool_call(
+        item_id="tool-1",
+        tool_name="fail_tool",
+        call_id="call_1",
+        arguments={"path": "/tmp/example.txt"},
+    )
+    client = _FakeOpenAIClient(
+        outcomes=[
+            _EventStream(
+                events=[
+                    _FakeOutputItemDoneEvent(item=tool_call),
+                    _FakeCompletedEvent(
+                        response=_FakeResponse(
+                            response_id="resp_tool",
+                            output=[tool_call],
+                        )
+                    ),
+                ]
+            ),
+            _CompletedStream(
+                event=_FakeCompletedEvent(
+                    response=_FakeResponse(
+                        response_id="resp_done",
+                        output=[
+                            _make_output_message(message_id="msg_done", text="done")
+                        ],
+                    )
+                )
+            ),
+        ]
+    )
+    adapter = OpenAIResponsesAdapter(
+        mode="request",
+        client=client,
+        model="gpt-4.1-mini",
+    )
+    context = adapter.create_session()
+    context.append_user_message("run tool")
+    published_events: list[dict] = []
+
+    result = await adapter.create_response(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        toolkits=[
+            Toolkit(
+                name="storage",
+                tools=[_FailingTool("fail_tool", RoomException("boom"))],
+            )
+        ],
+        event_handler=published_events.append,
+    )
+
+    assert result == "done"
+    assert client.responses.create_kwargs[1]["input"][-1] == {
+        "output": json.dumps({"error": "unable to complete tool call: boom"}),
+        "call_id": "call_1",
+        "type": "function_call_output",
+    }
+    assert {
+        "type": "meshagent.handler.done",
+        "item_id": "tool-1",
+        "error": "boom",
+    } in published_events
 
 
 @pytest.mark.asyncio
@@ -4838,20 +5206,26 @@ async def test_next_restarts_after_first_completed_tool_call_before_later_tool_c
 @pytest.mark.asyncio
 async def test_request_mode_cancellation_restores_context_during_tool_call() -> None:
     blocking_tool = _BlockingTool("write_file")
+    tool_call = _make_function_tool_call(
+        item_id="tool-1",
+        tool_name="write_file",
+        call_id="call_1",
+        arguments={"path": "/tmp/example.txt"},
+    )
     adapter = OpenAIResponsesAdapter(
         mode="request",
         client=_FakeOpenAIClient(
             outcomes=[
-                _FakeResponse(
-                    response_id="resp_tool",
-                    output=[
-                        _make_function_tool_call(
-                            item_id="tool-1",
-                            tool_name="write_file",
-                            call_id="call_1",
-                            arguments={"path": "/tmp/example.txt"},
-                        )
-                    ],
+                _EventStream(
+                    events=[
+                        _FakeOutputItemDoneEvent(item=tool_call),
+                        _FakeCompletedEvent(
+                            response=_FakeResponse(
+                                response_id="resp_tool",
+                                output=[tool_call],
+                            )
+                        ),
+                    ]
                 )
             ]
         ),
@@ -4859,12 +5233,14 @@ async def test_request_mode_cancellation_restores_context_during_tool_call() -> 
     )
     context = adapter.create_session()
     context.append_user_message("run tool")
+    published_events: list[dict] = []
 
     task = asyncio.create_task(
         adapter.create_response(
             context=context,
             caller=_FakeRoom().local_participant,
             toolkits=[Toolkit(name="storage", tools=[blocking_tool])],
+            event_handler=published_events.append,
         )
     )
 
@@ -4875,6 +5251,11 @@ async def test_request_mode_cancellation_restores_context_during_tool_call() -> 
         await task
 
     assert context.messages == [{"role": "user", "content": "run tool"}]
+    assert {
+        "type": "meshagent.handler.done",
+        "item_id": "tool-1",
+        "error": "cancelled",
+    } in published_events
 
 
 @pytest.mark.asyncio
@@ -4924,6 +5305,71 @@ async def test_consume_streaming_tool_result_ignores_non_json_intermediate_items
     assert isinstance(result, TextContent)
     assert result.text == "done"
     assert events == []
+
+
+@pytest.mark.asyncio
+async def test_consume_streaming_tool_result_final_item_branches() -> None:
+    empty_result = await _consume_streaming_tool_result(
+        tool_name="native",
+        tool_call_id=None,
+        item_id=None,
+        stream=_ToolItemStream(items=[]),
+        event_handler=[].append,
+    )
+    assert isinstance(empty_result, EmptyContent)
+
+    control_result = await _consume_streaming_tool_result(
+        tool_name="native",
+        tool_call_id=None,
+        item_id=None,
+        stream=_ToolItemStream(items=[_ControlContent(method="close")]),
+        event_handler=[].append,
+    )
+    assert isinstance(control_result, EmptyContent)
+
+    codex_result = await _consume_streaming_tool_result(
+        tool_name="native",
+        tool_call_id=None,
+        item_id=None,
+        stream=_ToolItemStream(
+            items=[{"type": "codex.event", "event": {"kind": "done"}}]
+        ),
+        event_handler=[].append,
+    )
+    assert isinstance(codex_result, EmptyContent)
+
+    agent_result = await _consume_streaming_tool_result(
+        tool_name="native",
+        tool_call_id=None,
+        item_id=None,
+        stream=_ToolItemStream(
+            items=[{"type": "agent.event", "event": {"kind": "done"}}]
+        ),
+        event_handler=[].append,
+    )
+    assert isinstance(agent_result, EmptyContent)
+
+    final_json_content = await _consume_streaming_tool_result(
+        tool_name="native",
+        tool_call_id=None,
+        item_id=None,
+        stream=_ToolItemStream(
+            items=[
+                JsonContent(
+                    json={
+                        "type": "agent.event",
+                        "event": {"kind": "final-json-content"},
+                    }
+                )
+            ]
+        ),
+        event_handler=[].append,
+    )
+    assert isinstance(final_json_content, JsonContent)
+    assert final_json_content.json == {
+        "type": "agent.event",
+        "event": {"kind": "final-json-content"},
+    }
 
 
 @pytest.mark.asyncio
