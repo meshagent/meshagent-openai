@@ -603,6 +603,36 @@ async def test_openai_completions_adapter_publishes_text_events_for_restore() ->
 
 
 @pytest.mark.asyncio
+async def test_openai_completions_adapter_blank_schema_output_matches_python_bug() -> (
+    None
+):
+    adapter = OpenAICompletionsAdapter(
+        model="gpt-4o-mini",
+        client=_FakeOpenAIClient(
+            responses=[
+                _FakeChatCompletion(
+                    message=_FakeMessage(tool_calls=None, content=" \n\t"),
+                    usage={"prompt_tokens": 1, "completion_tokens": 1},
+                )
+            ]
+        ),
+    )
+    context = adapter.create_session()
+    context.append_user_message("hello")
+
+    with pytest.raises(
+        UnboundLocalError,
+        match="cannot access local variable 'full_response'",
+    ):
+        await adapter.create_response(
+            context=context,
+            caller=_FakeRoom().local_participant,
+            toolkits=[],
+            output_schema={"type": "object", "additionalProperties": True},
+        )
+
+
+@pytest.mark.asyncio
 async def test_openai_completions_adapter_publishes_tool_events_for_restore() -> None:
     adapter = OpenAICompletionsAdapter(
         model="gpt-4o-mini",
