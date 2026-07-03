@@ -477,6 +477,14 @@ class _ToolItemStream:
             yield item
 
 
+class _AttrDict(dict):
+    def __getattr__(self, name: str):
+        try:
+            return self[name]
+        except KeyError as ex:
+            raise AttributeError(name) from ex
+
+
 @pytest.mark.asyncio
 async def test_openai_completions_tool_response_adapter_truncates_json_output() -> None:
     adapter = OpenAICompletionsToolResponseAdapter(
@@ -511,6 +519,58 @@ async def test_openai_completions_tool_response_adapter_truncates_utf8_file_outp
     assert "line1\nline2" in output
     assert "line3" not in output
     assert "The tool call returned too much data and was truncated." in output
+
+
+@pytest.mark.asyncio
+async def test_openai_completions_tool_response_adapter_raw_outputs_match_python() -> (
+    None
+):
+    adapter = OpenAICompletionsToolResponseAdapter(
+        max_tool_call_length=1024,
+        max_tool_call_lines=20,
+    )
+
+    raw_dict_text = await adapter.to_plain_text(  # type: ignore[arg-type]
+        response={"hello": "世界"}
+    )
+    assert json.loads(raw_dict_text) == {"hello": "世界"}
+    assert "\\u4e16\\u754c" in raw_dict_text
+    assert await adapter.to_plain_text(response="raw text") == "raw text"  # type: ignore[arg-type]
+    assert await adapter.to_plain_text(response=None) == "ok"  # type: ignore[arg-type]
+
+    assert await adapter.create_messages(
+        context=None,  # type: ignore[arg-type]
+        tool_call=_AttrDict(id="tool-call-dict"),
+        response={"hello": "世界"},  # type: ignore[arg-type]
+    ) == [
+        {
+            "role": "tool",
+            "content": json.dumps({"hello": "世界"}),
+            "tool_call_id": "tool-call-dict",
+        }
+    ]
+    assert await adapter.create_messages(
+        context=None,  # type: ignore[arg-type]
+        tool_call=_AttrDict(id="tool-call-string"),
+        response="raw text",  # type: ignore[arg-type]
+    ) == [
+        {
+            "role": "tool",
+            "content": "raw text",
+            "tool_call_id": "tool-call-string",
+        }
+    ]
+    assert await adapter.create_messages(
+        context=None,  # type: ignore[arg-type]
+        tool_call=_AttrDict(id="tool-call-none"),
+        response=None,  # type: ignore[arg-type]
+    ) == [
+        {
+            "role": "tool",
+            "content": "ok",
+            "tool_call_id": "tool-call-none",
+        }
+    ]
 
 
 def test_openai_completions_adapter_passes_through_tool_truncation_limits() -> None:
@@ -642,6 +702,75 @@ async def test_openai_completions_adapter_blank_schema_output_matches_python_bug
             caller=_FakeRoom().local_participant,
             toolkits=[],
             output_schema={"type": "object", "additionalProperties": True},
+        )
+
+
+@pytest.mark.asyncio
+async def test_openai_completions_adapter_schema_output_json_errors_match_python() -> (
+    None
+):
+    adapter = OpenAICompletionsAdapter(
+        model="gpt-4o-mini",
+        client=_FakeOpenAIClient(
+            responses=[
+                _FakeChatCompletion(
+                    message=_FakeMessage(tool_calls=None, content="[1,]"),
+                    usage={"prompt_tokens": 1, "completion_tokens": 1},
+                ),
+                _FakeChatCompletion(
+                    message=_FakeMessage(tool_calls=None, content='["unterminated]'),
+                    usage={"prompt_tokens": 1, "completion_tokens": 1},
+                ),
+                _FakeChatCompletion(
+                    message=_FakeMessage(tool_calls=None, content='{"answer": }'),
+                    usage={"prompt_tokens": 1, "completion_tokens": 1},
+                ),
+            ]
+        ),
+    )
+    caller = _FakeRoom().local_participant
+    output_schema = {"type": "object", "additionalProperties": True}
+
+    context = adapter.create_session()
+    context.append_user_message("array trailing comma")
+    with pytest.raises(
+        json.JSONDecodeError,
+        match=(
+            r"Illegal trailing comma before end of array: "
+            r"line 1 column 3 \(char 2\)"
+        ),
+    ):
+        await adapter.create_response(
+            context=context,
+            caller=caller,
+            toolkits=[],
+            output_schema=output_schema,
+        )
+
+    context = adapter.create_session()
+    context.append_user_message("unterminated string")
+    with pytest.raises(
+        json.JSONDecodeError,
+        match=r"Unterminated string starting at: line 1 column 2 \(char 1\)",
+    ):
+        await adapter.create_response(
+            context=context,
+            caller=caller,
+            toolkits=[],
+            output_schema=output_schema,
+        )
+
+    context = adapter.create_session()
+    context.append_user_message("missing object value")
+    with pytest.raises(
+        json.JSONDecodeError,
+        match=r"Expecting value: line 1 column 12 \(char 11\)",
+    ):
+        await adapter.create_response(
+            context=context,
+            caller=caller,
+            toolkits=[],
+            output_schema=output_schema,
         )
 
 

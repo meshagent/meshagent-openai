@@ -1298,6 +1298,8 @@ async def test_input_audio_helpers_send_realtime_input_buffer_events() -> None:
         {"type": "input_audio_buffer.clear"},
     ]
 
+    await adapter.disconnect(context=context)
+
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(

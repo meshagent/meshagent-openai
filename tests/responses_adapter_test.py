@@ -103,6 +103,15 @@ from meshagent.tools import FunctionTool, Toolkit, ToolContext
 from meshagent.tools.storage import StorageToolkit, StorageToolLocalMount
 
 
+def test_openai_responses_tool_base_methods_are_empty() -> None:
+    tool = OpenAIResponsesTool(name="native")
+
+    assert tool.name == "native"
+    assert tool.get_open_ai_tool_definitions() == []
+    assert tool.get_open_ai_stream_callbacks() == {}
+    assert tool.get_open_ai_output_handlers() == {}
+
+
 class _AttrDict(dict):
     def __getattr__(self, name: str):
         return self[name]
@@ -1759,6 +1768,13 @@ async def test_openai_responses_tool_response_adapter_content_branches() -> None
         == "Error (code=7): bad"
     )
     assert await adapter.to_plain_text(response=EmptyContent()) == "ok"
+    raw_dict_text = await adapter.to_plain_text(  # type: ignore[arg-type]
+        response={"hello": "世界"}
+    )
+    assert json.loads(raw_dict_text) == {"hello": "世界"}
+    assert "\\u4e16\\u754c" in raw_dict_text
+    assert await adapter.to_plain_text(response="raw text") == "raw text"  # type: ignore[arg-type]
+    assert await adapter.to_plain_text(response=None) == "ok"  # type: ignore[arg-type]
 
     raw_outputs = [{"type": "already-built"}]
     assert (
@@ -1802,6 +1818,39 @@ async def test_openai_responses_tool_response_adapter_content_branches() -> None
         {
             "output": "hello",
             "call_id": "call-text",
+            "type": "function_call_output",
+        }
+    ]
+    assert await adapter.create_messages(
+        context=None,  # type: ignore[arg-type]
+        tool_call=_AttrDict(call_id="call-raw-dict-output"),
+        response={"hello": "世界"},  # type: ignore[arg-type]
+    ) == [
+        {
+            "output": json.dumps({"hello": "世界"}),
+            "call_id": "call-raw-dict-output",
+            "type": "function_call_output",
+        }
+    ]
+    assert await adapter.create_messages(
+        context=None,  # type: ignore[arg-type]
+        tool_call=_AttrDict(call_id="call-raw-string-output"),
+        response="raw text",  # type: ignore[arg-type]
+    ) == [
+        {
+            "output": "raw text",
+            "call_id": "call-raw-string-output",
+            "type": "function_call_output",
+        }
+    ]
+    assert await adapter.create_messages(
+        context=None,  # type: ignore[arg-type]
+        tool_call=_AttrDict(call_id="call-raw-none-output"),
+        response=None,  # type: ignore[arg-type]
+    ) == [
+        {
+            "output": "ok",
+            "call_id": "call-raw-none-output",
             "type": "function_call_output",
         }
     ]
@@ -2431,6 +2480,92 @@ def test_image_generation_tool_defaults_to_gpt_image_2() -> None:
     ]
 
 
+def test_image_generation_tool_options_and_handlers_match_python() -> None:
+    class RecordingImageGenerationTool(ImageGenerationTool):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.generated: list[dict] = []
+
+        async def on_image_generated(self, context, **kwargs):
+            del context
+            self.generated.append(kwargs)
+
+    tool = RecordingImageGenerationTool(
+        background="transparent",
+        input_image_mask_url="https://example.test/mask.png",
+        model=" custom-model ",
+        moderation="low",
+        output_compression=80,
+        output_format="webp",
+        partial_images=3,
+        quality="high",
+        size="1024x1536",
+    )
+
+    assert tool.model == "custom-model"
+    assert tool.get_open_ai_tool_definitions() == [
+        {
+            "type": "image_generation",
+            "background": "transparent",
+            "input_image_mask": {"image_url": "https://example.test/mask.png"},
+            "model": "custom-model",
+            "moderation": "low",
+            "output_compression": 80,
+            "output_format": "webp",
+            "partial_images": 3,
+            "quality": "high",
+            "size": "1024x1536",
+        }
+    ]
+    assert list(tool.get_open_ai_stream_callbacks()) == [
+        "response.image_generation_call.completed",
+        "response.image_generation_call.in_progress",
+        "response.image_generation_call.generating",
+        "response.image_generation_call.partial_image",
+    ]
+    assert list(tool.get_open_ai_output_handlers()) == ["image_generation_call"]
+
+    asyncio.run(
+        tool.handle_image_generated(
+            ToolContext(caller=_FakeParticipant()),
+            id="image-1",
+            result="A Q I D",
+            status="completed",
+            type="image_generation_call",
+            size="1024x1024",
+            quality="high",
+            background="opaque",
+            output_format="png",
+        )
+    )
+    assert tool.generated == [
+        {
+            "item_id": "image-1",
+            "data": b"\x01\x02\x03",
+            "status": "completed",
+            "size": "1024x1024",
+            "quality": "high",
+            "background": "opaque",
+            "output_format": "png",
+        }
+    ]
+
+    asyncio.run(
+        tool.handle_image_generated(
+            ToolContext(caller=_FakeParticipant()),
+            id="image-2",
+            result=None,
+            status="completed",
+            type="image_generation_call",
+            size="1024x1024",
+            quality="high",
+            background="opaque",
+            output_format="png",
+        )
+    )
+    assert len(tool.generated) == 1
+
+
 @pytest.mark.asyncio
 async def test_openai_mcp_tool_bundle_threads_tool_call_approval_handler() -> None:
     server = MCPServer.model_validate(
@@ -2558,6 +2693,59 @@ async def test_responses_tool_bundle_uses_toolkit_namespaces_for_function_tools(
     assert isinstance(beta_result, JsonContent)
     assert alpha_result.json == {"ok": True, "args": {"value": "alpha"}}
     assert beta_result.json == {"ok": True, "args": {"value": "beta"}}
+
+
+@pytest.mark.asyncio
+async def test_responses_tool_bundle_invalid_arguments_error_matches_json_loads() -> (
+    None
+):
+    bundle = ResponsesToolBundle(
+        toolkits=[Toolkit(name="", tools=[_AnyArgsTool("lookup")])],
+    )
+
+    with pytest.raises(
+        json.JSONDecodeError,
+        match=r"Expecting property name enclosed in double quotes: line 1 column 2 \(char 1\)",
+    ):
+        await bundle.execute(
+            context=ToolContext(caller=_FakeParticipant()),
+            tool_call=ResponseFunctionToolCall(
+                id="call-invalid-json",
+                name="lookup",
+                call_id="call-invalid-json",
+                arguments="{",
+                type="function_call",
+                status="completed",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_responses_tool_bundle_native_tools_are_lookup_only_for_function_execute() -> (
+    None
+):
+    bundle = ResponsesToolBundle(
+        toolkits=[Toolkit(name="openai", tools=[WebSearchTool()])],
+    )
+
+    tool = bundle.get_tool("web_search")
+    assert isinstance(tool, WebSearchTool)
+
+    with pytest.raises(
+        Exception,
+        match="tools must extend the FunctionTool or ContentTool class to be invokable",
+    ):
+        await bundle.execute(
+            context=ToolContext(caller=_FakeParticipant()),
+            tool_call=ResponseFunctionToolCall(
+                id="call-native",
+                name="web_search",
+                call_id="call-native",
+                arguments="{}",
+                type="function_call",
+                status="completed",
+            ),
+        )
 
 
 def test_responses_tool_bundle_defers_function_tools_when_tool_search_enabled() -> None:
@@ -3564,6 +3752,33 @@ async def test_create_response_output_schema_message_branches_match_python() -> 
                 response_id="resp_empty",
                 output=[_make_output_message(message_id="msg_empty", text="")],
             ),
+            _FakeResponse(
+                response_id="resp_array_trailing_comma",
+                output=[
+                    _make_output_message(
+                        message_id="msg_array_trailing_comma",
+                        text="[1,]",
+                    )
+                ],
+            ),
+            _FakeResponse(
+                response_id="resp_unterminated_string",
+                output=[
+                    _make_output_message(
+                        message_id="msg_unterminated_string",
+                        text='["unterminated]',
+                    )
+                ],
+            ),
+            _FakeResponse(
+                response_id="resp_missing_object_value",
+                output=[
+                    _make_output_message(
+                        message_id="msg_missing_object_value",
+                        text='{"answer": }',
+                    )
+                ],
+            ),
         ]
     )
     adapter = OpenAIResponsesAdapter(
@@ -3598,6 +3813,48 @@ async def test_create_response_output_schema_message_branches_match_python() -> 
         match=(
             "cannot access local variable 'full_response' where it is not associated"
         ),
+    ):
+        await adapter.create_response(
+            context=context,
+            caller=caller,
+            toolkits=[],
+            output_schema=output_schema,
+        )
+
+    context = adapter.create_session()
+    context.append_user_message("array trailing comma")
+    with pytest.raises(
+        json.JSONDecodeError,
+        match=(
+            r"Illegal trailing comma before end of array: "
+            r"line 1 column 3 \(char 2\)"
+        ),
+    ):
+        await adapter.create_response(
+            context=context,
+            caller=caller,
+            toolkits=[],
+            output_schema=output_schema,
+        )
+
+    context = adapter.create_session()
+    context.append_user_message("unterminated string")
+    with pytest.raises(
+        json.JSONDecodeError,
+        match=r"Unterminated string starting at: line 1 column 2 \(char 1\)",
+    ):
+        await adapter.create_response(
+            context=context,
+            caller=caller,
+            toolkits=[],
+            output_schema=output_schema,
+        )
+
+    context = adapter.create_session()
+    context.append_user_message("missing object value")
+    with pytest.raises(
+        json.JSONDecodeError,
+        match=r"Expecting value: line 1 column 12 \(char 11\)",
     ):
         await adapter.create_response(
             context=context,
