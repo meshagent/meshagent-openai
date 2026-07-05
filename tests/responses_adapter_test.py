@@ -1380,6 +1380,70 @@ class _FakeRoom:
         self.developer = _FakeDeveloper()
 
 
+@pytest.mark.asyncio
+async def test_responses_session_context_copy_supports_and_lifecycle_match_source():
+    websocket = _QueuedLoggingWebSocket()
+    client_session = _SequentialClientSession([websocket])
+    context = OpenAIResponsesSessionContext(
+        messages=[{"role": "user", "content": {"text": "copy me"}}],
+        system_role="system",
+        websocket_timeout=3600,
+        websocket_ping_interval_seconds=3600,
+        session=client_session,  # type: ignore[arg-type]
+    )
+    assert context.supports_images is True
+    assert context.supports_files is True
+    assert context._owns_session is False
+
+    connected = await context.ensure_websocket(
+        url="wss://example.test/openai/v1/responses",
+        headers={"Authorization": "Bearer test"},
+    )
+    assert connected is websocket
+    assert context.has_valid_websocket is True
+    context.turn_count = 9
+    context.last_usage = SessionUsage(
+        model="gpt-test",
+        usage={"input_tokens": 1.0},
+        context_window_used=1,
+        context_window_size=10,
+    )
+    context.remember_websocket_response(
+        response_id="resp_copy", incremental_start_index=1
+    )
+
+    copied = context.copy()
+    assert isinstance(copied, OpenAIResponsesSessionContext)
+    assert copied.messages == context.messages
+    assert copied.messages is not context.messages
+    assert copied.system_role == "system"
+    assert copied.turn_count == 0
+    assert copied.last_usage is None
+    assert copied._owns_session is False
+    assert copied._session is client_session
+    assert copied.has_valid_websocket is False
+    assert copied.get_websocket_incremental_request() is None
+
+    context.messages[0]["content"]["text"] = "mutated"
+    assert copied.messages[0]["content"]["text"] == "copy me"
+
+    await context.close_websocket()
+    assert websocket.closed is True
+    assert client_session.closed is False
+    assert context.has_valid_websocket is False
+    assert context.get_websocket_incremental_request() is None
+
+    await context.close()
+    assert client_session.closed is False
+
+    owned = OpenAIResponsesSessionContext()
+    assert owned._session is None
+    await owned.start()
+    assert owned._session is not None
+    await owned.close()
+    assert owned._session is None
+
+
 class _FakeContainerInfo:
     def __init__(self, *, container_id: str):
         self.id = container_id

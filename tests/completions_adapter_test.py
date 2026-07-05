@@ -667,6 +667,39 @@ async def test_openai_completions_adapter_passes_base_url_to_get_client(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_next_commits_empty_tool_calls_message_before_followup() -> None:
+    empty_tool_calls_message = _FakeMessage(tool_calls=[], content=None)
+    adapter = OpenAICompletionsAdapter(
+        model="gpt-4o-mini",
+        client=_FakeOpenAIClient(
+            responses=[
+                _FakeChatCompletion(message=empty_tool_calls_message),
+                _FakeChatCompletion(
+                    message=_FakeMessage(tool_calls=None, content="done"),
+                    usage={"prompt_tokens": 2, "completion_tokens": 1},
+                ),
+            ]
+        ),
+    )
+    context = adapter.create_session()
+    context.append_user_message("hello")
+
+    result = await adapter.create_response(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        toolkits=[],
+    )
+
+    assert result == "done"
+    assert len(adapter._client.chat.completions.create_kwargs) == 2
+    second_messages = adapter._client.chat.completions.create_kwargs[1]["messages"]
+    assert second_messages[-1].tool_calls == []
+    assert second_messages[-1].content is None
+    assert context.messages[-2] is empty_tool_calls_message
+    assert context.messages[-1].content == "done"
+
+
+@pytest.mark.asyncio
 async def test_openai_completions_adapter_publishes_text_events_for_restore() -> None:
     adapter = OpenAICompletionsAdapter(
         model="gpt-4o-mini",

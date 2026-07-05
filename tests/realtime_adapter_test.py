@@ -34,6 +34,7 @@ from meshagent.agents.messages import (
     AgentToolCallStarted,
 )
 from meshagent.api import RoomException
+from meshagent.api.error_codes import ErrorCode
 from meshagent.api.messaging import TextContent
 from meshagent.agents.context import SessionUsage
 from meshagent.openai.tools.realtime_adapter import (
@@ -762,6 +763,32 @@ async def test_realtime_response_future_mapping_and_completion_branches() -> Non
     )
     assert done.result() == {"already": "done"}
     assert list(context._pending_response_futures) == []
+
+
+def test_realtime_response_error_preserves_provider_string_code() -> None:
+    provider_error = OpenAIRealtimeAdapter._response_error(
+        {
+            "type": "response.failed",
+            "response": {"error": {"message": " rate limited ", "code": "rate_limit"}},
+        }
+    )
+
+    assert isinstance(provider_error, RoomException)
+    assert str(provider_error) == "rate limited"
+    assert provider_error.status_code == 500
+    assert provider_error.code == "rate_limit"
+
+    fallback_error = OpenAIRealtimeAdapter._response_error(
+        {
+            "type": "response.failed",
+            "response": {"error": {"message": "bad", "code": 2}},
+        }
+    )
+
+    assert isinstance(fallback_error, RoomException)
+    assert str(fallback_error) == "bad"
+    assert fallback_error.status_code == 500
+    assert fallback_error.code == ErrorCode.OPERATION_FAILED
 
 
 @pytest.mark.asyncio
