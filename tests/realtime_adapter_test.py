@@ -74,6 +74,7 @@ class _FakeWebSocket:
         self.messages: asyncio.Queue[aiohttp.WSMessage] = asyncio.Queue()
         self.closed = False
         self.close_count = 0
+        self.ping_error: Exception | None = None
 
     async def send_str(self, data: str) -> None:
         payload = json.loads(data)
@@ -85,6 +86,8 @@ class _FakeWebSocket:
         return await self.messages.get()
 
     async def ping(self) -> None:
+        if self.ping_error is not None:
+            raise self.ping_error
         return None
 
     async def close(self) -> None:
@@ -148,6 +151,42 @@ def _context(websocket: _FakeWebSocket) -> OpenAIRealtimeSessionContext:
         session=_FakeSession(websocket),
         websocket_timeout=3600,
     )
+
+
+def test_realtime_adapter_openai_client_boundary_matches_python(monkeypatch):
+    configured_client = AsyncOpenAI(
+        api_key="test-key",
+        base_url="https://api.openai.test/v1",
+    )
+    configured_adapter = OpenAIRealtimeAdapter(client=configured_client)
+
+    assert configured_adapter._openai_client() is configured_client
+
+    calls: list[dict[str, object]] = []
+    fake_client = object()
+
+    def _get_client(**kwargs):
+        calls.append(kwargs)
+        return fake_client
+
+    monkeypatch.setattr(
+        "meshagent.openai.tools.realtime_adapter.get_client",
+        _get_client,
+    )
+    adapter = OpenAIRealtimeAdapter(
+        base_url="https://openai.test/v1",
+        api_key="configured-key",
+        user_agent="custom-agent",
+    )
+
+    assert adapter._openai_client() is fake_client
+    assert calls == [
+        {
+            "base_url": "https://openai.test/v1",
+            "api_key": "configured-key",
+            "user_agent": "custom-agent",
+        }
+    ]
 
 
 def _text_message(event: dict[str, object]) -> aiohttp.WSMessage:
@@ -263,9 +302,20 @@ def test_websocket_headers_remove_beta_and_http_headers_case_insensitively() -> 
 
 
 def test_list_models_advertises_realtime_protocols() -> None:
-    adapter = _adapter(realtime_protocols=("webrtc", "websocket", "webrtc"))
+    adapter = _adapter(realtime_protocols=("webrtc", "", "websocket", "webrtc", ""))
 
-    assert adapter.list_models()[0].realtime_protocols == ("webrtc", "websocket")
+    assert adapter.list_models()[0].realtime_protocols == ("webrtc", "", "websocket")
+
+
+def test_list_models_empty_allowed_models_falls_back_to_known_without_custom_model() -> (
+    None
+):
+    adapter = _adapter(allowed_models=[])
+
+    names = [model.name for model in adapter.list_models()]
+
+    assert names[0] == "gpt-realtime"
+    assert "gpt-realtime-test" not in names
 
 
 def test_list_models_uses_trimmed_realtime_voice_and_transcription_defaults() -> None:
@@ -591,6 +641,173 @@ async def test_stop_session_closes_realtime_websocket() -> None:
     await adapter.stop_session(context=context)
 
     assert websocket.close_count == 1
+    assert not context.is_connected
+
+
+@pytest.mark.asyncio
+async def test_close_websocket_fails_pending_realtime_futures() -> None:
+    websocket = _FakeWebSocket()
+    context = _context(websocket)
+    await context.connect(
+        url="wss://api.openai.test/v1/realtime?model=gpt-realtime-test",
+        headers={"Authorization": "Bearer test-key"},
+        event_handler=lambda _event: None,
+        receive_loop=lambda _context: asyncio.sleep(3600),
+    )
+    pending = asyncio.get_running_loop().create_future()
+    by_id = asyncio.get_running_loop().create_future()
+    session_update = asyncio.get_running_loop().create_future()
+    context._pending_response_futures.append(pending)
+    context._response_futures_by_id["resp-1"] = by_id
+    context._session_update_future = session_update
+    context._session_options_signature = "signature"
+    context._synced_message_count = 3
+
+    await context.close_websocket()
+
+    assert websocket.close_count == 1
+    assert context._session_options_signature is None
+    assert context._synced_message_count == 0
+    assert list(context._pending_response_futures) == []
+    assert context._response_futures_by_id == {}
+    assert context._session_update_future is None
+    for future in (pending, by_id):
+        assert future.done()
+        error = future.exception()
+        assert isinstance(error, RoomException)
+        assert str(error) == (
+            "OpenAI Realtime websocket closed before the response completed"
+        )
+        assert error.status_code == 503
+    update_error = session_update.exception()
+    assert isinstance(update_error, RoomException)
+    assert str(update_error) == (
+        "OpenAI Realtime websocket closed before the session update completed"
+    )
+    assert update_error.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_realtime_fail_response_futures_preserves_room_errors_and_wraps_generic_errors() -> (
+    None
+):
+    websocket = _FakeWebSocket()
+    context = _context(websocket)
+    pending = asyncio.get_running_loop().create_future()
+    by_id = asyncio.get_running_loop().create_future()
+    room_error = RoomException("provider failed", status_code=429, code=123)
+    context._pending_response_futures.append(pending)
+    context._response_futures_by_id["resp-1"] = by_id
+
+    context._fail_response_futures(room_error)
+
+    assert list(context._pending_response_futures) == []
+    assert context._response_futures_by_id == {}
+    assert pending.exception() is room_error
+    assert by_id.exception() is room_error
+
+    generic_pending = asyncio.get_running_loop().create_future()
+    context._pending_response_futures.append(generic_pending)
+
+    context._fail_response_futures(RuntimeError("socket died"))
+
+    generic_error = generic_pending.exception()
+    assert isinstance(generic_error, RoomException)
+    assert str(generic_error) == "socket died"
+    assert generic_error.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_realtime_response_future_mapping_and_completion_branches() -> None:
+    websocket = _FakeWebSocket()
+    context = _context(websocket)
+    first = asyncio.get_running_loop().create_future()
+    second = asyncio.get_running_loop().create_future()
+    done = asyncio.get_running_loop().create_future()
+    done.set_result({"already": "done"})
+    context._pending_response_futures.append(first)
+    context._pending_response_futures.append(second)
+
+    context._response_created({"type": "response.created"})
+    assert list(context._pending_response_futures) == [first, second]
+    assert context._response_futures_by_id == {}
+
+    context._response_created(
+        {"type": "response.created", "response": {"id": "resp-1"}}
+    )
+    assert list(context._pending_response_futures) == [second]
+    assert context._response_futures_by_id == {"resp-1": first}
+
+    completed_event = {
+        "type": "response.completed",
+        "response": {"id": "resp-1"},
+    }
+    context._complete_response_future(event=completed_event, error=None)
+    assert first.result() is completed_event
+    assert context._response_futures_by_id == {}
+
+    fallback_error = RoomException("fallback failed", status_code=500, code=999)
+    fallback_event = {
+        "type": "response.failed",
+        "response": {"id": "unknown-response"},
+    }
+    context._complete_response_future(event=fallback_event, error=fallback_error)
+    assert second.exception() is fallback_error
+    assert list(context._pending_response_futures) == []
+
+    context._pending_response_futures.append(done)
+    context._complete_response_future(
+        event={"type": "response.completed", "response": {"id": "missing"}},
+        error=None,
+    )
+    assert done.result() == {"already": "done"}
+    assert list(context._pending_response_futures) == []
+
+
+@pytest.mark.asyncio
+async def test_realtime_ping_failure_closes_websocket() -> None:
+    websocket = _FakeWebSocket()
+    websocket.ping_error = RuntimeError("ping failed")
+    context = OpenAIRealtimeSessionContext(
+        session=_FakeSession(websocket),
+        websocket_timeout=3600,
+        websocket_ping_interval_seconds=0.001,
+    )
+    await context.connect(
+        url="wss://api.openai.test/v1/realtime?model=gpt-realtime-test",
+        headers={"Authorization": "Bearer test-key"},
+        event_handler=lambda _event: None,
+        receive_loop=lambda _context: asyncio.sleep(3600),
+    )
+
+    await context._websocket_ping_task
+
+    assert websocket.close_count == 1
+    assert not context.is_connected
+
+
+@pytest.mark.asyncio
+async def test_realtime_timeout_closes_owned_session() -> None:
+    websocket = _FakeWebSocket()
+    session = _FakeSession(websocket)
+    context = OpenAIRealtimeSessionContext(
+        session=session,
+        websocket_timeout=0.001,
+        websocket_ping_interval_seconds=3600,
+    )
+    context._owns_session = True
+    await context.connect(
+        url="wss://api.openai.test/v1/realtime?model=gpt-realtime-test",
+        headers={"Authorization": "Bearer test-key"},
+        event_handler=lambda _event: None,
+        receive_loop=lambda _context: asyncio.sleep(3600),
+    )
+
+    await context._websocket_timeout_task
+
+    assert websocket.close_count == 1
+    assert session.closed
+    assert context._session is None
     assert not context.is_connected
 
 

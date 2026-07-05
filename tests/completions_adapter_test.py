@@ -16,7 +16,9 @@ from meshagent.agents.messages import (
     AgentToolCallStarted,
     AgentTextContentDelta,
     AgentTextContentEnded,
+    ToolChoice,
 )
+from meshagent.api import ToolContentSpec
 from meshagent.api.messaging import FileContent, JsonContent, TextContent
 from meshagent.agents.context import SessionUsage
 import meshagent.openai.tools.completions_adapter as completions_adapter_module
@@ -25,7 +27,7 @@ from meshagent.openai.tools.completions_adapter import (
     OpenAICompletionsToolResponseAdapter,
     _consume_streaming_tool_result,
 )
-from meshagent.tools import FunctionTool, Toolkit, ToolContext
+from meshagent.tools import ContentTool, FunctionTool, Toolkit, ToolContext
 
 
 def test_list_models_advertises_attachment_capabilities() -> None:
@@ -499,6 +501,14 @@ async def test_openai_completions_tool_response_adapter_truncates_json_output() 
     assert "The tool call returned too much data and was truncated." in output
 
 
+def test_openai_completions_tool_response_adapter_constructor_validation() -> None:
+    with pytest.raises(ValueError, match="max_tool_call_length must be greater than 0"):
+        OpenAICompletionsToolResponseAdapter(max_tool_call_length=0)
+
+    with pytest.raises(ValueError, match="max_tool_call_lines must be greater than 0"):
+        OpenAICompletionsToolResponseAdapter(max_tool_call_lines=0)
+
+
 @pytest.mark.asyncio
 async def test_openai_completions_tool_response_adapter_truncates_utf8_file_output() -> (
     None
@@ -839,6 +849,32 @@ def test_openai_completions_adapter_reads_base_url_from_environment(monkeypatch)
     assert adapter._base_url == "https://env.example.test/v1"
 
 
+def test_openai_completions_tool_choice_rejects_content_tools_like_python() -> None:
+    adapter = OpenAICompletionsAdapter(model="gpt-4o-mini", client=object())
+    toolkit = Toolkit(
+        name="content",
+        tools=[
+            ContentTool(
+                name="content_tool",
+                input_spec=ToolContentSpec(types=["json"]),
+                output_spec=ToolContentSpec(types=["json"]),
+            )
+        ],
+    )
+
+    with pytest.raises(
+        completions_adapter_module.RoomException,
+        match="tool_choice is not supported for ContentTool",
+    ):
+        adapter._resolve_tool_choice(
+            toolkits=[toolkit],
+            tool_choice=ToolChoice(
+                toolkit_name="content",
+                tool_name="content_tool",
+            ),
+        )
+
+
 def test_openai_completions_adapter_with_runtime_api_key_returns_bound_clone(
     monkeypatch,
 ) -> None:
@@ -1157,6 +1193,45 @@ async def test_next_inserts_steering_messages_after_tool_results() -> None:
         "role": "user",
         "content": "steer now",
     }
+
+
+@pytest.mark.asyncio
+async def test_next_newline_json_validation_error_returns_last_line_like_python() -> (
+    None
+):
+    adapter = OpenAICompletionsAdapter(
+        model="gpt-4o-mini",
+        client=_FakeOpenAIClient(
+            responses=[
+                _FakeChatCompletion(
+                    message=_FakeMessage(
+                        tool_calls=None,
+                        content='{"answer": 1}\n{"wrong": true}',
+                    ),
+                )
+            ]
+        ),
+    )
+    context = adapter.create_session()
+    context.append_user_message("return json")
+
+    result = await adapter.create_response(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        toolkits=[],
+        output_schema={
+            "type": "object",
+            "required": ["answer"],
+            "properties": {"answer": {"type": "integer"}},
+        },
+    )
+
+    assert result == {"wrong": True}
+    assert context.messages[-1]["role"] == "user"
+    assert context.messages[-1]["content"].startswith(
+        "encountered a validation error with the output: 'answer' is a required property"
+    )
+    assert "On instance:\n    {'wrong': True}" in context.messages[-1]["content"]
 
 
 @pytest.mark.asyncio

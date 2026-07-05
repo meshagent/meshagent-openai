@@ -125,6 +125,17 @@ def test_list_models_advertises_attachment_capabilities() -> None:
     assert "application/pdf" in model.accepts
 
 
+def test_list_models_empty_allowed_models_falls_back_to_known_without_custom_model() -> (
+    None
+):
+    adapter = OpenAIResponsesAdapter(model="custom-model", allowed_models=[])
+
+    names = [model.name for model in adapter.list_models()]
+
+    assert names[0] == "gpt-5.5"
+    assert "custom-model" not in names
+
+
 class _FakeDeveloper:
     def log_nowait(self, *, type: str, data: dict) -> None:
         del type
@@ -1181,6 +1192,16 @@ class _NamelessParticipant:
         return None
 
 
+class _EmptyNameParticipant:
+    def __init__(self):
+        self.id = "participant_3"
+
+    def get_attribute(self, key: str):
+        if key == "name":
+            return ""
+        return None
+
+
 def test_store_usage_publishes_otel_usage_metrics(monkeypatch: pytest.MonkeyPatch):
     calls: list[dict[str, object]] = []
 
@@ -1697,6 +1718,14 @@ async def test_openai_responses_tool_response_adapter_truncates_text_output() ->
     assert "line1\nline2" in output
     assert "line3" not in output
     assert "The tool call returned too much data and was truncated." in output
+
+
+def test_openai_responses_tool_response_adapter_constructor_validation() -> None:
+    with pytest.raises(ValueError, match="max_tool_call_length must be greater than 0"):
+        OpenAIResponsesToolResponseAdapter(max_tool_call_length=0)
+
+    with pytest.raises(ValueError, match="max_tool_call_lines must be greater than 0"):
+        OpenAIResponsesToolResponseAdapter(max_tool_call_lines=0)
 
 
 @pytest.mark.asyncio
@@ -6184,6 +6213,35 @@ async def test_next_omits_on_behalf_of_header_when_name_is_missing() -> None:
     assert result == "done"
     assert len(client.responses.create_kwargs) == 1
     assert client.responses.create_kwargs[0]["extra_headers"] == {}
+
+
+@pytest.mark.asyncio
+async def test_next_keeps_empty_on_behalf_of_name_header_like_python() -> None:
+    client = _FakeOpenAIClient(
+        outcomes=[
+            _FakeResponse(
+                response_id="resp_done",
+                output=[_make_output_message(message_id="msg_done", text="done")],
+            )
+        ]
+    )
+
+    adapter = OpenAIResponsesAdapter(client=client, max_retries=3, mode="request")
+    context = adapter.create_session()
+    context.append_user_message("hello")
+
+    result = await adapter.create_response(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        on_behalf_of=_EmptyNameParticipant(),
+        toolkits=[],
+    )
+
+    assert result == "done"
+    assert len(client.responses.create_kwargs) == 1
+    assert client.responses.create_kwargs[0]["extra_headers"] == {
+        "Meshagent-On-Behalf-Of": ""
+    }
 
 
 @pytest.mark.asyncio
