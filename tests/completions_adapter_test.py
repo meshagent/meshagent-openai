@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import json
+import logging
 from typing import Any
 
 import pytest
@@ -18,7 +19,7 @@ from meshagent.agents.messages import (
     AgentTextContentEnded,
     ToolChoice,
 )
-from meshagent.api import ToolContentSpec
+from meshagent.api import RoomException, ToolContentSpec
 from meshagent.api.messaging import FileContent, JsonContent, TextContent
 from meshagent.agents.context import SessionUsage
 import meshagent.openai.tools.completions_adapter as completions_adapter_module
@@ -413,6 +414,21 @@ class _ContextTool(FunctionTool):
         return {"ok": True}
 
 
+class _FailingTool(FunctionTool):
+    def __init__(self, name: str, error: Exception):
+        super().__init__(
+            name=name,
+            input_schema={"type": "object", "additionalProperties": True},
+            description="failing test tool",
+        )
+        self._error = error
+
+    async def execute(self, context, **kwargs):
+        del context
+        del kwargs
+        raise self._error
+
+
 class _FakeToolFunction:
     def __init__(self, *, name: str, arguments: dict):
         self.name = name
@@ -432,6 +448,11 @@ class _FakeMessage:
 
     def to_dict(self) -> dict:
         return {"tool_calls": self.tool_calls, "content": self.content}
+
+
+class _FakeDisplayMessage(_FakeMessage):
+    def __str__(self) -> str:
+        return "message-object"
 
 
 class _FakeChoice:
@@ -728,6 +749,26 @@ async def test_openai_completions_adapter_schema_output_json_errors_match_python
                     usage={"prompt_tokens": 1, "completion_tokens": 1},
                 ),
                 _FakeChatCompletion(
+                    message=_FakeMessage(tool_calls=None, content='{"answer": 1,}'),
+                    usage={"prompt_tokens": 1, "completion_tokens": 1},
+                ),
+                _FakeChatCompletion(
+                    message=_FakeMessage(tool_calls=None, content="[1 2]"),
+                    usage={"prompt_tokens": 1, "completion_tokens": 1},
+                ),
+                _FakeChatCompletion(
+                    message=_FakeMessage(tool_calls=None, content="1 2"),
+                    usage={"prompt_tokens": 1, "completion_tokens": 1},
+                ),
+                _FakeChatCompletion(
+                    message=_FakeMessage(tool_calls=None, content=r'["bad\uZZZZ"]'),
+                    usage={"prompt_tokens": 1, "completion_tokens": 1},
+                ),
+                _FakeChatCompletion(
+                    message=_FakeMessage(tool_calls=None, content=r'["bad\x01"]'),
+                    usage={"prompt_tokens": 1, "completion_tokens": 1},
+                ),
+                _FakeChatCompletion(
                     message=_FakeMessage(tool_calls=None, content='["unterminated]'),
                     usage={"prompt_tokens": 1, "completion_tokens": 1},
                 ),
@@ -749,6 +790,74 @@ async def test_openai_completions_adapter_schema_output_json_errors_match_python
             r"Illegal trailing comma before end of array: "
             r"line 1 column 3 \(char 2\)"
         ),
+    ):
+        await adapter.create_response(
+            context=context,
+            caller=caller,
+            toolkits=[],
+            output_schema=output_schema,
+        )
+
+    context = adapter.create_session()
+    context.append_user_message("object trailing comma")
+    with pytest.raises(
+        json.JSONDecodeError,
+        match=(
+            r"Illegal trailing comma before end of object: "
+            r"line 1 column 13 \(char 12\)"
+        ),
+    ):
+        await adapter.create_response(
+            context=context,
+            caller=caller,
+            toolkits=[],
+            output_schema=output_schema,
+        )
+
+    context = adapter.create_session()
+    context.append_user_message("missing array comma")
+    with pytest.raises(
+        json.JSONDecodeError,
+        match=r"Expecting ',' delimiter: line 1 column 4 \(char 3\)",
+    ):
+        await adapter.create_response(
+            context=context,
+            caller=caller,
+            toolkits=[],
+            output_schema=output_schema,
+        )
+
+    context = adapter.create_session()
+    context.append_user_message("extra data")
+    with pytest.raises(
+        json.JSONDecodeError,
+        match=r"Extra data: line 1 column 3 \(char 2\)",
+    ):
+        await adapter.create_response(
+            context=context,
+            caller=caller,
+            toolkits=[],
+            output_schema=output_schema,
+        )
+
+    context = adapter.create_session()
+    context.append_user_message("invalid unicode escape")
+    with pytest.raises(
+        json.JSONDecodeError,
+        match=r"Invalid \\uXXXX escape: line 1 column 7 \(char 6\)",
+    ):
+        await adapter.create_response(
+            context=context,
+            caller=caller,
+            toolkits=[],
+            output_schema=output_schema,
+        )
+
+    context = adapter.create_session()
+    context.append_user_message("invalid escape")
+    with pytest.raises(
+        json.JSONDecodeError,
+        match=r"Invalid \\escape: line 1 column 6 \(char 5\)",
     ):
         await adapter.create_response(
             context=context,
@@ -781,6 +890,33 @@ async def test_openai_completions_adapter_schema_output_json_errors_match_python
             caller=caller,
             toolkits=[],
             output_schema=output_schema,
+        )
+
+
+@pytest.mark.asyncio
+async def test_openai_completions_adapter_unexpected_message_uses_message_str() -> None:
+    adapter = OpenAICompletionsAdapter(
+        model="gpt-4o-mini",
+        client=_FakeOpenAIClient(
+            responses=[
+                _FakeChatCompletion(
+                    message=_FakeDisplayMessage(tool_calls=None, content=None),
+                    usage={"prompt_tokens": 1, "completion_tokens": 1},
+                )
+            ]
+        ),
+    )
+    context = adapter.create_session()
+    context.append_user_message("hello")
+
+    with pytest.raises(
+        RoomException,
+        match=r"Unexpected response from OpenAI message-object",
+    ):
+        await adapter.create_response(
+            context=context,
+            caller=_FakeRoom().local_participant,
+            toolkits=[],
         )
 
 
@@ -993,6 +1129,71 @@ async def test_next_consumes_streaming_tool_events_and_uses_final_item_result():
         context_window_used=5,
     )
     assert events == [{"type": "agent.event", "headline": "working"}]
+
+
+@pytest.mark.asyncio
+async def test_next_logs_non_room_tool_exception_and_sends_fallback_result(caplog):
+    adapter = OpenAICompletionsAdapter(
+        model="gpt-4o-mini",
+        client=_FakeOpenAIClient(
+            responses=[
+                _FakeChatCompletion(
+                    message=_FakeMessage(
+                        tool_calls=[
+                            _FakeToolCall(
+                                tool_call_id="call_1",
+                                name="fail_tool",
+                                arguments={},
+                            )
+                        ],
+                        content=None,
+                    ),
+                    usage={"prompt_tokens": 5, "completion_tokens": 1},
+                ),
+                _FakeChatCompletion(
+                    message=_FakeMessage(tool_calls=None, content="done"),
+                    usage={"prompt_tokens": 2, "completion_tokens": 3},
+                ),
+            ]
+        ),
+    )
+    context = adapter.create_session()
+    context.append_user_message("run tool")
+
+    caplog.set_level(logging.ERROR, logger="openai_agent")
+    result = await adapter.create_response(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        toolkits=[
+            Toolkit(
+                name="tools",
+                tools=[_FailingTool("fail_tool", ValueError("non-room boom"))],
+            )
+        ],
+    )
+
+    assert result == "done"
+    logged_messages = [
+        record.message
+        for record in caplog.records
+        if record.name == "openai_agent" and record.levelno == logging.ERROR
+    ]
+    assert len(logged_messages) == 1
+    assert "unable to complete tool call" in logged_messages[0]
+    assert "non-room boom" not in logged_messages[0]
+    second_request_messages = adapter._client.chat.completions.create_kwargs[1][
+        "messages"
+    ]
+    tool_message = next(
+        message
+        for message in second_request_messages
+        if isinstance(message, dict) and message.get("role") == "tool"
+    )
+    assert tool_message == {
+        "role": "tool",
+        "content": json.dumps({"error": "unable to complete tool call: non-room boom"}),
+        "tool_call_id": "call_1",
+    }
 
 
 @pytest.mark.asyncio

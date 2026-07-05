@@ -3791,6 +3791,51 @@ async def test_create_response_output_schema_message_branches_match_python() -> 
                 ],
             ),
             _FakeResponse(
+                response_id="resp_object_trailing_comma",
+                output=[
+                    _make_output_message(
+                        message_id="msg_object_trailing_comma",
+                        text='{"answer": 1,}',
+                    )
+                ],
+            ),
+            _FakeResponse(
+                response_id="resp_missing_array_comma",
+                output=[
+                    _make_output_message(
+                        message_id="msg_missing_array_comma",
+                        text="[1 2]",
+                    )
+                ],
+            ),
+            _FakeResponse(
+                response_id="resp_extra_data",
+                output=[
+                    _make_output_message(
+                        message_id="msg_extra_data",
+                        text="1 2",
+                    )
+                ],
+            ),
+            _FakeResponse(
+                response_id="resp_invalid_unicode_escape",
+                output=[
+                    _make_output_message(
+                        message_id="msg_invalid_unicode_escape",
+                        text=r'["bad\uZZZZ"]',
+                    )
+                ],
+            ),
+            _FakeResponse(
+                response_id="resp_invalid_escape",
+                output=[
+                    _make_output_message(
+                        message_id="msg_invalid_escape",
+                        text=r'["bad\x01"]',
+                    )
+                ],
+            ),
+            _FakeResponse(
                 response_id="resp_unterminated_string",
                 output=[
                     _make_output_message(
@@ -3858,6 +3903,74 @@ async def test_create_response_output_schema_message_branches_match_python() -> 
             r"Illegal trailing comma before end of array: "
             r"line 1 column 3 \(char 2\)"
         ),
+    ):
+        await adapter.create_response(
+            context=context,
+            caller=caller,
+            toolkits=[],
+            output_schema=output_schema,
+        )
+
+    context = adapter.create_session()
+    context.append_user_message("object trailing comma")
+    with pytest.raises(
+        json.JSONDecodeError,
+        match=(
+            r"Illegal trailing comma before end of object: "
+            r"line 1 column 13 \(char 12\)"
+        ),
+    ):
+        await adapter.create_response(
+            context=context,
+            caller=caller,
+            toolkits=[],
+            output_schema=output_schema,
+        )
+
+    context = adapter.create_session()
+    context.append_user_message("missing array comma")
+    with pytest.raises(
+        json.JSONDecodeError,
+        match=r"Expecting ',' delimiter: line 1 column 4 \(char 3\)",
+    ):
+        await adapter.create_response(
+            context=context,
+            caller=caller,
+            toolkits=[],
+            output_schema=output_schema,
+        )
+
+    context = adapter.create_session()
+    context.append_user_message("extra data")
+    with pytest.raises(
+        json.JSONDecodeError,
+        match=r"Extra data: line 1 column 3 \(char 2\)",
+    ):
+        await adapter.create_response(
+            context=context,
+            caller=caller,
+            toolkits=[],
+            output_schema=output_schema,
+        )
+
+    context = adapter.create_session()
+    context.append_user_message("invalid unicode escape")
+    with pytest.raises(
+        json.JSONDecodeError,
+        match=r"Invalid \\uXXXX escape: line 1 column 7 \(char 6\)",
+    ):
+        await adapter.create_response(
+            context=context,
+            caller=caller,
+            toolkits=[],
+            output_schema=output_schema,
+        )
+
+    context = adapter.create_session()
+    context.append_user_message("invalid escape")
+    with pytest.raises(
+        json.JSONDecodeError,
+        match=r"Invalid \\escape: line 1 column 6 \(char 5\)",
     ):
         await adapter.create_response(
             context=context,
