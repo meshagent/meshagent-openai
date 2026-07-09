@@ -99,6 +99,7 @@ def preprocess_openai_usage(
         cached_image = _to_float(cached_details.get("image_tokens"))
 
         cached_total = _to_float(input_details.get("cached_tokens"))
+        cache_write_total = _to_float(input_details.get("cache_write_tokens"))
         if cached_text is None and cached_total is not None:
             cached_text = cached_total
 
@@ -108,6 +109,8 @@ def preprocess_openai_usage(
             out["audio_cached_tokens"] = cached_audio
         if cached_image is not None and cached_image > 0:
             out["image_cached_tokens"] = cached_image
+        if cache_write_total is not None and cache_write_total > 0:
+            out["cache_write_tokens"] = cache_write_total
 
         text_total = _to_float(input_details.get("text_tokens"))
         audio_total = _to_float(input_details.get("audio_tokens"))
@@ -115,7 +118,10 @@ def preprocess_openai_usage(
 
         if text_total is not None:
             saw_modal_details = True
-            uncached_text = max(0.0, text_total - (cached_text or 0.0))
+            uncached_text = max(
+                0.0,
+                text_total - (cached_text or 0.0) - (cache_write_total or 0.0),
+            )
             if uncached_text > 0:
                 out["input_tokens"] = uncached_text
 
@@ -168,12 +174,20 @@ def preprocess_openai_usage(
         aggregate_input = _to_float(usage.get("prompt_tokens"))
     if input_details is not None:
         cached_total = _to_float(input_details.get("cached_tokens"))
+        cache_write_total = _to_float(input_details.get("cache_write_tokens"))
         if cached_total is not None and cached_total > 0:
             out["cached_tokens"] = cached_total
-            if aggregate_input is not None:
-                uncached_input = max(0.0, aggregate_input - cached_total)
-                if uncached_input > 0:
-                    out["input_tokens"] = uncached_input
+        if cache_write_total is not None and cache_write_total > 0:
+            out["cache_write_tokens"] = cache_write_total
+        if aggregate_input is not None and (
+            cached_total is not None or cache_write_total is not None
+        ):
+            uncached_input = max(
+                0.0,
+                aggregate_input - (cached_total or 0.0) - (cache_write_total or 0.0),
+            )
+            if uncached_input > 0:
+                out["input_tokens"] = uncached_input
 
     has_aggregate_output = (
         _to_float(usage.get("output_tokens")) is not None

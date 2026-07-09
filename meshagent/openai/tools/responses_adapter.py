@@ -1554,6 +1554,10 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
 
 class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
     _known_models = (
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.6",
         "gpt-5.5",
         "gpt-5.4",
         "gpt-5.4-mini",
@@ -1567,6 +1571,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         "o1",
     )
     _context_window_sizes = {
+        "gpt-5.6": 1_050_000,
         "gpt-5.5": 400000,
         "gpt-4.1": 128000,
         "gpt-4o": 128000,

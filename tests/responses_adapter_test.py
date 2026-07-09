@@ -132,8 +132,16 @@ def test_list_models_empty_allowed_models_falls_back_to_known_without_custom_mod
 
     names = [model.name for model in adapter.list_models()]
 
-    assert names[0] == "gpt-5.5"
+    assert names[0] == "gpt-5.6-sol"
     assert "custom-model" not in names
+
+
+def test_gpt_5_6_models_use_documented_context_window() -> None:
+    adapter = OpenAIResponsesAdapter(model="gpt-5.6-sol")
+
+    assert adapter.context_window_size("gpt-5.6-sol") == 1_050_000
+    assert adapter.context_window_size("gpt-5.6-terra") == 1_050_000
+    assert adapter.context_window_size("gpt-5.6-luna") == 1_050_000
 
 
 class _FakeDeveloper:
