@@ -139,6 +139,7 @@ _OPENAI_RESPONSES_IMAGE_GENERATION_CALL_INPUT_FIELDS = frozenset(
         "size",
     }
 )
+_OPENAI_RESPONSES_INPUT_STATUSES = {"in_progress", "completed", "incomplete"}
 OpenAIResponsesToolSearchMode = Literal["server", "client"]
 OpenAIResponsesToolSearchConfig = OpenAIResponsesToolSearchMode | bool | None
 
@@ -1910,11 +1911,61 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         )
 
     @staticmethod
+    def _normalize_restored_input_status(*, message: dict[str, Any]) -> None:
+        status = message.get("status")
+        if not isinstance(status, str):
+            return
+
+        normalized = status.strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized == "":
+            message.pop("status", None)
+            return
+        if normalized == "inprogress":
+            normalized = "in_progress"
+
+        if normalized in _OPENAI_RESPONSES_INPUT_STATUSES:
+            message["status"] = normalized
+            return
+        if normalized in {
+            "completed",
+            "complete",
+            "done",
+            "succeeded",
+            "success",
+            "finished",
+        }:
+            message["status"] = "completed"
+            return
+        if normalized in {
+            "queued",
+            "pending",
+            "waiting",
+            "running",
+            "started",
+            "starting",
+        }:
+            message["status"] = "in_progress"
+            return
+
+        message["status"] = "incomplete"
+
+    @staticmethod
+    def _normalize_responses_input_messages(*, messages: Any) -> Any:
+        if not isinstance(messages, list):
+            return messages
+        normalized = copy.deepcopy(messages)
+        for message in normalized:
+            if isinstance(message, dict):
+                OpenAIResponsesAdapter._normalize_restored_input_status(message=message)
+        return normalized
+
+    @staticmethod
     def _normalize_stateless_context_message(
         *,
         message: dict[str, Any],
     ) -> dict[str, Any]:
         restored = copy.deepcopy(message)
+        OpenAIResponsesAdapter._normalize_restored_input_status(message=restored)
         message_type = restored.get("type")
         if message_type in {"shell_call_output", "local_shell_call_output"}:
             OpenAIResponsesAdapter._normalize_restored_shell_call_output(
@@ -3390,10 +3441,12 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                 "extra_headers": extra_headers,
                                 "stream": stream,
                                 "model": model,
-                                "input": (
-                                    incremental_input
-                                    if incremental_input is not None
-                                    else context.messages
+                                "input": self._normalize_responses_input_messages(
+                                    messages=(
+                                        incremental_input
+                                        if incremental_input is not None
+                                        else context.messages
+                                    )
                                 ),
                                 "tools": open_ai_tools,
                                 "tool_choice": self._resolve_tool_choice(
@@ -4267,6 +4320,11 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                     iteration_committed = True
                                                     return ""
                                         if restart_after_tool_boundary:
+                                            create_kwargs["input"] = (
+                                                self._normalize_responses_input_messages(
+                                                    messages=context.messages
+                                                )
+                                            )
                                             response = None
                                             continue
                                         break

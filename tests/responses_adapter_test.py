@@ -265,6 +265,114 @@ def test_restore_context_messages_normalizes_restored_reasoning_for_stateless_re
     assert context.messages is not messages
 
 
+def test_restore_context_messages_normalizes_restored_failed_statuses_for_input() -> (
+    None
+):
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    context = adapter.create_session()
+
+    adapter.restore_context_messages(
+        context=context,
+        messages=[
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "save_file",
+                "arguments": "{}",
+                "status": "failed",
+            },
+            {
+                "type": "apply_patch_call_output",
+                "call_id": "call_2",
+                "output": "patch failed",
+                "status": "cancelled",
+            },
+            {
+                "type": "mcp_call",
+                "id": "mcp_1",
+                "call_id": "call_3",
+                "name": "search",
+                "server_label": "tools",
+                "arguments": "{}",
+                "status": "queued",
+            },
+        ],
+    )
+
+    assert context.messages == [
+        {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "save_file",
+            "arguments": "{}",
+            "status": "incomplete",
+        },
+        {
+            "type": "apply_patch_call_output",
+            "call_id": "call_2",
+            "output": "patch failed",
+            "status": "incomplete",
+        },
+        {
+            "type": "mcp_call",
+            "id": "mcp_1",
+            "call_id": "call_3",
+            "name": "search",
+            "server_label": "tools",
+            "arguments": "{}",
+            "status": "in_progress",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_next_normalizes_in_memory_failed_statuses_before_request() -> None:
+    client = _FakeOpenAIClient(
+        outcomes=[
+            _FakeResponse(
+                response_id="resp_status",
+                output=[_make_output_message(message_id="msg_status", text="Done.")],
+            )
+        ]
+    )
+    adapter = OpenAIResponsesAdapter(client=client, mode="request")
+    context = adapter.create_session()
+    context.messages.extend(
+        [
+            {"role": "user", "content": "continue"},
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "save_file",
+                "arguments": "{}",
+                "status": "failed",
+            },
+        ]
+    )
+
+    await adapter.create_response(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        toolkits=[],
+    )
+
+    assert client.responses.create_kwargs[0]["input"] == [
+        {"role": "user", "content": "continue"},
+        {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "save_file",
+            "arguments": "{}",
+            "status": "incomplete",
+        },
+    ]
+    assert context.messages[1]["status"] == "failed"
+
+
 def test_restore_context_messages_normalizes_legacy_shell_output_string() -> None:
     adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
     context = adapter.create_session()
