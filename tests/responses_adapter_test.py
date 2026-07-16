@@ -735,6 +735,53 @@ def test_make_agent_event_reader_converts_cross_provider_function_calls() -> Non
     ]
 
 
+def test_make_agent_event_reader_pairs_incomplete_function_call_with_cancelled_output() -> (
+    None
+):
+    adapter = OpenAIResponsesAdapter(
+        model="gpt-5-mini",
+        client=object(),
+        provider="openai",
+    )
+    restored_messages: list[dict[str, object]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+
+    reader.consume(
+        AgentToolCallStarted(
+            type=AGENT_EVENT_TOOL_CALL_STARTED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="tool-1",
+            namespace="meshagent",
+            call_id="call-1",
+            toolkit="test",
+            tool="blocking_tool",
+            arguments={"marker": "cancel-me"},
+            provider="openai",
+            model="gpt-5-mini",
+        )
+    )
+    reader.finalize()
+
+    assert restored_messages == [
+        {
+            "type": "function_call",
+            "id": "tool-1",
+            "call_id": "call-1",
+            "name": "test_blocking_tool",
+            "arguments": '{"marker":"cancel-me"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": (
+                '{"error":{"message":"tool call was cancelled before completion",'
+                '"code":"cancelled"}}'
+            ),
+        },
+    ]
+
+
 def test_make_agent_event_reader_restores_openai_encrypted_reasoning_metadata() -> None:
     adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
     restored_messages: list[dict[str, object]] = []
