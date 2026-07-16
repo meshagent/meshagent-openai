@@ -310,6 +310,11 @@ def test_restore_context_messages_normalizes_restored_failed_statuses_for_input(
             "status": "incomplete",
         },
         {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "Tool call output was unavailable in the restored thread.",
+        },
+        {
             "type": "apply_patch_call_output",
             "call_id": "call_2",
             "output": "patch failed",
@@ -779,6 +784,100 @@ def test_make_agent_event_reader_pairs_incomplete_function_call_with_cancelled_o
                 '"code":"cancelled"}}'
             ),
         },
+    ]
+
+
+def test_make_agent_event_reader_pairs_completed_function_call_without_result() -> None:
+    adapter = OpenAIResponsesAdapter(
+        model="gpt-5-mini",
+        client=object(),
+        provider="openai",
+    )
+    restored_messages: list[dict[str, object]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+
+    reader.consume(
+        AgentToolCallStarted(
+            type=AGENT_EVENT_TOOL_CALL_STARTED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="tool-1",
+            namespace="meshagent",
+            call_id="call-1",
+            toolkit="storage",
+            tool="read_file",
+            arguments={"path": "/data/empty.txt", "offset": None},
+            provider="openai",
+            model="gpt-5-mini",
+        )
+    )
+    reader.consume(
+        AgentToolCallEnded(
+            type=AGENT_EVENT_TOOL_CALL_ENDED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="tool-1",
+            namespace="meshagent",
+            call_id="call-1",
+            toolkit="storage",
+            tool="read_file",
+            result=None,
+            error=None,
+            provider="openai",
+            model="gpt-5-mini",
+        )
+    )
+
+    assert restored_messages == [
+        {
+            "type": "function_call",
+            "id": "tool-1",
+            "call_id": "call-1",
+            "name": "storage_read_file",
+            "arguments": '{"path":"/data/empty.txt","offset":null}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "ok",
+        },
+    ]
+
+
+def test_restore_context_messages_repairs_unpaired_function_call() -> None:
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    context = adapter.create_session()
+
+    adapter.restore_context_messages(
+        context=context,
+        messages=[
+            {"role": "user", "content": "read the file"},
+            {
+                "type": "function_call",
+                "id": "tool-1",
+                "call_id": "call-1",
+                "name": "storage_read_file",
+                "arguments": "{}",
+            },
+            {"role": "user", "content": "continue"},
+        ],
+    )
+
+    assert context.messages == [
+        {"role": "user", "content": "read the file"},
+        {
+            "type": "function_call",
+            "id": "tool-1",
+            "call_id": "call-1",
+            "name": "storage_read_file",
+            "arguments": "{}",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "Tool call output was unavailable in the restored thread.",
+        },
+        {"role": "user", "content": "continue"},
     ]
 
 
@@ -7843,6 +7942,46 @@ def test_make_agent_event_publisher_updates_function_tool_failure_from_handler_d
     assert isinstance(ended, AgentToolCallEnded)
     assert ended.error is not None
     assert ended.error.message == "'text' is a required property"
+
+
+def test_make_agent_event_publisher_preserves_empty_successful_tool_results() -> None:
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    for item_id, result in (("call-empty-text", ""), ("call-empty", None)):
+        publisher(
+            {
+                "type": "meshagent.handler.added",
+                "item": {
+                    "type": "function_call",
+                    "id": item_id,
+                    "call_id": item_id,
+                    "name": "read_file",
+                    "arguments": "{}",
+                },
+            }
+        )
+        publisher(
+            {
+                "type": "meshagent.handler.done",
+                "item_id": item_id,
+                "result": result,
+            }
+        )
+
+    ended = [event for event in published if isinstance(event, AgentToolCallEnded)]
+    assert len(ended) == 2
+    assert isinstance(ended[0].result, TextContent)
+    assert ended[0].result.text == ""
+    assert isinstance(ended[1].result, EmptyContent)
 
 
 def test_make_agent_event_publisher_emits_web_search_tool_events() -> None:

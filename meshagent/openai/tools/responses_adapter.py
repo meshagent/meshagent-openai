@@ -825,18 +825,20 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
                     "arguments": tool_call.arguments_json(),
                 }
             )
-            if result is not None or error is not None or tool_call.logs:
-                self._emit_context_message(
-                    {
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": self._result_text(
-                            result=result,
-                            error=error,
-                            logs=tool_call.logs,
-                        ),
-                    }
-                )
+            output = self._result_text(
+                result=result,
+                error=error,
+                logs=tool_call.logs,
+            )
+            if result is None and error is None and not tool_call.logs:
+                output = "ok"
+            self._emit_context_message(
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output,
+                }
+            )
             return
 
         item = self._builtin_call_item(
@@ -1903,12 +1905,52 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         if isinstance(context, OpenAIResponsesSessionContext):
             context.clear_websocket_incremental_state()
         context.messages.clear()
+        normalized_messages = [
+            self._normalize_restored_context_message(message=message)
+            for message in messages
+        ]
         context.messages.extend(
-            [
-                self._normalize_restored_context_message(message=message)
-                for message in messages
-            ]
+            self._repair_restored_function_call_outputs(
+                messages=normalized_messages,
+            )
         )
+
+    @staticmethod
+    def _repair_restored_function_call_outputs(
+        *,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        output_call_ids = {
+            call_id
+            for message in messages
+            if message.get("type") == "function_call_output"
+            and isinstance((call_id := message.get("call_id")), str)
+            and call_id != ""
+        }
+        repaired: list[dict[str, Any]] = []
+        for message in messages:
+            repaired.append(message)
+            if message.get("type") != "function_call":
+                continue
+            call_id = message.get("call_id")
+            if not isinstance(call_id, str) or call_id == "":
+                continue
+            if call_id in output_call_ids:
+                continue
+            logger.warning(
+                "restored OpenAI function call %s without an output; "
+                "inserting a placeholder output",
+                call_id,
+            )
+            repaired.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": "Tool call output was unavailable in the restored thread.",
+                }
+            )
+            output_call_ids.add(call_id)
+        return repaired
 
     @staticmethod
     def _normalize_restored_input_status(*, message: dict[str, Any]) -> None:
@@ -3656,6 +3698,22 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                         ):
                                                             handler_result = (
                                                                 tool_response.text
+                                                            )
+                                                        elif isinstance(
+                                                            tool_response, ErrorContent
+                                                        ):
+                                                            event_handler(
+                                                                {
+                                                                    "type": "meshagent.handler.done",
+                                                                    "item_id": tool_call.id,
+                                                                    "error": tool_response.text,
+                                                                    "error_code": tool_response.code,
+                                                                }
+                                                            )
+                                                            return await tool_adapter.create_messages(
+                                                                context=context,
+                                                                tool_call=tool_call,
+                                                                response=tool_response,
                                                             )
                                                         elif isinstance(
                                                             tool_response,
