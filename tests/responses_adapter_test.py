@@ -103,6 +103,135 @@ from meshagent.tools import FunctionTool, Toolkit, ToolContext
 from meshagent.tools.storage import StorageToolkit, StorageToolLocalMount
 
 
+DOCUMENTED_OPENAI_FILE_MIME_TYPES = (
+    "application/csv",
+    "application/graphql",
+    "application/javascript",
+    "application/json",
+    "application/json5",
+    "application/msword",
+    "application/pdf",
+    "application/rtf",
+    "application/toml",
+    "application/typescript",
+    "application/vnd.apple.iwork",
+    "application/vnd.apple.keynote",
+    "application/vnd.apple.pages",
+    "application/vnd.google-apps.document",
+    "application/vnd.google-apps.presentation",
+    "application/vnd.google-apps.spreadsheet",
+    "application/vnd.ms-excel",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.oasis.opendocument.text",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/x-awk",
+    "application/x-bash",
+    "application/x-graphql",
+    "application/x-httpd-php",
+    "application/x-httpd-php-source",
+    "application/x-iif",
+    "application/x-json5",
+    "application/x-ndjson",
+    "application/x-patch",
+    "application/x-php",
+    "application/x-powershell",
+    "application/x-protobuf",
+    "application/x-rust",
+    "application/x-scala",
+    "application/x-sql",
+    "application/x-subrip",
+    "application/x-terraform",
+    "application/x-toml",
+    "application/x-yaml",
+    "application/yaml",
+    "message/rfc822",
+    "text/calendar",
+    "text/css",
+    "text/csv",
+    "text/html",
+    "text/javascript",
+    "text/jsx",
+    "text/markdown",
+    "text/plain",
+    "text/rtf",
+    "text/srt",
+    "text/tsx",
+    "text/tsv",
+    "text/vbscript",
+    "text/vtt",
+    "text/x-asm",
+    "text/x-astro",
+    "text/x-awk",
+    "text/x-bash",
+    "text/x-c",
+    "text/x-c++",
+    "text/x-clojure",
+    "text/x-cmake",
+    "text/x-csharp",
+    "text/x-dart",
+    "text/x-diff",
+    "text/x-dockerfile",
+    "text/x-ejs",
+    "text/x-elixir",
+    "text/x-erb",
+    "text/x-erlang",
+    "text/x-go",
+    "text/x-golang",
+    "text/x-gradle",
+    "text/x-graphql",
+    "text/x-groovy",
+    "text/x-handlebars",
+    "text/x-haskell",
+    "text/x-iif",
+    "text/x-ini",
+    "text/x-jade",
+    "text/x-java",
+    "text/x-jinja2",
+    "text/x-julia",
+    "text/x-kotlin",
+    "text/x-less",
+    "text/x-liquid",
+    "text/x-lisp",
+    "text/x-lua",
+    "text/x-makefile",
+    "text/x-mustache",
+    "text/x-objectivec",
+    "text/x-objectivec++",
+    "text/x-patch",
+    "text/x-perl",
+    "text/x-php",
+    "text/x-properties",
+    "text/x-protobuf",
+    "text/x-pug",
+    "text/x-python",
+    "text/x-r",
+    "text/x-rst",
+    "text/x-ruby",
+    "text/x-rust",
+    "text/x-sass",
+    "text/x-scala",
+    "text/x-scss",
+    "text/x-script.python",
+    "text/x-sh",
+    "text/x-shellscript",
+    "text/x-sql",
+    "text/x-subrip",
+    "text/x-swift",
+    "text/x-terraform",
+    "text/x-tex",
+    "text/x-tmpl",
+    "text/x-toml",
+    "text/x-twig",
+    "text/x-typescript",
+    "text/x-vcard",
+    "text/x-yaml",
+    "text/x-zsh",
+    "text/xml",
+)
+
+
 def test_openai_responses_tool_base_methods_are_empty() -> None:
     tool = OpenAIResponsesTool(name="native")
 
@@ -121,8 +250,16 @@ def test_list_models_advertises_attachment_capabilities() -> None:
     model = OpenAIResponsesAdapter(model="gpt-5.2").list_models()[0]
 
     assert model.supports_attachments is True
-    assert "image/*" in model.accepts
-    assert "application/pdf" in model.accepts
+    assert set(model.accepts) == {
+        "image/*",
+        "application/xhtml+xml",
+        *DOCUMENTED_OPENAI_FILE_MIME_TYPES,
+    }
+    assert responses_adapter_module._OPENAI_RESPONSES_INLINE_FILE_MIME_TYPES == {
+        "application/xhtml+xml",
+        *DOCUMENTED_OPENAI_FILE_MIME_TYPES,
+    }
+    assert "text/*" not in model.accepts
 
 
 def test_list_models_empty_allowed_models_falls_back_to_known_without_custom_model() -> (
@@ -2277,6 +2414,63 @@ async def test_openai_responses_tool_response_adapter_content_branches() -> None
         {
             "output": "archive.zip was not in a supported format",
             "call_id": "call-unsupported",
+            "type": "function_call_output",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mime_type", DOCUMENTED_OPENAI_FILE_MIME_TYPES)
+async def test_openai_responses_tool_response_adapter_handles_every_documented_file_type(
+    mime_type: str,
+) -> None:
+    adapter = OpenAIResponsesToolResponseAdapter()
+
+    messages = await adapter.create_messages(
+        context=None,  # type: ignore[arg-type]
+        tool_call=_AttrDict(call_id="call-file"),
+        response=FileContent(
+            name="attachment",
+            mime_type=mime_type,
+            data=b"\xff\x00",
+        ),
+    )
+
+    assert messages == [
+        {
+            "output": [
+                {
+                    "type": "input_file",
+                    "filename": "attachment",
+                    "file_data": f"data:{mime_type};base64,/wA=",
+                }
+            ],
+            "call_id": "call-file",
+            "type": "function_call_output",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_tool_response_adapter_does_not_assume_unknown_text_mime_is_supported() -> (
+    None
+):
+    adapter = OpenAIResponsesToolResponseAdapter()
+
+    messages = await adapter.create_messages(
+        context=None,  # type: ignore[arg-type]
+        tool_call=_AttrDict(call_id="call-file"),
+        response=FileContent(
+            name="attachment",
+            mime_type="text/x-meshagent-unknown",
+            data=b"\xff\x00",
+        ),
+    )
+
+    assert messages == [
+        {
+            "output": "attachment was not in a supported format",
+            "call_id": "call-file",
             "type": "function_call_output",
         }
     ]
