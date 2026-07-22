@@ -103,6 +103,135 @@ from meshagent.tools import FunctionTool, Toolkit, ToolContext
 from meshagent.tools.storage import StorageToolkit, StorageToolLocalMount
 
 
+DOCUMENTED_OPENAI_FILE_MIME_TYPES = (
+    "application/csv",
+    "application/graphql",
+    "application/javascript",
+    "application/json",
+    "application/json5",
+    "application/msword",
+    "application/pdf",
+    "application/rtf",
+    "application/toml",
+    "application/typescript",
+    "application/vnd.apple.iwork",
+    "application/vnd.apple.keynote",
+    "application/vnd.apple.pages",
+    "application/vnd.google-apps.document",
+    "application/vnd.google-apps.presentation",
+    "application/vnd.google-apps.spreadsheet",
+    "application/vnd.ms-excel",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.oasis.opendocument.text",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/x-awk",
+    "application/x-bash",
+    "application/x-graphql",
+    "application/x-httpd-php",
+    "application/x-httpd-php-source",
+    "application/x-iif",
+    "application/x-json5",
+    "application/x-ndjson",
+    "application/x-patch",
+    "application/x-php",
+    "application/x-powershell",
+    "application/x-protobuf",
+    "application/x-rust",
+    "application/x-scala",
+    "application/x-sql",
+    "application/x-subrip",
+    "application/x-terraform",
+    "application/x-toml",
+    "application/x-yaml",
+    "application/yaml",
+    "message/rfc822",
+    "text/calendar",
+    "text/css",
+    "text/csv",
+    "text/html",
+    "text/javascript",
+    "text/jsx",
+    "text/markdown",
+    "text/plain",
+    "text/rtf",
+    "text/srt",
+    "text/tsx",
+    "text/tsv",
+    "text/vbscript",
+    "text/vtt",
+    "text/x-asm",
+    "text/x-astro",
+    "text/x-awk",
+    "text/x-bash",
+    "text/x-c",
+    "text/x-c++",
+    "text/x-clojure",
+    "text/x-cmake",
+    "text/x-csharp",
+    "text/x-dart",
+    "text/x-diff",
+    "text/x-dockerfile",
+    "text/x-ejs",
+    "text/x-elixir",
+    "text/x-erb",
+    "text/x-erlang",
+    "text/x-go",
+    "text/x-golang",
+    "text/x-gradle",
+    "text/x-graphql",
+    "text/x-groovy",
+    "text/x-handlebars",
+    "text/x-haskell",
+    "text/x-iif",
+    "text/x-ini",
+    "text/x-jade",
+    "text/x-java",
+    "text/x-jinja2",
+    "text/x-julia",
+    "text/x-kotlin",
+    "text/x-less",
+    "text/x-liquid",
+    "text/x-lisp",
+    "text/x-lua",
+    "text/x-makefile",
+    "text/x-mustache",
+    "text/x-objectivec",
+    "text/x-objectivec++",
+    "text/x-patch",
+    "text/x-perl",
+    "text/x-php",
+    "text/x-properties",
+    "text/x-protobuf",
+    "text/x-pug",
+    "text/x-python",
+    "text/x-r",
+    "text/x-rst",
+    "text/x-ruby",
+    "text/x-rust",
+    "text/x-sass",
+    "text/x-scala",
+    "text/x-scss",
+    "text/x-script.python",
+    "text/x-sh",
+    "text/x-shellscript",
+    "text/x-sql",
+    "text/x-subrip",
+    "text/x-swift",
+    "text/x-terraform",
+    "text/x-tex",
+    "text/x-tmpl",
+    "text/x-toml",
+    "text/x-twig",
+    "text/x-typescript",
+    "text/x-vcard",
+    "text/x-yaml",
+    "text/x-zsh",
+    "text/xml",
+)
+
+
 def test_openai_responses_tool_base_methods_are_empty() -> None:
     tool = OpenAIResponsesTool(name="native")
 
@@ -121,8 +250,16 @@ def test_list_models_advertises_attachment_capabilities() -> None:
     model = OpenAIResponsesAdapter(model="gpt-5.2").list_models()[0]
 
     assert model.supports_attachments is True
-    assert "image/*" in model.accepts
-    assert "application/pdf" in model.accepts
+    assert set(model.accepts) == {
+        "image/*",
+        "application/xhtml+xml",
+        *DOCUMENTED_OPENAI_FILE_MIME_TYPES,
+    }
+    assert responses_adapter_module._OPENAI_RESPONSES_INLINE_FILE_MIME_TYPES == {
+        "application/xhtml+xml",
+        *DOCUMENTED_OPENAI_FILE_MIME_TYPES,
+    }
+    assert "text/*" not in model.accepts
 
 
 def test_list_models_empty_allowed_models_falls_back_to_known_without_custom_model() -> (
@@ -263,6 +400,119 @@ def test_restore_context_messages_normalizes_restored_reasoning_for_stateless_re
         },
     ]
     assert context.messages is not messages
+
+
+def test_restore_context_messages_normalizes_restored_failed_statuses_for_input() -> (
+    None
+):
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    context = adapter.create_session()
+
+    adapter.restore_context_messages(
+        context=context,
+        messages=[
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "save_file",
+                "arguments": "{}",
+                "status": "failed",
+            },
+            {
+                "type": "apply_patch_call_output",
+                "call_id": "call_2",
+                "output": "patch failed",
+                "status": "cancelled",
+            },
+            {
+                "type": "mcp_call",
+                "id": "mcp_1",
+                "call_id": "call_3",
+                "name": "search",
+                "server_label": "tools",
+                "arguments": "{}",
+                "status": "queued",
+            },
+        ],
+    )
+
+    assert context.messages == [
+        {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "save_file",
+            "arguments": "{}",
+            "status": "incomplete",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "Tool call output was unavailable in the restored thread.",
+        },
+        {
+            "type": "apply_patch_call_output",
+            "call_id": "call_2",
+            "output": "patch failed",
+            "status": "incomplete",
+        },
+        {
+            "type": "mcp_call",
+            "id": "mcp_1",
+            "call_id": "call_3",
+            "name": "search",
+            "server_label": "tools",
+            "arguments": "{}",
+            "status": "in_progress",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_next_normalizes_in_memory_failed_statuses_before_request() -> None:
+    client = _FakeOpenAIClient(
+        outcomes=[
+            _FakeResponse(
+                response_id="resp_status",
+                output=[_make_output_message(message_id="msg_status", text="Done.")],
+            )
+        ]
+    )
+    adapter = OpenAIResponsesAdapter(client=client, mode="request")
+    context = adapter.create_session()
+    context.messages.extend(
+        [
+            {"role": "user", "content": "continue"},
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "save_file",
+                "arguments": "{}",
+                "status": "failed",
+            },
+        ]
+    )
+
+    await adapter.create_response(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        toolkits=[],
+    )
+
+    assert client.responses.create_kwargs[0]["input"] == [
+        {"role": "user", "content": "continue"},
+        {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "save_file",
+            "arguments": "{}",
+            "status": "incomplete",
+        },
+    ]
+    assert context.messages[1]["status"] == "failed"
 
 
 def test_restore_context_messages_normalizes_legacy_shell_output_string() -> None:
@@ -624,6 +874,147 @@ def test_make_agent_event_reader_converts_cross_provider_function_calls() -> Non
             ],
         },
         {"role": "user", "content": "tool result"},
+    ]
+
+
+def test_make_agent_event_reader_pairs_incomplete_function_call_with_cancelled_output() -> (
+    None
+):
+    adapter = OpenAIResponsesAdapter(
+        model="gpt-5-mini",
+        client=object(),
+        provider="openai",
+    )
+    restored_messages: list[dict[str, object]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+
+    reader.consume(
+        AgentToolCallStarted(
+            type=AGENT_EVENT_TOOL_CALL_STARTED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="tool-1",
+            namespace="meshagent",
+            call_id="call-1",
+            toolkit="test",
+            tool="blocking_tool",
+            arguments={"marker": "cancel-me"},
+            provider="openai",
+            model="gpt-5-mini",
+        )
+    )
+    reader.finalize()
+
+    assert restored_messages == [
+        {
+            "type": "function_call",
+            "id": "tool-1",
+            "call_id": "call-1",
+            "name": "test_blocking_tool",
+            "arguments": '{"marker":"cancel-me"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": (
+                '{"error":{"message":"tool call was cancelled before completion",'
+                '"code":"cancelled"}}'
+            ),
+        },
+    ]
+
+
+def test_make_agent_event_reader_pairs_completed_function_call_without_result() -> None:
+    adapter = OpenAIResponsesAdapter(
+        model="gpt-5-mini",
+        client=object(),
+        provider="openai",
+    )
+    restored_messages: list[dict[str, object]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+
+    reader.consume(
+        AgentToolCallStarted(
+            type=AGENT_EVENT_TOOL_CALL_STARTED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="tool-1",
+            namespace="meshagent",
+            call_id="call-1",
+            toolkit="storage",
+            tool="read_file",
+            arguments={"path": "/data/empty.txt", "offset": None},
+            provider="openai",
+            model="gpt-5-mini",
+        )
+    )
+    reader.consume(
+        AgentToolCallEnded(
+            type=AGENT_EVENT_TOOL_CALL_ENDED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="tool-1",
+            namespace="meshagent",
+            call_id="call-1",
+            toolkit="storage",
+            tool="read_file",
+            result=None,
+            error=None,
+            provider="openai",
+            model="gpt-5-mini",
+        )
+    )
+
+    assert restored_messages == [
+        {
+            "type": "function_call",
+            "id": "tool-1",
+            "call_id": "call-1",
+            "name": "storage_read_file",
+            "arguments": '{"path":"/data/empty.txt","offset":null}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "ok",
+        },
+    ]
+
+
+def test_restore_context_messages_repairs_unpaired_function_call() -> None:
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    context = adapter.create_session()
+
+    adapter.restore_context_messages(
+        context=context,
+        messages=[
+            {"role": "user", "content": "read the file"},
+            {
+                "type": "function_call",
+                "id": "tool-1",
+                "call_id": "call-1",
+                "name": "storage_read_file",
+                "arguments": "{}",
+            },
+            {"role": "user", "content": "continue"},
+        ],
+    )
+
+    assert context.messages == [
+        {"role": "user", "content": "read the file"},
+        {
+            "type": "function_call",
+            "id": "tool-1",
+            "call_id": "call-1",
+            "name": "storage_read_file",
+            "arguments": "{}",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "Tool call output was unavailable in the restored thread.",
+        },
+        {"role": "user", "content": "continue"},
     ]
 
 
@@ -2023,6 +2414,63 @@ async def test_openai_responses_tool_response_adapter_content_branches() -> None
         {
             "output": "archive.zip was not in a supported format",
             "call_id": "call-unsupported",
+            "type": "function_call_output",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mime_type", DOCUMENTED_OPENAI_FILE_MIME_TYPES)
+async def test_openai_responses_tool_response_adapter_handles_every_documented_file_type(
+    mime_type: str,
+) -> None:
+    adapter = OpenAIResponsesToolResponseAdapter()
+
+    messages = await adapter.create_messages(
+        context=None,  # type: ignore[arg-type]
+        tool_call=_AttrDict(call_id="call-file"),
+        response=FileContent(
+            name="attachment",
+            mime_type=mime_type,
+            data=b"\xff\x00",
+        ),
+    )
+
+    assert messages == [
+        {
+            "output": [
+                {
+                    "type": "input_file",
+                    "filename": "attachment",
+                    "file_data": f"data:{mime_type};base64,/wA=",
+                }
+            ],
+            "call_id": "call-file",
+            "type": "function_call_output",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_tool_response_adapter_does_not_assume_unknown_text_mime_is_supported() -> (
+    None
+):
+    adapter = OpenAIResponsesToolResponseAdapter()
+
+    messages = await adapter.create_messages(
+        context=None,  # type: ignore[arg-type]
+        tool_call=_AttrDict(call_id="call-file"),
+        response=FileContent(
+            name="attachment",
+            mime_type="text/x-meshagent-unknown",
+            data=b"\xff\x00",
+        ),
+    )
+
+    assert messages == [
+        {
+            "output": "attachment was not in a supported format",
+            "call_id": "call-file",
             "type": "function_call_output",
         }
     ]
@@ -7688,6 +8136,46 @@ def test_make_agent_event_publisher_updates_function_tool_failure_from_handler_d
     assert isinstance(ended, AgentToolCallEnded)
     assert ended.error is not None
     assert ended.error.message == "'text' is a required property"
+
+
+def test_make_agent_event_publisher_preserves_empty_successful_tool_results() -> None:
+    adapter = OpenAIResponsesAdapter(
+        client=_FakeOpenAIClient(outcomes=[]),
+        mode="request",
+    )
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    for item_id, result in (("call-empty-text", ""), ("call-empty", None)):
+        publisher(
+            {
+                "type": "meshagent.handler.added",
+                "item": {
+                    "type": "function_call",
+                    "id": item_id,
+                    "call_id": item_id,
+                    "name": "read_file",
+                    "arguments": "{}",
+                },
+            }
+        )
+        publisher(
+            {
+                "type": "meshagent.handler.done",
+                "item_id": item_id,
+                "result": result,
+            }
+        )
+
+    ended = [event for event in published if isinstance(event, AgentToolCallEnded)]
+    assert len(ended) == 2
+    assert isinstance(ended[0].result, TextContent)
+    assert ended[0].result.text == ""
+    assert isinstance(ended[1].result, EmptyContent)
 
 
 def test_make_agent_event_publisher_emits_web_search_tool_events() -> None:

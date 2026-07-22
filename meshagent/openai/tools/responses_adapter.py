@@ -119,13 +119,7 @@ _OPENAI_OUT_OF_CREDITS_MESSAGE = (
 )
 _OPENAI_RESPONSES_MAX_INLINE_IMAGE_BYTES = 20 * 1024 * 1024
 _OPENAI_RESPONSES_MAX_INLINE_FILE_BYTES = 32 * 1024 * 1024
-_OPENAI_RESPONSES_ACCEPTED_ATTACHMENT_TYPES = (
-    "image/*",
-    "text/*",
-    "application/json",
-    "application/pdf",
-    "application/xhtml+xml",
-)
+_OPENAI_RESPONSES_ACCEPTED_ATTACHMENT_TYPES: tuple[str, ...]
 _OPENAI_RESPONSES_IMAGE_GENERATION_CALL_INPUT_FIELDS = frozenset(
     {
         "background",
@@ -139,6 +133,7 @@ _OPENAI_RESPONSES_IMAGE_GENERATION_CALL_INPUT_FIELDS = frozenset(
         "size",
     }
 )
+_OPENAI_RESPONSES_INPUT_STATUSES = {"in_progress", "completed", "incomplete"}
 OpenAIResponsesToolSearchMode = Literal["server", "client"]
 OpenAIResponsesToolSearchConfig = OpenAIResponsesToolSearchMode | bool | None
 
@@ -203,18 +198,156 @@ def _decode_data_url_attachment(url: str) -> _DataUrlAttachment | None:
 
 
 def _encoded_data_url(*, mime_type: str, data: bytes) -> str:
-    normalized_mime_type = (mime_type or "application/octet-stream").lower()
+    normalized_mime_type = (
+        (mime_type or "application/octet-stream").partition(";")[0].strip().lower()
+    )
     return f"data:{normalized_mime_type};base64,{base64.b64encode(data).decode()}"
 
 
+_OPENAI_RESPONSES_INLINE_FILE_MIME_TYPES = frozenset(
+    {
+        "application/csv",
+        "application/graphql",
+        "application/javascript",
+        "application/json",
+        "application/json5",
+        "application/msword",
+        "application/pdf",
+        "application/rtf",
+        "application/toml",
+        "application/typescript",
+        "application/vnd.apple.iwork",
+        "application/vnd.apple.keynote",
+        "application/vnd.apple.pages",
+        "application/vnd.google-apps.document",
+        "application/vnd.google-apps.presentation",
+        "application/vnd.google-apps.spreadsheet",
+        "application/vnd.ms-excel",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.oasis.opendocument.text",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/x-awk",
+        "application/x-bash",
+        "application/x-graphql",
+        "application/x-httpd-php",
+        "application/x-httpd-php-source",
+        "application/x-iif",
+        "application/x-json5",
+        "application/x-ndjson",
+        "application/x-patch",
+        "application/x-php",
+        "application/x-powershell",
+        "application/x-protobuf",
+        "application/x-rust",
+        "application/x-scala",
+        "application/x-sql",
+        "application/x-subrip",
+        "application/x-terraform",
+        "application/x-toml",
+        "application/x-yaml",
+        # Preserve the adapter's existing XHTML support in addition to the
+        # current documented OpenAI file-input list.
+        "application/xhtml+xml",
+        "application/yaml",
+        "message/rfc822",
+        "text/calendar",
+        "text/css",
+        "text/csv",
+        "text/html",
+        "text/javascript",
+        "text/jsx",
+        "text/markdown",
+        "text/plain",
+        "text/rtf",
+        "text/srt",
+        "text/tsx",
+        "text/tsv",
+        "text/vbscript",
+        "text/vtt",
+        "text/x-asm",
+        "text/x-astro",
+        "text/x-awk",
+        "text/x-bash",
+        "text/x-c",
+        "text/x-c++",
+        "text/x-clojure",
+        "text/x-cmake",
+        "text/x-csharp",
+        "text/x-dart",
+        "text/x-diff",
+        "text/x-dockerfile",
+        "text/x-ejs",
+        "text/x-elixir",
+        "text/x-erb",
+        "text/x-erlang",
+        "text/x-go",
+        "text/x-golang",
+        "text/x-gradle",
+        "text/x-graphql",
+        "text/x-groovy",
+        "text/x-handlebars",
+        "text/x-haskell",
+        "text/x-iif",
+        "text/x-ini",
+        "text/x-jade",
+        "text/x-java",
+        "text/x-jinja2",
+        "text/x-julia",
+        "text/x-kotlin",
+        "text/x-less",
+        "text/x-liquid",
+        "text/x-lisp",
+        "text/x-lua",
+        "text/x-makefile",
+        "text/x-mustache",
+        "text/x-objectivec",
+        "text/x-objectivec++",
+        "text/x-patch",
+        "text/x-perl",
+        "text/x-php",
+        "text/x-properties",
+        "text/x-protobuf",
+        "text/x-pug",
+        "text/x-python",
+        "text/x-r",
+        "text/x-rst",
+        "text/x-ruby",
+        "text/x-rust",
+        "text/x-sass",
+        "text/x-scala",
+        "text/x-scss",
+        "text/x-script.python",
+        "text/x-sh",
+        "text/x-shellscript",
+        "text/x-sql",
+        "text/x-subrip",
+        "text/x-swift",
+        "text/x-terraform",
+        "text/x-tex",
+        "text/x-tmpl",
+        "text/x-toml",
+        "text/x-twig",
+        "text/x-typescript",
+        "text/x-vcard",
+        "text/x-yaml",
+        "text/x-zsh",
+        "text/xml",
+    }
+)
+_OPENAI_RESPONSES_ACCEPTED_ATTACHMENT_TYPES = (
+    "image/*",
+    *sorted(_OPENAI_RESPONSES_INLINE_FILE_MIME_TYPES),
+)
+
+
+def _normalize_mime_type(mime_type: str | None) -> str:
+    return (mime_type or "application/octet-stream").partition(";")[0].strip().lower()
+
+
 def _is_openai_responses_inline_file_mime_type(mime_type: str) -> bool:
-    normalized_mime_type = (mime_type or "application/octet-stream").lower()
-    return (
-        normalized_mime_type.startswith("text/")
-        or normalized_mime_type == "application/json"
-        or normalized_mime_type == "application/pdf"
-        or normalized_mime_type == "application/xhtml+xml"
-    )
+    return _normalize_mime_type(mime_type) in _OPENAI_RESPONSES_INLINE_FILE_MIME_TYPES
 
 
 def _is_openai_out_of_credits_message(message: str) -> bool:
@@ -584,7 +717,7 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
         return True
 
     def append_image_message(self, *, mime_type: str, data: bytes) -> dict:
-        normalized_mime_type = (mime_type or "application/octet-stream").lower()
+        normalized_mime_type = _normalize_mime_type(mime_type)
         if not normalized_mime_type.startswith("image/"):
             return self._append_attachment_note(
                 f"the user attached an unsupported image with mime type {normalized_mime_type}"
@@ -630,7 +763,7 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
     def append_file_message(
         self, *, filename: str, mime_type: str, data: bytes
     ) -> dict:
-        normalized_mime_type = (mime_type or "application/octet-stream").lower()
+        normalized_mime_type = _normalize_mime_type(mime_type)
         if normalized_mime_type.startswith("image/"):
             return self.append_image_message(mime_type=normalized_mime_type, data=data)
         if not _is_openai_responses_inline_file_mime_type(normalized_mime_type):
@@ -824,18 +957,20 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
                     "arguments": tool_call.arguments_json(),
                 }
             )
-            if result is not None or error is not None or tool_call.logs:
-                self._emit_context_message(
-                    {
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": self._result_text(
-                            result=result,
-                            error=error,
-                            logs=tool_call.logs,
-                        ),
-                    }
-                )
+            output = self._result_text(
+                result=result,
+                error=error,
+                logs=tool_call.logs,
+            )
+            if result is None and error is None and not tool_call.logs:
+                output = "ok"
+            self._emit_context_message(
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output,
+                }
+            )
             return
 
         item = self._builtin_call_item(
@@ -1519,13 +1654,19 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
                             "output", f"file: {response.name}, {response.mime_type}"
                         )
 
-                        if response.mime_type == "application/pdf":
+                        normalized_mime_type = _normalize_mime_type(response.mime_type)
+                        if _is_openai_responses_inline_file_mime_type(
+                            normalized_mime_type
+                        ):
                             message = {
                                 "output": [
                                     {
                                         "type": "input_file",
                                         "filename": response.name,
-                                        "file_data": f"data:{response.mime_type or 'text/plain'};base64,{base64.b64encode(response.data).decode()}",
+                                        "file_data": _encoded_data_url(
+                                            mime_type=normalized_mime_type,
+                                            data=response.data,
+                                        ),
                                     }
                                 ],
                                 "call_id": tool_call.call_id,
@@ -1902,12 +2043,101 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         if isinstance(context, OpenAIResponsesSessionContext):
             context.clear_websocket_incremental_state()
         context.messages.clear()
+        normalized_messages = [
+            self._normalize_restored_context_message(message=message)
+            for message in messages
+        ]
         context.messages.extend(
-            [
-                self._normalize_restored_context_message(message=message)
-                for message in messages
-            ]
+            self._repair_restored_function_call_outputs(
+                messages=normalized_messages,
+            )
         )
+
+    @staticmethod
+    def _repair_restored_function_call_outputs(
+        *,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        output_call_ids = {
+            call_id
+            for message in messages
+            if message.get("type") == "function_call_output"
+            and isinstance((call_id := message.get("call_id")), str)
+            and call_id != ""
+        }
+        repaired: list[dict[str, Any]] = []
+        for message in messages:
+            repaired.append(message)
+            if message.get("type") != "function_call":
+                continue
+            call_id = message.get("call_id")
+            if not isinstance(call_id, str) or call_id == "":
+                continue
+            if call_id in output_call_ids:
+                continue
+            logger.warning(
+                "restored OpenAI function call %s without an output; "
+                "inserting a placeholder output",
+                call_id,
+            )
+            repaired.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": "Tool call output was unavailable in the restored thread.",
+                }
+            )
+            output_call_ids.add(call_id)
+        return repaired
+
+    @staticmethod
+    def _normalize_restored_input_status(*, message: dict[str, Any]) -> None:
+        status = message.get("status")
+        if not isinstance(status, str):
+            return
+
+        normalized = status.strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized == "":
+            message.pop("status", None)
+            return
+        if normalized == "inprogress":
+            normalized = "in_progress"
+
+        if normalized in _OPENAI_RESPONSES_INPUT_STATUSES:
+            message["status"] = normalized
+            return
+        if normalized in {
+            "completed",
+            "complete",
+            "done",
+            "succeeded",
+            "success",
+            "finished",
+        }:
+            message["status"] = "completed"
+            return
+        if normalized in {
+            "queued",
+            "pending",
+            "waiting",
+            "running",
+            "started",
+            "starting",
+        }:
+            message["status"] = "in_progress"
+            return
+
+        message["status"] = "incomplete"
+
+    @staticmethod
+    def _normalize_responses_input_messages(*, messages: Any) -> Any:
+        if not isinstance(messages, list):
+            return messages
+        normalized = copy.deepcopy(messages)
+        for message in normalized:
+            if isinstance(message, dict):
+                OpenAIResponsesAdapter._normalize_restored_input_status(message=message)
+        return normalized
 
     @staticmethod
     def _normalize_stateless_context_message(
@@ -1915,6 +2145,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         message: dict[str, Any],
     ) -> dict[str, Any]:
         restored = copy.deepcopy(message)
+        OpenAIResponsesAdapter._normalize_restored_input_status(message=restored)
         message_type = restored.get("type")
         if message_type in {"shell_call_output", "local_shell_call_output"}:
             OpenAIResponsesAdapter._normalize_restored_shell_call_output(
@@ -3390,10 +3621,12 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                 "extra_headers": extra_headers,
                                 "stream": stream,
                                 "model": model,
-                                "input": (
-                                    incremental_input
-                                    if incremental_input is not None
-                                    else context.messages
+                                "input": self._normalize_responses_input_messages(
+                                    messages=(
+                                        incremental_input
+                                        if incremental_input is not None
+                                        else context.messages
+                                    )
                                 ),
                                 "tools": open_ai_tools,
                                 "tool_choice": self._resolve_tool_choice(
@@ -3603,6 +3836,22 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                         ):
                                                             handler_result = (
                                                                 tool_response.text
+                                                            )
+                                                        elif isinstance(
+                                                            tool_response, ErrorContent
+                                                        ):
+                                                            event_handler(
+                                                                {
+                                                                    "type": "meshagent.handler.done",
+                                                                    "item_id": tool_call.id,
+                                                                    "error": tool_response.text,
+                                                                    "error_code": tool_response.code,
+                                                                }
+                                                            )
+                                                            return await tool_adapter.create_messages(
+                                                                context=context,
+                                                                tool_call=tool_call,
+                                                                response=tool_response,
                                                             )
                                                         elif isinstance(
                                                             tool_response,
@@ -4267,6 +4516,11 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                                     iteration_committed = True
                                                     return ""
                                         if restart_after_tool_boundary:
+                                            create_kwargs["input"] = (
+                                                self._normalize_responses_input_messages(
+                                                    messages=context.messages
+                                                )
+                                            )
                                             response = None
                                             continue
                                         break
