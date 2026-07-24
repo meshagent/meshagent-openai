@@ -19,6 +19,7 @@ dependencies = [
   "meshagent-agents==0.47.0",
   "meshagent-tools==0.47.0",
   "html-to-markdown~=2.24.3",
+  "pillow~=11.3.0",
 ]
 
 [project.urls]
