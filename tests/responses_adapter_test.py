@@ -1351,6 +1351,81 @@ def test_make_agent_event_reader_filters_invalid_image_generation_arguments() ->
     assert context.messages[0]["result"] == "aW1hZ2U="
 
 
+def test_restore_context_messages_deduplicates_dataset_image_generation_rows() -> None:
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    context = adapter.create_session()
+    restored_messages: list[dict[str, object]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+
+    for message_id, created_by in (
+        ("image-completed", "assistant"),
+        ("image-stale-generating", None),
+    ):
+        reader.consume(
+            AgentImageGenerationCompleted(
+                type=AGENT_EVENT_IMAGE_GENERATION_COMPLETED,
+                thread_id="thread-1",
+                turn_id="turn-1",
+                item_id="image-1",
+                message_id=message_id,
+                toolkit="openai",
+                tool="image_generation",
+                arguments={
+                    "action": "generate",
+                    "background": "opaque",
+                    "revised_prompt": "a shark",
+                    "size": "1536x1024",
+                },
+                images=[
+                    AgentGeneratedImage(
+                        uri="data:image/png;base64,aW1hZ2U=",
+                        mime_type="image/png",
+                        created_by=created_by,
+                        width=1536,
+                        height=1024,
+                        status="completed" if created_by is not None else "generating",
+                    )
+                ],
+            )
+        )
+    reader.finalize()
+    adapter.restore_context_messages(context=context, messages=restored_messages)
+
+    assert context.messages == [
+        {
+            "type": "image_generation_call",
+            "id": "image-1",
+            "status": "completed",
+            "result": "aW1hZ2U=",
+        }
+    ]
+
+
+def test_normalize_responses_input_filters_restored_image_generation_action() -> None:
+    normalized = OpenAIResponsesAdapter._normalize_responses_input_messages(
+        messages=[
+            {
+                "type": "image_generation_call",
+                "id": "image-1",
+                "status": "completed",
+                "result": "aW1hZ2U=",
+                "action": "generate",
+                "images": [{"status": "generating"}],
+                "revised_prompt": "a shark",
+            }
+        ]
+    )
+
+    assert normalized == [
+        {
+            "type": "image_generation_call",
+            "id": "image-1",
+            "status": "completed",
+            "result": "aW1hZ2U=",
+        }
+    ]
+
+
 def test_make_agent_event_reader_drops_unhydrated_completed_image_generation() -> None:
     adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
     context = adapter.create_session()
@@ -1564,6 +1639,8 @@ def test_make_agent_event_reader_restores_tool_lifecycle_as_responses_items(
         "apply_patch_call",
     }:
         assert messages[1]["type"] == f"{expected_type}_output"
+    elif expected_type == "image_generation_call":
+        assert "output" not in restored_call
     else:
         assert restored_call["output"] == {"type": "text", "text": "tool result"}
 
