@@ -124,6 +124,62 @@ def _encoded_data_url(*, mime_type: str, data: bytes) -> str:
     return f"data:{normalized_mime_type};base64,{base64.b64encode(data).decode()}"
 
 
+def _openai_completions_attachment_part(
+    *,
+    filename: str,
+    mime_type: str | None,
+    data: bytes,
+) -> dict[str, Any]:
+    normalized_mime_type = (mime_type or "application/octet-stream").lower()
+    if normalized_mime_type.startswith("image/"):
+        if len(data) > _OPENAI_COMPLETIONS_MAX_INLINE_IMAGE_BYTES:
+            return {
+                "type": "text",
+                "text": (
+                    f"the user attached an image ({normalized_mime_type}) "
+                    "that was too large to include"
+                ),
+            }
+        return {
+            "type": "image_url",
+            "image_url": {
+                "url": _encoded_data_url(
+                    mime_type=normalized_mime_type,
+                    data=data,
+                )
+            },
+        }
+    if (
+        normalized_mime_type.startswith("text/")
+        or normalized_mime_type == "application/json"
+        or normalized_mime_type == "application/xhtml+xml"
+    ):
+        if len(data) > _OPENAI_COMPLETIONS_MAX_INLINE_TEXT_BYTES:
+            return {
+                "type": "text",
+                "text": (
+                    f"the user attached {filename} ({normalized_mime_type}) "
+                    "but it was too large to include"
+                ),
+            }
+        text = (
+            convert(_decode_text(data))
+            if _is_html_mime_type(normalized_mime_type)
+            else _decode_text(data)
+        )
+        return {
+            "type": "text",
+            "text": f"attached file {filename} ({normalized_mime_type}):\n{text}",
+        }
+    return {
+        "type": "text",
+        "text": (
+            f"the user attached {filename} with unsupported mime type "
+            f"{normalized_mime_type}"
+        ),
+    }
+
+
 def _replace_non_matching(text: str, allowed_chars: str, replacement: str) -> str:
     """
     Replaces every character in `text` that does not match the given
@@ -155,6 +211,7 @@ class OpenAICompletionsAgentEventReader(AccumulatingAgentEventReader):
 
     def _append_user_content(self, content: list[dict[str, Any]]) -> None:
         parts: list[dict[str, Any]] = []
+        unresolved_files: list[tuple[int, str, str]] = []
         for item in content:
             item_type = item.get("type")
             if item_type == "text":
@@ -174,34 +231,54 @@ class OpenAICompletionsAgentEventReader(AccumulatingAgentEventReader):
                     data_url = _decode_data_url_attachment(url)
                     if data_url is not None and data_url.mime_type.startswith("image/"):
                         parts.append(
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": _encoded_data_url(
-                                        mime_type=data_url.mime_type,
-                                        data=data_url.data,
-                                    )
-                                },
-                            }
+                            _openai_completions_attachment_part(
+                                filename=filename,
+                                mime_type=data_url.mime_type,
+                                data=data_url.data,
+                            )
                         )
                     elif data_url is not None:
                         parts.append(
-                            {
-                                "type": "text",
-                                "text": (
-                                    "the user attached "
-                                    f"{filename} with mime type "
-                                    f"{data_url.mime_type}"
-                                ),
-                            }
+                            _openai_completions_attachment_part(
+                                filename=filename,
+                                mime_type=data_url.mime_type,
+                                data=data_url.data,
+                            )
                         )
                     else:
+                        unresolved_files.append((len(parts), url, filename))
                         parts.append(
                             {"type": "text", "text": f"the user attached a file: {url}"}
                         )
         if not parts:
             parts.append({"type": "text", "text": json.dumps(content)})
-        self._emit_context_message({"role": "user", "content": parts})
+        emitted_message = self._emit_context_message({"role": "user", "content": parts})
+        emitted_parts = emitted_message["content"]
+        for index, url, filename in unresolved_files:
+            part = emitted_parts[index]
+
+            def resolve_file(
+                file_content: FileContent,
+                *,
+                part: dict[str, Any] = part,
+                filename: str = filename,
+            ) -> None:
+                resolved_filename = filename
+                if (
+                    resolved_filename == "attachment"
+                    and file_content.name.strip() != ""
+                ):
+                    resolved_filename = file_content.name
+                part.clear()
+                part.update(
+                    _openai_completions_attachment_part(
+                        filename=resolved_filename,
+                        mime_type=file_content.mime_type,
+                        data=file_content.data,
+                    )
+                )
+
+            self._defer_file_resolution(url=url, resolve=resolve_file)
 
     def _append_assistant_text(self, *, text: str, phase: str | None) -> None:
         del phase
@@ -400,31 +477,16 @@ class OpenAICompletionsSessionContext(AgentSessionContext):
     def append_file_message(
         self, *, filename: str, mime_type: str, data: bytes
     ) -> dict:
-        normalized_mime_type = (mime_type or "application/octet-stream").lower()
-        if normalized_mime_type.startswith("image/"):
-            return self.append_image_message(mime_type=normalized_mime_type, data=data)
-
-        if (
-            normalized_mime_type.startswith("text/")
-            or normalized_mime_type == "application/json"
-            or normalized_mime_type == "application/xhtml+xml"
-        ):
-            if len(data) > _OPENAI_COMPLETIONS_MAX_INLINE_TEXT_BYTES:
-                return self._append_attachment_note(
-                    f"the user attached {filename} ({normalized_mime_type}) but it was too large to include"
-                )
-            text = (
-                convert(_decode_text(data))
-                if _is_html_mime_type(normalized_mime_type)
-                else _decode_text(data)
-            )
-            return self._append_attachment_note(
-                f"attached file {filename} ({normalized_mime_type}):\n{text}"
-            )
-
-        return self._append_attachment_note(
-            f"the user attached {filename} with unsupported mime type {normalized_mime_type}"
+        part = _openai_completions_attachment_part(
+            filename=filename,
+            mime_type=mime_type,
+            data=data,
         )
+        if part["type"] == "image_url":
+            message = {"role": "user", "content": [part]}
+            self.messages.append(message)
+            return message
+        return self._append_attachment_note(part["text"])
 
     def append_file_url(self, *, url: str, filename: str | None = None) -> dict:
         data_url = _decode_data_url_attachment(url)

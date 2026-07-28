@@ -360,6 +360,55 @@ def _is_openai_responses_inline_file_mime_type(mime_type: str) -> bool:
     return _normalize_mime_type(mime_type) in _OPENAI_RESPONSES_INLINE_FILE_MIME_TYPES
 
 
+def _openai_responses_attachment_part(
+    *,
+    filename: str,
+    mime_type: str | None,
+    data: bytes,
+) -> dict[str, Any]:
+    normalized_mime_type = _normalize_mime_type(mime_type)
+    if normalized_mime_type.startswith("image/"):
+        if len(data) > _OPENAI_RESPONSES_MAX_INLINE_IMAGE_BYTES:
+            return {
+                "type": "input_text",
+                "text": (
+                    f"the user attached an image ({normalized_mime_type}) "
+                    "that was too large to include"
+                ),
+            }
+        return {
+            "type": "input_image",
+            "image_url": _encoded_data_url(
+                mime_type=normalized_mime_type,
+                data=data,
+            ),
+        }
+    if not _is_openai_responses_inline_file_mime_type(normalized_mime_type):
+        return {
+            "type": "input_text",
+            "text": (
+                f"the user attached {filename} with unsupported mime type "
+                f"{normalized_mime_type}"
+            ),
+        }
+    if len(data) > _OPENAI_RESPONSES_MAX_INLINE_FILE_BYTES:
+        return {
+            "type": "input_text",
+            "text": (
+                f"the user attached {filename} ({normalized_mime_type}) "
+                "but it was too large to include"
+            ),
+        }
+    return {
+        "type": "input_file",
+        "filename": filename,
+        "file_data": _encoded_data_url(
+            mime_type=normalized_mime_type,
+            data=data,
+        ),
+    }
+
+
 def _is_openai_out_of_credits_message(message: str) -> bool:
     return "out of credits" in message.lower()
 
@@ -773,28 +822,14 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
     def append_file_message(
         self, *, filename: str, mime_type: str, data: bytes
     ) -> dict:
-        normalized_mime_type = _normalize_mime_type(mime_type)
-        if normalized_mime_type.startswith("image/"):
-            return self.append_image_message(mime_type=normalized_mime_type, data=data)
-        if not _is_openai_responses_inline_file_mime_type(normalized_mime_type):
-            return self._append_attachment_note(
-                f"the user attached {filename} with unsupported mime type {normalized_mime_type}"
-            )
-        if len(data) > _OPENAI_RESPONSES_MAX_INLINE_FILE_BYTES:
-            return self._append_attachment_note(
-                f"the user attached {filename} ({normalized_mime_type}) but it was too large to include"
-            )
         message = {
             "role": "user",
             "content": [
-                {
-                    "type": "input_file",
-                    "filename": filename,
-                    "file_data": _encoded_data_url(
-                        mime_type=normalized_mime_type,
-                        data=data,
-                    ),
-                }
+                _openai_responses_attachment_part(
+                    filename=filename,
+                    mime_type=mime_type,
+                    data=data,
+                )
             ],
         }
         self.messages.append(message)
@@ -851,6 +886,7 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
 
     def _append_user_content(self, content: list[dict[str, Any]]) -> None:
         parts: list[dict[str, Any]] = []
+        unresolved_files: list[tuple[int, str, str]] = []
         for item in content:
             item_type = item.get("type")
             if item_type == "text":
@@ -869,42 +905,45 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
                     )
                     data_url = _decode_data_url_attachment(url)
                     if data_url is None:
+                        unresolved_files.append((len(parts), url, filename))
                         parts.append({"type": "input_file", "file_url": url})
-                    elif data_url.mime_type.startswith("image/"):
-                        parts.append(
-                            {
-                                "type": "input_image",
-                                "image_url": _encoded_data_url(
-                                    mime_type=data_url.mime_type,
-                                    data=data_url.data,
-                                ),
-                            }
-                        )
-                    elif _is_openai_responses_inline_file_mime_type(data_url.mime_type):
-                        parts.append(
-                            {
-                                "type": "input_file",
-                                "filename": filename,
-                                "file_data": _encoded_data_url(
-                                    mime_type=data_url.mime_type,
-                                    data=data_url.data,
-                                ),
-                            }
-                        )
                     else:
                         parts.append(
-                            {
-                                "type": "input_text",
-                                "text": (
-                                    "the user attached "
-                                    f"{filename} with unsupported mime type "
-                                    f"{data_url.mime_type}"
-                                ),
-                            }
+                            _openai_responses_attachment_part(
+                                filename=filename,
+                                mime_type=data_url.mime_type,
+                                data=data_url.data,
+                            )
                         )
         if not parts:
             parts.append({"type": "input_text", "text": json.dumps(content)})
-        self._emit_context_message({"role": "user", "content": parts})
+        emitted_message = self._emit_context_message({"role": "user", "content": parts})
+        emitted_parts = emitted_message["content"]
+        for index, url, filename in unresolved_files:
+            part = emitted_parts[index]
+
+            def resolve_file(
+                file_content: FileContent,
+                *,
+                part: dict[str, Any] = part,
+                filename: str = filename,
+            ) -> None:
+                resolved_filename = filename
+                if (
+                    resolved_filename == "attachment"
+                    and file_content.name.strip() != ""
+                ):
+                    resolved_filename = file_content.name
+                part.clear()
+                part.update(
+                    _openai_responses_attachment_part(
+                        filename=resolved_filename,
+                        mime_type=file_content.mime_type,
+                        data=file_content.data,
+                    )
+                )
+
+            self._defer_file_resolution(url=url, resolve=resolve_file)
 
     def _append_assistant_text(self, *, text: str, phase: str | None) -> None:
         del phase

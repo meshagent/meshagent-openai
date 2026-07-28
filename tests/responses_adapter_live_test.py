@@ -376,7 +376,7 @@ def _restore_agent_messages_with_adapter(
     reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
     for message in messages:
         reader.consume(message)
-    reader.finalize()
+    await reader.finalize()
     adapter.restore_context_messages(context=context, messages=restored_messages)
     return context
 
@@ -746,7 +746,7 @@ async def test_live_openai_dataset_restore_uses_context_since_last_compaction():
         assert compacted_messages[-1].messages is not None
 
         restored_context = adapter.create_session()
-        await storage.restore_session_context_async(
+        await storage.restore_session_context(
             context=restored_context,
             llm_adapter=adapter,
         )
@@ -842,7 +842,7 @@ async def test_live_openai_dataset_websocket_resume_preserves_encrypted_reasonin
     )
     restored_context = second_adapter.create_session()
     try:
-        await storage.restore_session_context_async(
+        await storage.restore_session_context(
             context=restored_context,
             llm_adapter=second_adapter,
         )
@@ -957,7 +957,7 @@ async def test_live_openai_dataset_websocket_tool_turn_restores_encrypted_reason
         )
         restored_context = second_adapter.create_session()
         try:
-            await storage.restore_session_context_async(
+            await storage.restore_session_context(
                 context=restored_context,
                 llm_adapter=second_adapter,
             )

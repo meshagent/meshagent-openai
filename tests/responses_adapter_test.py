@@ -857,7 +857,7 @@ def test_make_agent_event_reader_converts_cross_provider_function_calls() -> Non
             model="claude-sonnet-4-5",
         )
     )
-    reader.finalize()
+    asyncio.run(reader.finalize())
 
     assert restored_messages == [
         {
@@ -903,7 +903,7 @@ def test_make_agent_event_reader_pairs_incomplete_function_call_with_cancelled_o
             model="gpt-5-mini",
         )
     )
-    reader.finalize()
+    asyncio.run(reader.finalize())
 
     assert restored_messages == [
         {
@@ -1055,7 +1055,7 @@ def test_make_agent_event_reader_restores_openai_encrypted_reasoning_metadata() 
             metadata={"openai": {"encrypted_content": "opaque-reasoning"}},
         )
     )
-    reader.finalize()
+    asyncio.run(reader.finalize())
 
     assert restored_messages == [
         {
@@ -1187,7 +1187,7 @@ def test_make_agent_event_reader_restores_pasted_dataset_failure_without_stale_r
 
     for row in dumped_rows:
         reader.consume(parse_agent_message(row))
-    reader.finalize()
+    asyncio.run(reader.finalize())
 
     restored_payload = json.dumps(restored_messages, default=str)
     assert "rs_03b3985e67f5d033016a21b2cdb1ac8195a10803ffecfe14eb" not in (
@@ -1263,7 +1263,7 @@ def test_make_agent_event_reader_ignores_audio_generation_for_restore() -> None:
             item_id="audio-1",
         )
     )
-    reader.finalize()
+    asyncio.run(reader.finalize())
     adapter.restore_context_messages(context=context, messages=restored_messages)
 
     assert context.messages == []
@@ -1296,7 +1296,7 @@ def test_make_agent_event_reader_restores_image_generation_with_turn_id() -> Non
             ],
         )
     )
-    reader.finalize()
+    asyncio.run(reader.finalize())
     adapter.restore_context_messages(context=context, messages=restored_messages)
 
     assert context.messages == [
@@ -1341,7 +1341,7 @@ def test_make_agent_event_reader_filters_invalid_image_generation_arguments() ->
             ],
         )
     )
-    reader.finalize()
+    asyncio.run(reader.finalize())
     adapter.restore_context_messages(context=context, messages=restored_messages)
 
     assert context.messages[0]["type"] == "image_generation_call"
@@ -1388,7 +1388,7 @@ def test_restore_context_messages_deduplicates_dataset_image_generation_rows() -
                 ],
             )
         )
-    reader.finalize()
+    asyncio.run(reader.finalize())
     adapter.restore_context_messages(context=context, messages=restored_messages)
 
     assert context.messages == [
@@ -1453,7 +1453,7 @@ def test_make_agent_event_reader_drops_unhydrated_completed_image_generation() -
             ],
         )
     )
-    reader.finalize()
+    asyncio.run(reader.finalize())
     adapter.restore_context_messages(context=context, messages=restored_messages)
 
     assert context.messages == []
@@ -1523,7 +1523,7 @@ def _restore_tool_lifecycle(
             model="gpt-5-mini",
         )
     )
-    reader.finalize()
+    asyncio.run(reader.finalize())
     adapter.restore_context_messages(context=context, messages=restored_messages)
     return context.messages
 
@@ -5998,6 +5998,73 @@ def test_session_context_replaces_unsupported_data_url_file_with_note() -> None:
         "type": "input_text",
         "text": "the user attached blob.bin with unsupported mime type application/octet-stream",
     }
+
+
+@pytest.mark.asyncio
+async def test_agent_message_projection_resolves_only_surviving_zip_attachments() -> (
+    None
+):
+    adapter = OpenAIResponsesAdapter(model="gpt-4.1-mini")
+    resolved_urls: list[str] = []
+
+    async def read_file(url: str) -> FileContent:
+        resolved_urls.append(url)
+        return FileContent(
+            name="archive.zip",
+            mime_type="application/zip",
+            data=b"zip",
+        )
+
+    old_turn = parse_agent_message(
+        {
+            "type": "meshagent.agent.turn.start",
+            "thread_id": "thread-1",
+            "content": [{"type": "file", "url": "room:///old.zip", "name": "old.zip"}],
+        }
+    )
+    compacted = AgentContextCompacted(
+        type=AGENT_EVENT_CONTEXT_COMPACTED,
+        thread_id="thread-1",
+        checkpoint_id="checkpoint-1",
+        path="dataset://threads/checkpoint",
+        through_sequence=1,
+        messages=[{"role": "assistant", "content": "checkpoint"}],
+    )
+    new_turn = parse_agent_message(
+        {
+            "type": "meshagent.agent.turn.start",
+            "thread_id": "thread-1",
+            "content": [{"type": "file", "url": "room:///new.zip", "name": "new.zip"}],
+        }
+    )
+
+    projected = await adapter.project_agent_messages(
+        messages=[old_turn, compacted, new_turn],
+        file_reader=read_file,
+    )
+
+    assert resolved_urls == ["room:///new.zip"]
+    assert projected == [
+        {"role": "assistant", "content": "checkpoint"},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": (
+                        "the user attached new.zip with unsupported mime type "
+                        "application/zip"
+                    ),
+                }
+            ],
+        },
+    ]
+    assert all(
+        part.get("type") != "input_file"
+        for message in projected
+        for part in message.get("content", [])
+        if isinstance(part, dict)
+    )
 
 
 @pytest.mark.asyncio
