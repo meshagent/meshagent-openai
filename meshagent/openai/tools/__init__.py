@@ -14,6 +14,7 @@ from .completions_adapter import (
     OpenAICompletionsToolResponseAdapter,
 )
 from .stt import OpenAIAudioFileSTT, OpenAISTTToolkit
+from .image_generation import ImageGenerationToolkit
 
 __all__ = [
     "OpenAIResponsesAdapter",
@@ -27,4 +28,5 @@ __all__ = [
     "OpenAICompletionsToolResponseAdapter",
     "OpenAIAudioFileSTT",
     "OpenAISTTToolkit",
+    "ImageGenerationToolkit",
 ]

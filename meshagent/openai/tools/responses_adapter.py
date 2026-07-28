@@ -133,6 +133,16 @@ _OPENAI_RESPONSES_IMAGE_GENERATION_CALL_INPUT_FIELDS = frozenset(
         "size",
     }
 )
+_OPENAI_RESPONSES_IMAGE_GENERATION_CALL_FIELDS = (
+    _OPENAI_RESPONSES_IMAGE_GENERATION_CALL_INPUT_FIELDS
+    | {
+        "call_id",
+        "id",
+        "result",
+        "status",
+        "type",
+    }
+)
 _OPENAI_RESPONSES_INPUT_STATUSES = {"in_progress", "completed", "incomplete"}
 OpenAIResponsesToolSearchMode = Literal["server", "client"]
 OpenAIResponsesToolSearchConfig = OpenAIResponsesToolSearchMode | bool | None
@@ -2047,6 +2057,9 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             self._normalize_restored_context_message(message=message)
             for message in messages
         ]
+        normalized_messages = self._deduplicate_image_generation_calls(
+            messages=normalized_messages,
+        )
         context.messages.extend(
             self._repair_restored_function_call_outputs(
                 messages=normalized_messages,
@@ -2137,7 +2150,61 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         for message in normalized:
             if isinstance(message, dict):
                 OpenAIResponsesAdapter._normalize_restored_input_status(message=message)
-        return normalized
+                OpenAIResponsesAdapter._normalize_image_generation_call(message=message)
+        return OpenAIResponsesAdapter._deduplicate_image_generation_calls(
+            messages=normalized,
+        )
+
+    @staticmethod
+    def _normalize_image_generation_call(*, message: dict[str, Any]) -> None:
+        if message.get("type") != "image_generation_call":
+            return
+        for key in list(message):
+            if key not in _OPENAI_RESPONSES_IMAGE_GENERATION_CALL_FIELDS:
+                message.pop(key, None)
+
+    @staticmethod
+    def _image_generation_call_replay_score(*, message: dict[str, Any]) -> int:
+        result = message.get("result")
+        if isinstance(result, str) and result != "":
+            return 4
+        status = message.get("status")
+        if status == "completed":
+            return 3
+        if status in {"failed", "incomplete"}:
+            return 2
+        if status == "in_progress":
+            return 1
+        return 0
+
+    @staticmethod
+    def _deduplicate_image_generation_calls(
+        *,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        deduplicated: list[dict[str, Any]] = []
+        index_by_item_id: dict[str, int] = {}
+        for message in messages:
+            if message.get("type") != "image_generation_call":
+                deduplicated.append(message)
+                continue
+            item_id = message.get("id")
+            if not isinstance(item_id, str) or item_id == "":
+                deduplicated.append(message)
+                continue
+            previous_index = index_by_item_id.get(item_id)
+            if previous_index is None:
+                index_by_item_id[item_id] = len(deduplicated)
+                deduplicated.append(message)
+                continue
+            previous = deduplicated[previous_index]
+            if OpenAIResponsesAdapter._image_generation_call_replay_score(
+                message=message
+            ) > OpenAIResponsesAdapter._image_generation_call_replay_score(
+                message=previous
+            ):
+                deduplicated[previous_index] = message
+        return deduplicated
 
     @staticmethod
     def _normalize_stateless_context_message(
@@ -2147,6 +2214,9 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         restored = copy.deepcopy(message)
         OpenAIResponsesAdapter._normalize_restored_input_status(message=restored)
         message_type = restored.get("type")
+        if message_type == "image_generation_call":
+            OpenAIResponsesAdapter._normalize_image_generation_call(message=restored)
+            return restored
         if message_type in {"shell_call_output", "local_shell_call_output"}:
             OpenAIResponsesAdapter._normalize_restored_shell_call_output(
                 message=restored
