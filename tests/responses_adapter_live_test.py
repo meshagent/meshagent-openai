@@ -34,6 +34,7 @@ from meshagent.openai.tools.responses_adapter import (
     OpenAIResponsesAdapter,
     OpenAIResponsesToolSearchRequest,
     ShellTool,
+    WebSearchTool,
 )
 from meshagent.tools import FunctionTool, Toolkit
 from meshagent.tools.storage import StorageToolkit, StorageToolLocalMount
@@ -366,7 +367,7 @@ def _has_restored_tool_transcript_fallback(messages: list[dict[str, object]]) ->
     return False
 
 
-def _restore_agent_messages_with_adapter(
+async def _restore_agent_messages_with_adapter(
     *,
     adapter,
     messages: list[AgentMessage],
@@ -1331,6 +1332,77 @@ async def test_live_openai_websocket_restores_legacy_shell_output_context():
 
 
 @pytest.mark.asyncio
+async def test_live_openai_websocket_follows_up_after_enriched_web_search_restore():
+    room = _FakeRoom()
+    adapter = _RecordingOpenAIResponsesAdapter(
+        model=os.getenv("OPENAI_WEB_SEARCH_RESTORE_TEST_MODEL", "gpt-5.5"),
+        mode="websocket",
+        client=AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        reasoning_effort="low",
+        max_output_tokens=256,
+        max_retries=1,
+    )
+    context = adapter.create_session()
+    action = {"type": "open_page", "url": "https://www.starling.build"}
+    adapter.restore_context_messages(
+        context=context,
+        messages=[
+            {
+                "type": "web_search_call",
+                "id": "ws_restore",
+                "status": "in_progress",
+                "action": action,
+            },
+            {
+                "type": "web_search_call",
+                "id": "ws_restore",
+                "status": "completed",
+                "action": action,
+                "output": {"type": "empty"},
+            },
+        ],
+    )
+
+    assert context.messages == [
+        {
+            "type": "web_search_call",
+            "id": "ws_restore",
+            "status": "completed",
+            "action": action,
+        }
+    ]
+    context.append_user_message(
+        "Using the restored web-search transcript, reply with exactly "
+        "RESTORED_WEB_SEARCH_OK and do not call tools."
+    )
+    try:
+        result = await asyncio.wait_for(
+            adapter.create_response(
+                context=context,
+                caller=room.local_participant,
+                toolkits=[Toolkit(name="openai", tools=[WebSearchTool()])],
+            ),
+            timeout=180.0,
+        )
+    finally:
+        await context.close()
+
+    first_input = adapter.recorded_create_kwargs[0]["input"]
+    replayed_calls = [
+        item for item in first_input if item.get("type") == "web_search_call"
+    ]
+    assert replayed_calls == [
+        {
+            "type": "web_search_call",
+            "id": "ws_restore",
+            "status": "completed",
+            "action": action,
+        }
+    ]
+    assert "RESTORED_WEB_SEARCH_OK" in result
+
+
+@pytest.mark.asyncio
 async def test_live_openai_tool_call_restores_into_anthropic():
     anthropic_client = _anthropic_client_if_key_set()
     room = _FakeRoom()
@@ -1375,7 +1447,7 @@ async def test_live_openai_tool_call_restores_into_anthropic():
         max_tokens=512,
         max_retries=2,
     )
-    restored_context = _restore_agent_messages_with_adapter(
+    restored_context = await _restore_agent_messages_with_adapter(
         adapter=anthropic_adapter,
         messages=source_messages,
     )
@@ -1441,7 +1513,7 @@ async def test_live_anthropic_tool_call_restores_into_openai():
         max_output_tokens=512,
         max_retries=2,
     )
-    restored_context = _restore_agent_messages_with_adapter(
+    restored_context = await _restore_agent_messages_with_adapter(
         adapter=openai_adapter,
         messages=source_messages,
     )

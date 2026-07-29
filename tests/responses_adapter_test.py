@@ -460,7 +460,6 @@ def test_restore_context_messages_normalizes_restored_failed_statuses_for_input(
         {
             "type": "mcp_call",
             "id": "mcp_1",
-            "call_id": "call_3",
             "name": "search",
             "server_label": "tools",
             "arguments": "{}",
@@ -1304,7 +1303,6 @@ def test_make_agent_event_reader_restores_image_generation_with_turn_id() -> Non
             "type": "image_generation_call",
             "id": "image-1",
             "status": "completed",
-            "call_id": "call-image",
             "result": "aW1hZ2U=",
         }
     ]
@@ -1543,7 +1541,13 @@ def _restore_tool_lifecycle(
             "openai.responses",
             "openai",
             "local_shell",
-            {"action": {"commands": ["pwd"]}},
+            {
+                "action": {
+                    "type": "exec",
+                    "command": ["pwd"],
+                    "env": {},
+                }
+            },
             "local_shell_call",
         ),
         (
@@ -1557,21 +1561,33 @@ def _restore_tool_lifecycle(
             "openai.responses",
             "openai",
             "computer",
-            {"action": {"type": "screenshot"}},
+            {
+                "action": {"type": "screenshot"},
+                "pending_safety_checks": [],
+            },
             "computer_call",
         ),
         (
             "openai.responses",
             "openai",
             "code_interpreter",
-            {"code": "print(1)"},
+            {
+                "code": "print(1)",
+                "container_id": "container-1",
+                "outputs": [],
+            },
             "code_interpreter_call",
         ),
         (
             "openai.responses",
             "openai",
             "web_search",
-            {"query": "meshagent"},
+            {
+                "action": {
+                    "type": "search",
+                    "query": "meshagent",
+                }
+            },
             "web_search_call",
         ),
         (
@@ -1599,7 +1615,7 @@ def _restore_tool_lifecycle(
             "openai.responses",
             "server",
             "list_tools",
-            {},
+            {"tools": []},
             "mcp_list_tools",
         ),
     ],
@@ -1639,10 +1655,221 @@ def test_make_agent_event_reader_restores_tool_lifecycle_as_responses_items(
         "apply_patch_call",
     }:
         assert messages[1]["type"] == f"{expected_type}_output"
-    elif expected_type == "image_generation_call":
+    elif expected_type in {
+        "code_interpreter_call",
+        "file_search_call",
+        "image_generation_call",
+        "mcp_list_tools",
+        "web_search_call",
+    }:
         assert "output" not in restored_call
+    elif expected_type == "mcp_call":
+        assert restored_call["output"] == "tool result"
     else:
-        assert restored_call["output"] == {"type": "text", "text": "tool result"}
+        raise AssertionError(f"missing assertion for {expected_type}")
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_keys"),
+    [
+        (
+            {
+                "type": "shell_call",
+                "id": "sh-1",
+                "call_id": "call-sh",
+                "status": "completed",
+                "action": {"commands": ["pwd"]},
+            },
+            {"type", "id", "call_id", "status", "action"},
+        ),
+        (
+            {
+                "type": "local_shell_call",
+                "id": "local-1",
+                "call_id": "call-local",
+                "status": "completed",
+                "action": {"type": "exec", "command": ["pwd"], "env": {}},
+            },
+            {"type", "id", "call_id", "status", "action"},
+        ),
+        (
+            {
+                "type": "computer_call",
+                "id": "computer-1",
+                "call_id": "call-computer",
+                "status": "completed",
+                "action": {"type": "screenshot"},
+                "pending_safety_checks": [],
+            },
+            {
+                "type",
+                "id",
+                "call_id",
+                "status",
+                "action",
+                "pending_safety_checks",
+            },
+        ),
+        (
+            {
+                "type": "apply_patch_call",
+                "id": "patch-1",
+                "call_id": "call-patch",
+                "status": "failed",
+                "operation": {
+                    "type": "update_file",
+                    "path": "a.py",
+                    "diff": "@@",
+                },
+            },
+            {"type", "id", "call_id", "status", "operation"},
+        ),
+        (
+            {
+                "type": "code_interpreter_call",
+                "id": "code-1",
+                "status": "completed",
+                "code": "print(1)",
+                "container_id": "container-1",
+                "outputs": [],
+            },
+            {"type", "id", "status", "code", "container_id", "outputs"},
+        ),
+        (
+            {
+                "type": "web_search_call",
+                "id": "web-1",
+                "status": "completed",
+                "action": {"type": "search", "query": "meshagent"},
+            },
+            {"type", "id", "status", "action"},
+        ),
+        (
+            {
+                "type": "file_search_call",
+                "id": "file-1",
+                "status": "completed",
+                "queries": ["meshagent"],
+                "results": [],
+            },
+            {"type", "id", "status", "queries", "results"},
+        ),
+        (
+            {
+                "type": "image_generation_call",
+                "id": "image-1",
+                "call_id": "call-image",
+                "status": "completed",
+                "result": "aW1hZ2U=",
+            },
+            {"type", "id", "status", "result"},
+        ),
+        (
+            {
+                "type": "mcp_call",
+                "id": "mcp-1",
+                "status": "completed",
+                "server_label": "server",
+                "name": "search",
+                "arguments": "{}",
+                "output": "done",
+            },
+            {
+                "type",
+                "id",
+                "status",
+                "server_label",
+                "name",
+                "arguments",
+                "output",
+            },
+        ),
+        (
+            {
+                "type": "mcp_list_tools",
+                "id": "mcp-list-1",
+                "server_label": "server",
+                "tools": [],
+            },
+            {"type", "id", "server_label", "tools"},
+        ),
+        (
+            {
+                "type": "tool_search_call",
+                "id": "tool-search-1",
+                "call_id": "call-tool-search",
+                "status": "completed",
+                "execution": "server",
+                "arguments": {"query": "storage"},
+            },
+            {
+                "type",
+                "id",
+                "call_id",
+                "status",
+                "execution",
+                "arguments",
+            },
+        ),
+        (
+            {
+                "type": "custom_tool_call",
+                "id": "custom-1",
+                "call_id": "call-custom",
+                "name": "grammar",
+                "input": "hello",
+            },
+            {"type", "id", "call_id", "name", "input"},
+        ),
+    ],
+)
+def test_restore_context_messages_filters_every_builtin_call_to_input_schema(
+    message: dict[str, object],
+    expected_keys: set[str],
+) -> None:
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    context = adapter.create_session()
+    enriched = {**message, "unexpected": True}
+    if message["type"] not in {"mcp_call"}:
+        enriched["output"] = {"type": "empty"}
+
+    adapter.restore_context_messages(context=context, messages=[enriched])
+
+    assert set(context.messages[0]) == expected_keys
+
+
+def test_restore_context_messages_coalesces_enriched_web_search_snapshot() -> None:
+    adapter = OpenAIResponsesAdapter(model="gpt-5-mini", client=object())
+    context = adapter.create_session()
+    action = {"type": "open_page", "url": "https://www.starling.build"}
+
+    adapter.restore_context_messages(
+        context=context,
+        messages=[
+            {
+                "type": "web_search_call",
+                "id": "ws-1",
+                "status": "in_progress",
+                "action": action,
+            },
+            {
+                "type": "web_search_call",
+                "id": "ws-1",
+                "status": "completed",
+                "action": action,
+                "output": {"type": "empty"},
+            },
+        ],
+    )
+
+    assert context.messages == [
+        {
+            "type": "web_search_call",
+            "id": "ws-1",
+            "status": "completed",
+            "action": action,
+        }
+    ]
 
 
 class _FakeImagesDataset:
