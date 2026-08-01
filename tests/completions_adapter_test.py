@@ -263,7 +263,7 @@ def test_make_agent_event_reader_restores_tool_lifecycle_as_chat_tool_calls(
             result=TextContent(text="tool result"),
         )
     )
-    reader.finalize()
+    asyncio.run(reader.finalize())
     adapter.restore_context_messages(context=context, messages=restored_messages)
 
     assistant_message = context.messages[0]

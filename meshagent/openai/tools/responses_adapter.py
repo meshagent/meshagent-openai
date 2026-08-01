@@ -133,17 +133,149 @@ _OPENAI_RESPONSES_IMAGE_GENERATION_CALL_INPUT_FIELDS = frozenset(
         "size",
     }
 )
-_OPENAI_RESPONSES_IMAGE_GENERATION_CALL_FIELDS = (
-    _OPENAI_RESPONSES_IMAGE_GENERATION_CALL_INPUT_FIELDS
-    | {
+_OPENAI_RESPONSES_IMAGE_GENERATION_CALL_FIELDS = {
+    "id",
+    "result",
+    "status",
+    "type",
+}
+_OPENAI_RESPONSES_INPUT_STATUSES = {"in_progress", "completed", "incomplete"}
+_OPENAI_RESPONSES_BUILTIN_CALL_FIELDS = {
+    "apply_patch_call": {
         "call_id",
         "id",
-        "result",
+        "operation",
         "status",
         "type",
-    }
-)
-_OPENAI_RESPONSES_INPUT_STATUSES = {"in_progress", "completed", "incomplete"}
+    },
+    "code_interpreter_call": {
+        "code",
+        "container_id",
+        "id",
+        "outputs",
+        "status",
+        "type",
+    },
+    "computer_call": {
+        "action",
+        "actions",
+        "call_id",
+        "id",
+        "pending_safety_checks",
+        "status",
+        "type",
+    },
+    "custom_tool_call": {
+        "call_id",
+        "id",
+        "input",
+        "name",
+        "namespace",
+        "type",
+    },
+    "file_search_call": {
+        "id",
+        "queries",
+        "results",
+        "status",
+        "type",
+    },
+    "local_shell_call": {
+        "action",
+        "call_id",
+        "id",
+        "status",
+        "type",
+    },
+    "mcp_call": {
+        "approval_request_id",
+        "arguments",
+        "error",
+        "id",
+        "name",
+        "output",
+        "server_label",
+        "status",
+        "type",
+    },
+    "mcp_list_tools": {
+        "error",
+        "id",
+        "server_label",
+        "tools",
+        "type",
+    },
+    "shell_call": {
+        "action",
+        "call_id",
+        "environment",
+        "id",
+        "status",
+        "type",
+    },
+    "tool_search_call": {
+        "arguments",
+        "call_id",
+        "execution",
+        "id",
+        "status",
+        "type",
+    },
+    "web_search_call": {
+        "action",
+        "id",
+        "status",
+        "type",
+    },
+}
+_OPENAI_RESPONSES_BUILTIN_CALL_STATUSES = {
+    "apply_patch_call": {
+        "in_progress",
+        "completed",
+    },
+    "code_interpreter_call": {
+        "in_progress",
+        "completed",
+        "incomplete",
+        "interpreting",
+        "failed",
+    },
+    "file_search_call": {
+        "in_progress",
+        "searching",
+        "completed",
+        "incomplete",
+        "failed",
+    },
+    "image_generation_call": {
+        "in_progress",
+        "completed",
+        "generating",
+        "failed",
+    },
+    "mcp_call": {
+        "in_progress",
+        "completed",
+        "incomplete",
+        "calling",
+        "failed",
+    },
+    "web_search_call": {
+        "in_progress",
+        "searching",
+        "completed",
+        "failed",
+    },
+}
+_OPENAI_RESPONSES_SNAPSHOT_CALL_TYPES = {
+    "code_interpreter_call",
+    "file_search_call",
+    "image_generation_call",
+    "mcp_call",
+    "mcp_list_tools",
+    "tool_search_call",
+    "web_search_call",
+}
 OpenAIResponsesToolSearchMode = Literal["server", "client"]
 OpenAIResponsesToolSearchConfig = OpenAIResponsesToolSearchMode | bool | None
 
@@ -358,6 +490,55 @@ def _normalize_mime_type(mime_type: str | None) -> str:
 
 def _is_openai_responses_inline_file_mime_type(mime_type: str) -> bool:
     return _normalize_mime_type(mime_type) in _OPENAI_RESPONSES_INLINE_FILE_MIME_TYPES
+
+
+def _openai_responses_attachment_part(
+    *,
+    filename: str,
+    mime_type: str | None,
+    data: bytes,
+) -> dict[str, Any]:
+    normalized_mime_type = _normalize_mime_type(mime_type)
+    if normalized_mime_type.startswith("image/"):
+        if len(data) > _OPENAI_RESPONSES_MAX_INLINE_IMAGE_BYTES:
+            return {
+                "type": "input_text",
+                "text": (
+                    f"the user attached an image ({normalized_mime_type}) "
+                    "that was too large to include"
+                ),
+            }
+        return {
+            "type": "input_image",
+            "image_url": _encoded_data_url(
+                mime_type=normalized_mime_type,
+                data=data,
+            ),
+        }
+    if not _is_openai_responses_inline_file_mime_type(normalized_mime_type):
+        return {
+            "type": "input_text",
+            "text": (
+                f"the user attached {filename} with unsupported mime type "
+                f"{normalized_mime_type}"
+            ),
+        }
+    if len(data) > _OPENAI_RESPONSES_MAX_INLINE_FILE_BYTES:
+        return {
+            "type": "input_text",
+            "text": (
+                f"the user attached {filename} ({normalized_mime_type}) "
+                "but it was too large to include"
+            ),
+        }
+    return {
+        "type": "input_file",
+        "filename": filename,
+        "file_data": _encoded_data_url(
+            mime_type=normalized_mime_type,
+            data=data,
+        ),
+    }
 
 
 def _is_openai_out_of_credits_message(message: str) -> bool:
@@ -773,28 +954,14 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
     def append_file_message(
         self, *, filename: str, mime_type: str, data: bytes
     ) -> dict:
-        normalized_mime_type = _normalize_mime_type(mime_type)
-        if normalized_mime_type.startswith("image/"):
-            return self.append_image_message(mime_type=normalized_mime_type, data=data)
-        if not _is_openai_responses_inline_file_mime_type(normalized_mime_type):
-            return self._append_attachment_note(
-                f"the user attached {filename} with unsupported mime type {normalized_mime_type}"
-            )
-        if len(data) > _OPENAI_RESPONSES_MAX_INLINE_FILE_BYTES:
-            return self._append_attachment_note(
-                f"the user attached {filename} ({normalized_mime_type}) but it was too large to include"
-            )
         message = {
             "role": "user",
             "content": [
-                {
-                    "type": "input_file",
-                    "filename": filename,
-                    "file_data": _encoded_data_url(
-                        mime_type=normalized_mime_type,
-                        data=data,
-                    ),
-                }
+                _openai_responses_attachment_part(
+                    filename=filename,
+                    mime_type=mime_type,
+                    data=data,
+                )
             ],
         }
         self.messages.append(message)
@@ -851,6 +1018,7 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
 
     def _append_user_content(self, content: list[dict[str, Any]]) -> None:
         parts: list[dict[str, Any]] = []
+        unresolved_files: list[tuple[int, str, str]] = []
         for item in content:
             item_type = item.get("type")
             if item_type == "text":
@@ -869,42 +1037,45 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
                     )
                     data_url = _decode_data_url_attachment(url)
                     if data_url is None:
+                        unresolved_files.append((len(parts), url, filename))
                         parts.append({"type": "input_file", "file_url": url})
-                    elif data_url.mime_type.startswith("image/"):
-                        parts.append(
-                            {
-                                "type": "input_image",
-                                "image_url": _encoded_data_url(
-                                    mime_type=data_url.mime_type,
-                                    data=data_url.data,
-                                ),
-                            }
-                        )
-                    elif _is_openai_responses_inline_file_mime_type(data_url.mime_type):
-                        parts.append(
-                            {
-                                "type": "input_file",
-                                "filename": filename,
-                                "file_data": _encoded_data_url(
-                                    mime_type=data_url.mime_type,
-                                    data=data_url.data,
-                                ),
-                            }
-                        )
                     else:
                         parts.append(
-                            {
-                                "type": "input_text",
-                                "text": (
-                                    "the user attached "
-                                    f"{filename} with unsupported mime type "
-                                    f"{data_url.mime_type}"
-                                ),
-                            }
+                            _openai_responses_attachment_part(
+                                filename=filename,
+                                mime_type=data_url.mime_type,
+                                data=data_url.data,
+                            )
                         )
         if not parts:
             parts.append({"type": "input_text", "text": json.dumps(content)})
-        self._emit_context_message({"role": "user", "content": parts})
+        emitted_message = self._emit_context_message({"role": "user", "content": parts})
+        emitted_parts = emitted_message["content"]
+        for index, url, filename in unresolved_files:
+            part = emitted_parts[index]
+
+            def resolve_file(
+                file_content: FileContent,
+                *,
+                part: dict[str, Any] = part,
+                filename: str = filename,
+            ) -> None:
+                resolved_filename = filename
+                if (
+                    resolved_filename == "attachment"
+                    and file_content.name.strip() != ""
+                ):
+                    resolved_filename = file_content.name
+                part.clear()
+                part.update(
+                    _openai_responses_attachment_part(
+                        filename=resolved_filename,
+                        mime_type=file_content.mime_type,
+                        data=file_content.data,
+                    )
+                )
+
+            self._defer_file_resolution(url=url, resolve=resolve_file)
 
     def _append_assistant_text(self, *, text: str, phase: str | None) -> None:
         del phase
@@ -1162,13 +1333,35 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
             item["code"] = code if isinstance(code, str) else tool_call.arguments_json()
         else:
             item.update(arguments)
-        if result is not None and item_type not in {
-            "shell_call",
-            "local_shell_call",
-            "computer_call",
-            "apply_patch_call",
-        }:
-            item["output"] = copy.deepcopy(result)
+        if item_type == "file_search_call" and result is not None:
+            result_payload = (
+                result.get("json") if result.get("type") == "json" else result
+            )
+            if isinstance(result_payload, dict):
+                results = result_payload.get("results")
+                if isinstance(results, list):
+                    item["results"] = copy.deepcopy(results)
+        elif item_type == "mcp_call" and result is not None:
+            if result.get("type") == "text" and isinstance(result.get("text"), str):
+                item["output"] = result["text"]
+            elif result.get("type") == "json":
+                item["output"] = json.dumps(
+                    result.get("json"),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            else:
+                item["output"] = json.dumps(
+                    result,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+        if item_type in {"mcp_call", "mcp_list_tools"} and error is not None:
+            item["error"] = json.dumps(
+                error,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
         return item
 
     def _builtin_output_item(
@@ -2053,12 +2246,11 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         if isinstance(context, OpenAIResponsesSessionContext):
             context.clear_websocket_incremental_state()
         context.messages.clear()
-        normalized_messages = [
-            self._normalize_restored_context_message(message=message)
-            for message in messages
-        ]
-        normalized_messages = self._deduplicate_image_generation_calls(
-            messages=normalized_messages,
+        normalized_messages = self._normalize_responses_input_messages(
+            messages=[
+                self._normalize_restored_context_message(message=message)
+                for message in messages
+            ],
         )
         context.messages.extend(
             self._repair_restored_function_call_outputs(
@@ -2116,7 +2308,12 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         if normalized == "inprogress":
             normalized = "in_progress"
 
-        if normalized in _OPENAI_RESPONSES_INPUT_STATUSES:
+        message_type = message.get("type")
+        accepted_statuses = _OPENAI_RESPONSES_BUILTIN_CALL_STATUSES.get(
+            message_type,
+            _OPENAI_RESPONSES_INPUT_STATUSES,
+        )
+        if normalized in accepted_statuses:
             message["status"] = normalized
             return
         if normalized in {
@@ -2140,7 +2337,12 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             message["status"] = "in_progress"
             return
 
-        message["status"] = "incomplete"
+        if "incomplete" in accepted_statuses:
+            message["status"] = "incomplete"
+        elif "failed" in accepted_statuses:
+            message["status"] = "failed"
+        else:
+            message["status"] = "completed"
 
     @staticmethod
     def _normalize_responses_input_messages(*, messages: Any) -> Any:
@@ -2151,9 +2353,57 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             if isinstance(message, dict):
                 OpenAIResponsesAdapter._normalize_restored_input_status(message=message)
                 OpenAIResponsesAdapter._normalize_image_generation_call(message=message)
-        return OpenAIResponsesAdapter._deduplicate_image_generation_calls(
-            messages=normalized,
+                OpenAIResponsesAdapter._normalize_builtin_call(message=message)
+        return OpenAIResponsesAdapter._deduplicate_snapshot_calls(
+            messages=OpenAIResponsesAdapter._deduplicate_image_generation_calls(
+                messages=normalized,
+            ),
         )
+
+    @staticmethod
+    def _normalize_builtin_call(*, message: dict[str, Any]) -> None:
+        message_type = message.get("type")
+        fields = _OPENAI_RESPONSES_BUILTIN_CALL_FIELDS.get(message_type)
+        if fields is None:
+            return
+
+        output = message.get("output")
+        payload = (
+            output.get("json")
+            if isinstance(output, dict) and output.get("type") == "json"
+            else output
+        )
+        if message_type == "file_search_call" and "results" not in message:
+            if isinstance(payload, dict) and isinstance(payload.get("results"), list):
+                message["results"] = copy.deepcopy(payload["results"])
+        elif message_type == "mcp_call" and output is not None:
+            if isinstance(output, dict) and output.get("type") == "text":
+                text = output.get("text")
+                if isinstance(text, str):
+                    message["output"] = text
+            elif isinstance(output, dict) and output.get("type") == "json":
+                message["output"] = json.dumps(
+                    output.get("json"),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+        elif message_type == "mcp_list_tools" and "tools" not in message:
+            if isinstance(payload, dict) and isinstance(payload.get("tools"), list):
+                message["tools"] = copy.deepcopy(payload["tools"])
+
+        if message_type == "web_search_call" and not isinstance(
+            message.get("action"), dict
+        ):
+            query = message.get("query")
+            queries = message.get("queries")
+            if isinstance(query, str):
+                message["action"] = {"type": "search", "query": query}
+            elif isinstance(queries, list):
+                message["action"] = {"type": "search", "queries": queries}
+
+        for key in list(message):
+            if key not in fields:
+                message.pop(key, None)
 
     @staticmethod
     def _normalize_image_generation_call(*, message: dict[str, Any]) -> None:
@@ -2207,6 +2457,50 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         return deduplicated
 
     @staticmethod
+    def _snapshot_call_replay_score(*, message: dict[str, Any]) -> tuple[int, int]:
+        status_score = {
+            "completed": 5,
+            "failed": 4,
+            "incomplete": 3,
+            "searching": 2,
+            "interpreting": 2,
+            "calling": 2,
+            "generating": 2,
+            "in_progress": 1,
+        }.get(message.get("status"), 0)
+        return status_score, len(message)
+
+    @staticmethod
+    def _deduplicate_snapshot_calls(
+        *,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        deduplicated: list[dict[str, Any]] = []
+        index_by_item: dict[tuple[str, str], int] = {}
+        for message in messages:
+            message_type = message.get("type")
+            item_id = message.get("id")
+            if (
+                message_type not in _OPENAI_RESPONSES_SNAPSHOT_CALL_TYPES
+                or not isinstance(item_id, str)
+                or item_id == ""
+            ):
+                deduplicated.append(message)
+                continue
+            key = (message_type, item_id)
+            previous_index = index_by_item.get(key)
+            if previous_index is None:
+                index_by_item[key] = len(deduplicated)
+                deduplicated.append(message)
+                continue
+            previous = deduplicated[previous_index]
+            if OpenAIResponsesAdapter._snapshot_call_replay_score(
+                message=message
+            ) >= OpenAIResponsesAdapter._snapshot_call_replay_score(message=previous):
+                deduplicated[previous_index] = message
+        return deduplicated
+
+    @staticmethod
     def _normalize_stateless_context_message(
         *,
         message: dict[str, Any],
@@ -2216,6 +2510,9 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         message_type = restored.get("type")
         if message_type == "image_generation_call":
             OpenAIResponsesAdapter._normalize_image_generation_call(message=restored)
+            return restored
+        if message_type in _OPENAI_RESPONSES_BUILTIN_CALL_FIELDS:
+            OpenAIResponsesAdapter._normalize_builtin_call(message=restored)
             return restored
         if message_type in {"shell_call_output", "local_shell_call_output"}:
             OpenAIResponsesAdapter._normalize_restored_shell_call_output(

@@ -1260,7 +1260,7 @@ async def test_make_agent_event_reader_accumulates_text_for_realtime_replay() ->
         ),
     ]:
         reader.consume(message)
-    reader.finalize()
+    await reader.finalize()
     adapter.restore_context_messages(context=context, messages=restored_messages)
 
     assert context.messages == [
@@ -1351,7 +1351,7 @@ async def test_make_agent_event_reader_restores_tool_lifecycle_for_realtime_repl
             result=TextContent(text="patched"),
         )
     )
-    reader.finalize()
+    await reader.finalize()
     adapter.restore_context_messages(context=context, messages=restored_messages)
 
     assert context.messages == [
@@ -1408,7 +1408,10 @@ async def test_make_agent_event_reader_restores_tool_lifecycle_for_realtime_repl
     await adapter.disconnect(context=context)
 
 
-def test_make_agent_event_reader_ignores_realtime_audio_generation_for_replay() -> None:
+@pytest.mark.asyncio
+async def test_make_agent_event_reader_ignores_realtime_audio_generation_for_replay() -> (
+    None
+):
     adapter = _adapter(response_options={"modalities": ["audio"]})
 
     restored_messages: list[dict[str, Any]] = []
@@ -1435,7 +1438,7 @@ def test_make_agent_event_reader_ignores_realtime_audio_generation_for_replay() 
         ),
     ]:
         reader.consume(message)
-    reader.finalize()
+    await reader.finalize()
 
     assert restored_messages == []
 
