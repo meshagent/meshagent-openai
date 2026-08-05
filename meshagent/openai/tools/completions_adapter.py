@@ -80,6 +80,9 @@ _OPENAI_COMPLETIONS_ACCEPTED_ATTACHMENT_TYPES = (
     "application/json",
     "application/xhtml+xml",
 )
+_OPENAI_COMPLETIONS_INLINE_IMAGE_MIME_TYPES = frozenset(
+    {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
+)
 
 
 @dataclass(frozen=True)
@@ -124,6 +127,26 @@ def _encoded_data_url(*, mime_type: str, data: bytes) -> str:
     return f"data:{normalized_mime_type};base64,{base64.b64encode(data).decode()}"
 
 
+def _openai_completions_unsupported_image_note(
+    *, filename: str, mime_type: str
+) -> dict[str, Any]:
+    if mime_type in {"image/svg+xml", "image/svg"}:
+        return {
+            "type": "text",
+            "text": (
+                f"The user attached {filename}, an SVG file. PowerBoards can preview "
+                "the file, but this Assistant cannot use SVG as image input. Ask the "
+                "user to attach a PNG, JPEG, WEBP, or GIF instead."
+            ),
+        }
+    return {
+        "type": "text",
+        "text": (
+            f"the user attached {filename} with unsupported image mime type {mime_type}"
+        ),
+    }
+
+
 def _openai_completions_attachment_part(
     *,
     filename: str,
@@ -132,6 +155,11 @@ def _openai_completions_attachment_part(
 ) -> dict[str, Any]:
     normalized_mime_type = (mime_type or "application/octet-stream").lower()
     if normalized_mime_type.startswith("image/"):
+        if normalized_mime_type not in _OPENAI_COMPLETIONS_INLINE_IMAGE_MIME_TYPES:
+            return _openai_completions_unsupported_image_note(
+                filename=filename,
+                mime_type=normalized_mime_type,
+            )
         if len(data) > _OPENAI_COMPLETIONS_MAX_INLINE_IMAGE_BYTES:
             return {
                 "type": "text",
@@ -434,6 +462,13 @@ class OpenAICompletionsSessionContext(AgentSessionContext):
             return self._append_attachment_note(
                 f"the user attached an unsupported image with mime type {normalized_mime_type}"
             )
+        if normalized_mime_type not in _OPENAI_COMPLETIONS_INLINE_IMAGE_MIME_TYPES:
+            return self._append_attachment_note(
+                _openai_completions_unsupported_image_note(
+                    filename="image",
+                    mime_type=normalized_mime_type,
+                )["text"]
+            )
         if len(data) > _OPENAI_COMPLETIONS_MAX_INLINE_IMAGE_BYTES:
             return self._append_attachment_note(
                 f"the user attached an image ({normalized_mime_type}) that was too large to include"
@@ -461,6 +496,18 @@ class OpenAICompletionsSessionContext(AgentSessionContext):
             return self.append_image_message(
                 mime_type=data_url.mime_type,
                 data=data_url.data,
+            )
+        guessed_mime_type, _ = mimetypes.guess_type(urlparse(url).path)
+        normalized_mime_type = (guessed_mime_type or "").lower()
+        if (
+            normalized_mime_type.startswith("image/")
+            and normalized_mime_type not in _OPENAI_COMPLETIONS_INLINE_IMAGE_MIME_TYPES
+        ):
+            return self._append_attachment_note(
+                _openai_completions_unsupported_image_note(
+                    filename=urlparse(url).path.rsplit("/", 1)[-1] or "image",
+                    mime_type=normalized_mime_type,
+                )["text"]
             )
         message = {
             "role": "user",
@@ -500,8 +547,17 @@ class OpenAICompletionsSessionContext(AgentSessionContext):
         parsed_url = urlparse(url)
         guessed_mime_type, _ = mimetypes.guess_type(parsed_url.path)
         normalized_mime_type = (guessed_mime_type or "application/octet-stream").lower()
-        if normalized_mime_type.startswith("image/"):
+        if normalized_mime_type in _OPENAI_COMPLETIONS_INLINE_IMAGE_MIME_TYPES:
             return self.append_image_url(url=url)
+        if normalized_mime_type.startswith("image/"):
+            return self._append_attachment_note(
+                _openai_completions_unsupported_image_note(
+                    filename=filename
+                    or parsed_url.path.rsplit("/", 1)[-1]
+                    or "attachment",
+                    mime_type=normalized_mime_type,
+                )["text"]
+            )
         return self._append_attachment_note(
             f"the user attached a file available at {url}"
         )

@@ -6214,6 +6214,81 @@ def test_session_context_appends_data_url_image_as_inline_image() -> None:
     }
 
 
+def test_session_context_keeps_svg_out_of_raster_image_input() -> None:
+    context = OpenAIResponsesSessionContext(system_role=None)
+
+    svg_message = context.append_file_url(
+        url="data:image/svg+xml;base64,PHN2Zz48ZmlsdGVyLz48L3N2Zz4=",
+        filename="unsupported-filter.svg",
+    )
+    text_message = context.append_user_message("Continue without the attachment")
+
+    assert svg_message["content"][0]["type"] == "input_text"
+    assert svg_message["content"][0]["text"].startswith(
+        "The user attached unsupported-filter.svg, an SVG file."
+    )
+    assert "cannot use SVG as image input" in svg_message["content"][0]["text"]
+    assert text_message == {
+        "role": "user",
+        "content": "Continue without the attachment",
+    }
+    assert all(
+        not isinstance(message.get("content"), list)
+        or all(part.get("type") != "input_image" for part in message.get("content", []))
+        for message in context.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_restored_svg_attachment_is_sanitized_before_later_text_turn() -> None:
+    adapter = OpenAIResponsesAdapter(model="gpt-4.1-mini")
+
+    async def read_file(url: str) -> FileContent:
+        assert url == "room:///unsupported-filter.svg"
+        return FileContent(
+            name="unsupported-filter.svg",
+            mime_type="image/svg+xml",
+            data=b"<svg><filter/></svg>",
+        )
+
+    messages = [
+        parse_agent_message(
+            {
+                "type": "meshagent.agent.turn.start",
+                "thread_id": "thread-1",
+                "content": [
+                    {
+                        "type": "file",
+                        "url": "room:///unsupported-filter.svg",
+                        "name": "unsupported-filter.svg",
+                    }
+                ],
+            }
+        ),
+        parse_agent_message(
+            {
+                "type": "meshagent.agent.turn.start",
+                "thread_id": "thread-1",
+                "content": [
+                    {"type": "text", "text": "Continue without the attachment"}
+                ],
+            }
+        ),
+    ]
+
+    projected = await adapter.project_agent_messages(
+        messages=messages,
+        file_reader=read_file,
+    )
+
+    assert projected[0]["content"][0]["type"] == "input_text"
+    assert "cannot use SVG as image input" in projected[0]["content"][0]["text"]
+    assert projected[1] == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "Continue without the attachment"}],
+    }
+
+
 def test_session_context_replaces_unsupported_data_url_file_with_note() -> None:
     context = OpenAIResponsesSessionContext(system_role=None)
 
