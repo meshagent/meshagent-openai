@@ -251,7 +251,11 @@ def test_list_models_advertises_attachment_capabilities() -> None:
 
     assert model.supports_attachments is True
     assert set(model.accepts) == {
-        "image/*",
+        "image/png",
+        "image/jpeg",
+        "image/jpg",
+        "image/webp",
+        "image/gif",
         "application/xhtml+xml",
         *DOCUMENTED_OPENAI_FILE_MIME_TYPES,
     }
@@ -6276,10 +6280,11 @@ async def test_restored_svg_attachment_is_sanitized_before_later_text_turn() -> 
         ),
     ]
 
-    projected = await adapter.project_agent_messages(
-        messages=messages,
-        file_reader=read_file,
-    )
+    projected: list[dict] = []
+    reader = adapter.make_agent_event_reader(emit_message=projected.append)
+    for message in messages:
+        reader.consume(message)
+    await reader.finalize(file_reader=read_file)
 
     assert projected[0]["content"][0]["type"] == "input_text"
     assert "cannot use SVG as image input" in projected[0]["content"][0]["text"]
@@ -7672,7 +7677,17 @@ async def test_next_does_not_retry_after_websocket_out_of_credits(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_next_does_not_retry_after_websocket_invalid_schema(monkeypatch):
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Invalid schema for function 'ask_user': 'text' is not valid under any of the given schemas.",
+        "The image data you provided does not represent a valid image. Please check your input and try again.",
+    ],
+)
+async def test_next_does_not_retry_after_deterministic_websocket_request_error(
+    monkeypatch,
+    message: str,
+):
     sleep_calls: list[float] = []
 
     async def _fake_sleep(delay: float):
@@ -7689,8 +7704,7 @@ async def test_next_does_not_retry_after_websocket_invalid_schema(monkeypatch):
         {
             "type": "error",
             "error": {
-                "message": "Invalid schema for function 'ask_user': "
-                "'text' is not valid under any of the given schemas.",
+                "message": message,
             },
             "status": 400,
         }
@@ -7723,7 +7737,7 @@ async def test_next_does_not_retry_after_websocket_invalid_schema(monkeypatch):
                 event_handler=stream_events.append,
             )
 
-        assert "Invalid schema for function 'ask_user'" in str(exc_info.value)
+        assert message in str(exc_info.value)
         assert client_session.connect_calls == 1
         assert sleep_calls == []
         assert stream_events == []

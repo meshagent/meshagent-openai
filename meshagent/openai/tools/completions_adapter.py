@@ -75,7 +75,11 @@ logger = logging.getLogger("openai_agent")
 _OPENAI_COMPLETIONS_MAX_INLINE_IMAGE_BYTES = 20 * 1024 * 1024
 _OPENAI_COMPLETIONS_MAX_INLINE_TEXT_BYTES = 1 * 1024 * 1024
 _OPENAI_COMPLETIONS_ACCEPTED_ATTACHMENT_TYPES = (
-    "image/*",
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/webp",
+    "image/gif",
     "text/*",
     "application/json",
     "application/xhtml+xml",

@@ -480,7 +480,11 @@ _OPENAI_RESPONSES_INLINE_FILE_MIME_TYPES = frozenset(
     }
 )
 _OPENAI_RESPONSES_ACCEPTED_ATTACHMENT_TYPES = (
-    "image/*",
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/webp",
+    "image/gif",
     *sorted(_OPENAI_RESPONSES_INLINE_FILE_MIME_TYPES),
 )
 _OPENAI_RESPONSES_INLINE_IMAGE_MIME_TYPES = frozenset(
@@ -582,6 +586,7 @@ def _is_openai_non_retryable_request_error_message(message: str) -> bool:
         or "missing required parameter" in normalized
         or "unknown parameter" in normalized
         or "unsupported parameter" in normalized
+        or "the image data you provided does not represent a valid image" in normalized
     )
 
 
