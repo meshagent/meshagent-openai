@@ -8264,7 +8264,9 @@ async def test_openai_responses_adapter_prepare_stream_event_image_branches() ->
     }
 
 
-def test_make_agent_event_publisher_preserves_text_delta_whitespace() -> None:
+def test_make_agent_event_publisher_uses_deltas_instead_of_repeating_added_snapshot() -> (
+    None
+):
     adapter = OpenAIResponsesAdapter(
         client=_FakeOpenAIClient(outcomes=[]),
         mode="request",
@@ -8280,7 +8282,7 @@ def test_make_agent_event_publisher_preserves_text_delta_whitespace() -> None:
         {
             "type": "response.content_part.added",
             "item_id": "msg_1",
-            "part": {"type": "output_text", "text": ""},
+            "part": {"type": "output_text", "text": "Hello world"},
         }
     )
     publisher(
