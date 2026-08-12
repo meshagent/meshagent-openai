@@ -18,6 +18,7 @@ from meshagent.agents.messages import (
     AgentTextContentDelta,
     AgentTextContentEnded,
     ToolChoice,
+    parse_agent_message,
 )
 from meshagent.api import RoomException, ToolContentSpec
 from meshagent.api.messaging import FileContent, JsonContent, TextContent
@@ -35,7 +36,10 @@ def test_list_models_advertises_attachment_capabilities() -> None:
     model = OpenAICompletionsAdapter(model="gpt-4o").list_models()[0]
 
     assert model.supports_attachments is True
-    assert "image/*" in model.accepts
+    assert {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}.issubset(
+        model.accepts
+    )
+    assert "image/*" not in model.accepts
     assert "application/xhtml+xml" in model.accepts
 
 
@@ -150,6 +154,82 @@ def test_session_context_appends_data_url_image_as_image_url() -> None:
                 "image_url": {"url": "data:image/png;base64,cG5n"},
             }
         ],
+    }
+
+
+def test_session_context_keeps_svg_out_of_raster_image_input() -> None:
+    adapter = OpenAICompletionsAdapter(model="gpt-4o-mini", client=object())
+    context = adapter.create_session()
+
+    svg_message = context.append_file_url(
+        url="data:image/svg+xml;base64,PHN2Zz48ZmlsdGVyLz48L3N2Zz4=",
+        filename="unsupported-filter.svg",
+    )
+    text_message = context.append_user_message("Continue without the attachment")
+
+    assert svg_message["content"].startswith(
+        "The user attached unsupported-filter.svg, an SVG file."
+    )
+    assert "cannot use SVG as image input" in svg_message["content"]
+    assert text_message == {
+        "role": "user",
+        "content": "Continue without the attachment",
+    }
+    assert all(
+        not isinstance(message.get("content"), list)
+        or all(part.get("type") != "image_url" for part in message["content"])
+        for message in context.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_restored_svg_attachment_is_sanitized_before_later_text_turn() -> None:
+    adapter = OpenAICompletionsAdapter(model="gpt-4o-mini", client=object())
+
+    async def read_file(url: str) -> FileContent:
+        assert url == "room:///unsupported-filter.svg"
+        return FileContent(
+            name="unsupported-filter.svg",
+            mime_type="image/svg+xml",
+            data=b"<svg><filter/></svg>",
+        )
+
+    messages = [
+        parse_agent_message(
+            {
+                "type": "meshagent.agent.turn.start",
+                "thread_id": "thread-1",
+                "content": [
+                    {
+                        "type": "file",
+                        "url": "room:///unsupported-filter.svg",
+                        "name": "unsupported-filter.svg",
+                    }
+                ],
+            }
+        ),
+        parse_agent_message(
+            {
+                "type": "meshagent.agent.turn.start",
+                "thread_id": "thread-1",
+                "content": [
+                    {"type": "text", "text": "Continue without the attachment"}
+                ],
+            }
+        ),
+    ]
+
+    projected: list[dict] = []
+    reader = adapter.make_agent_event_reader(emit_message=projected.append)
+    for message in messages:
+        reader.consume(message)
+    await reader.finalize(file_reader=read_file)
+
+    assert projected[0]["content"][0]["type"] == "text"
+    assert "cannot use SVG as image input" in projected[0]["content"][0]["text"]
+    assert projected[1] == {
+        "role": "user",
+        "content": "Continue without the attachment",
     }
 
 

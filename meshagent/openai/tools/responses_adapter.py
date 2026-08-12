@@ -95,6 +95,7 @@ import re
 import asyncio
 import aiohttp
 import math
+import mimetypes
 import httpx
 from pydantic import BaseModel, model_validator
 from opentelemetry import trace
@@ -479,8 +480,15 @@ _OPENAI_RESPONSES_INLINE_FILE_MIME_TYPES = frozenset(
     }
 )
 _OPENAI_RESPONSES_ACCEPTED_ATTACHMENT_TYPES = (
-    "image/*",
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/webp",
+    "image/gif",
     *sorted(_OPENAI_RESPONSES_INLINE_FILE_MIME_TYPES),
+)
+_OPENAI_RESPONSES_INLINE_IMAGE_MIME_TYPES = frozenset(
+    {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
 )
 
 
@@ -492,6 +500,26 @@ def _is_openai_responses_inline_file_mime_type(mime_type: str) -> bool:
     return _normalize_mime_type(mime_type) in _OPENAI_RESPONSES_INLINE_FILE_MIME_TYPES
 
 
+def _openai_responses_unsupported_image_note(
+    *, filename: str, mime_type: str
+) -> dict[str, Any]:
+    if mime_type in {"image/svg+xml", "image/svg"}:
+        return {
+            "type": "input_text",
+            "text": (
+                f"The user attached {filename}, an SVG file. PowerBoards can preview "
+                "the file, but this Assistant cannot use SVG as image input. Ask the "
+                "user to attach a PNG, JPEG, WEBP, or GIF instead."
+            ),
+        }
+    return {
+        "type": "input_text",
+        "text": (
+            f"the user attached {filename} with unsupported image mime type {mime_type}"
+        ),
+    }
+
+
 def _openai_responses_attachment_part(
     *,
     filename: str,
@@ -500,6 +528,11 @@ def _openai_responses_attachment_part(
 ) -> dict[str, Any]:
     normalized_mime_type = _normalize_mime_type(mime_type)
     if normalized_mime_type.startswith("image/"):
+        if normalized_mime_type not in _OPENAI_RESPONSES_INLINE_IMAGE_MIME_TYPES:
+            return _openai_responses_unsupported_image_note(
+                filename=filename,
+                mime_type=normalized_mime_type,
+            )
         if len(data) > _OPENAI_RESPONSES_MAX_INLINE_IMAGE_BYTES:
             return {
                 "type": "input_text",
@@ -553,6 +586,7 @@ def _is_openai_non_retryable_request_error_message(message: str) -> bool:
         or "missing required parameter" in normalized
         or "unknown parameter" in normalized
         or "unsupported parameter" in normalized
+        or "the image data you provided does not represent a valid image" in normalized
     )
 
 
@@ -913,6 +947,13 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
             return self._append_attachment_note(
                 f"the user attached an unsupported image with mime type {normalized_mime_type}"
             )
+        if normalized_mime_type not in _OPENAI_RESPONSES_INLINE_IMAGE_MIME_TYPES:
+            return self._append_attachment_note(
+                _openai_responses_unsupported_image_note(
+                    filename="image",
+                    mime_type=normalized_mime_type,
+                )["text"]
+            )
         if len(data) > _OPENAI_RESPONSES_MAX_INLINE_IMAGE_BYTES:
             return self._append_attachment_note(
                 f"the user attached an image ({normalized_mime_type}) that was too large to include"
@@ -938,6 +979,18 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
             return self.append_image_message(
                 mime_type=data_url.mime_type,
                 data=data_url.data,
+            )
+        guessed_mime_type, _ = mimetypes.guess_type(urlparse(url).path)
+        normalized_mime_type = _normalize_mime_type(guessed_mime_type)
+        if (
+            normalized_mime_type.startswith("image/")
+            and normalized_mime_type not in _OPENAI_RESPONSES_INLINE_IMAGE_MIME_TYPES
+        ):
+            return self._append_attachment_note(
+                _openai_responses_unsupported_image_note(
+                    filename=urlparse(url).path.rsplit("/", 1)[-1] or "image",
+                    mime_type=normalized_mime_type,
+                )["text"]
             )
         message = {
             "role": "user",
@@ -974,6 +1027,20 @@ class OpenAIResponsesSessionContext(AgentSessionContext):
                 filename=filename or "attachment",
                 mime_type=data_url.mime_type,
                 data=data_url.data,
+            )
+        guessed_mime_type, _ = mimetypes.guess_type(urlparse(url).path)
+        normalized_mime_type = _normalize_mime_type(guessed_mime_type)
+        if (
+            normalized_mime_type.startswith("image/")
+            and normalized_mime_type not in _OPENAI_RESPONSES_INLINE_IMAGE_MIME_TYPES
+        ):
+            return self._append_attachment_note(
+                _openai_responses_unsupported_image_note(
+                    filename=filename
+                    or urlparse(url).path.rsplit("/", 1)[-1]
+                    or "attachment",
+                    mime_type=normalized_mime_type,
+                )["text"]
             )
         message = {
             "role": "user",

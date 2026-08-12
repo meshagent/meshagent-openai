@@ -251,7 +251,11 @@ def test_list_models_advertises_attachment_capabilities() -> None:
 
     assert model.supports_attachments is True
     assert set(model.accepts) == {
-        "image/*",
+        "image/png",
+        "image/jpeg",
+        "image/jpg",
+        "image/webp",
+        "image/gif",
         "application/xhtml+xml",
         *DOCUMENTED_OPENAI_FILE_MIME_TYPES,
     }
@@ -6214,6 +6218,82 @@ def test_session_context_appends_data_url_image_as_inline_image() -> None:
     }
 
 
+def test_session_context_keeps_svg_out_of_raster_image_input() -> None:
+    context = OpenAIResponsesSessionContext(system_role=None)
+
+    svg_message = context.append_file_url(
+        url="data:image/svg+xml;base64,PHN2Zz48ZmlsdGVyLz48L3N2Zz4=",
+        filename="unsupported-filter.svg",
+    )
+    text_message = context.append_user_message("Continue without the attachment")
+
+    assert svg_message["content"][0]["type"] == "input_text"
+    assert svg_message["content"][0]["text"].startswith(
+        "The user attached unsupported-filter.svg, an SVG file."
+    )
+    assert "cannot use SVG as image input" in svg_message["content"][0]["text"]
+    assert text_message == {
+        "role": "user",
+        "content": "Continue without the attachment",
+    }
+    assert all(
+        not isinstance(message.get("content"), list)
+        or all(part.get("type") != "input_image" for part in message.get("content", []))
+        for message in context.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_restored_svg_attachment_is_sanitized_before_later_text_turn() -> None:
+    adapter = OpenAIResponsesAdapter(model="gpt-4.1-mini")
+
+    async def read_file(url: str) -> FileContent:
+        assert url == "room:///unsupported-filter.svg"
+        return FileContent(
+            name="unsupported-filter.svg",
+            mime_type="image/svg+xml",
+            data=b"<svg><filter/></svg>",
+        )
+
+    messages = [
+        parse_agent_message(
+            {
+                "type": "meshagent.agent.turn.start",
+                "thread_id": "thread-1",
+                "content": [
+                    {
+                        "type": "file",
+                        "url": "room:///unsupported-filter.svg",
+                        "name": "unsupported-filter.svg",
+                    }
+                ],
+            }
+        ),
+        parse_agent_message(
+            {
+                "type": "meshagent.agent.turn.start",
+                "thread_id": "thread-1",
+                "content": [
+                    {"type": "text", "text": "Continue without the attachment"}
+                ],
+            }
+        ),
+    ]
+
+    projected: list[dict] = []
+    reader = adapter.make_agent_event_reader(emit_message=projected.append)
+    for message in messages:
+        reader.consume(message)
+    await reader.finalize(file_reader=read_file)
+
+    assert projected[0]["content"][0]["type"] == "input_text"
+    assert "cannot use SVG as image input" in projected[0]["content"][0]["text"]
+    assert projected[1] == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "Continue without the attachment"}],
+    }
+
+
 def test_session_context_replaces_unsupported_data_url_file_with_note() -> None:
     context = OpenAIResponsesSessionContext(system_role=None)
 
@@ -7597,7 +7677,17 @@ async def test_next_does_not_retry_after_websocket_out_of_credits(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_next_does_not_retry_after_websocket_invalid_schema(monkeypatch):
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Invalid schema for function 'ask_user': 'text' is not valid under any of the given schemas.",
+        "The image data you provided does not represent a valid image. Please check your input and try again.",
+    ],
+)
+async def test_next_does_not_retry_after_deterministic_websocket_request_error(
+    monkeypatch,
+    message: str,
+):
     sleep_calls: list[float] = []
 
     async def _fake_sleep(delay: float):
@@ -7614,8 +7704,7 @@ async def test_next_does_not_retry_after_websocket_invalid_schema(monkeypatch):
         {
             "type": "error",
             "error": {
-                "message": "Invalid schema for function 'ask_user': "
-                "'text' is not valid under any of the given schemas.",
+                "message": message,
             },
             "status": 400,
         }
@@ -7648,7 +7737,7 @@ async def test_next_does_not_retry_after_websocket_invalid_schema(monkeypatch):
                 event_handler=stream_events.append,
             )
 
-        assert "Invalid schema for function 'ask_user'" in str(exc_info.value)
+        assert message in str(exc_info.value)
         assert client_session.connect_calls == 1
         assert sleep_calls == []
         assert stream_events == []
@@ -8175,7 +8264,9 @@ async def test_openai_responses_adapter_prepare_stream_event_image_branches() ->
     }
 
 
-def test_make_agent_event_publisher_preserves_text_delta_whitespace() -> None:
+def test_make_agent_event_publisher_uses_deltas_instead_of_repeating_added_snapshot() -> (
+    None
+):
     adapter = OpenAIResponsesAdapter(
         client=_FakeOpenAIClient(outcomes=[]),
         mode="request",
@@ -8191,7 +8282,7 @@ def test_make_agent_event_publisher_preserves_text_delta_whitespace() -> None:
         {
             "type": "response.content_part.added",
             "item_id": "msg_1",
-            "part": {"type": "output_text", "text": ""},
+            "part": {"type": "output_text", "text": "Hello world"},
         }
     )
     publisher(
