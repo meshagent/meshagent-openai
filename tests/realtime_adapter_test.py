@@ -247,6 +247,7 @@ async def _wait_for_sent_count(
 async def test_connect_opens_realtime_websocket_and_sends_session_update() -> None:
     websocket = _FakeWebSocket()
     context = _context(websocket)
+    context.set_llm_authorization_token("delegation-token")
     adapter = _adapter(session_options={"modalities": ["text", "audio"]})
     received: list[dict[str, object]] = []
 
@@ -260,6 +261,7 @@ async def test_connect_opens_realtime_websocket_and_sends_session_update() -> No
     headers = session.ws_connect_calls[0]["headers"]
     assert isinstance(headers, dict)
     assert "OpenAI-Beta" not in headers
+    assert headers["Meshagent-Llm-Delegation"] == "delegation-token"
     assert websocket.sent == [
         {
             "type": "session.update",

@@ -1137,6 +1137,10 @@ class OpenAICompletionsAdapter(LLMAdapter):
 
                 request_options = dict(options or {})
                 extra_headers = llm_annotation_headers(self._annotations)
+                if context.llm_authorization_token is not None:
+                    extra_headers["Meshagent-Llm-Delegation"] = (
+                        context.llm_authorization_token
+                    )
                 extra_headers.update(request_options.pop("extra_headers", None) or {})
                 response: ChatCompletion = await openai.chat.completions.create(
                     n=1,

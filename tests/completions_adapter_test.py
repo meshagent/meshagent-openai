@@ -780,6 +780,33 @@ async def test_next_commits_empty_tool_calls_message_before_followup() -> None:
 
 
 @pytest.mark.asyncio
+async def test_openai_completions_adapter_passes_llm_delegation_header() -> None:
+    client = _FakeOpenAIClient(
+        responses=[
+            _FakeChatCompletion(
+                message=_FakeMessage(tool_calls=None, content="done"),
+                usage={"prompt_tokens": 1, "completion_tokens": 1},
+            )
+        ]
+    )
+    adapter = OpenAICompletionsAdapter(model="gpt-4o-mini", client=client)
+    context = adapter.create_session()
+    context.append_user_message("hello")
+    context.set_llm_authorization_token("delegation-token")
+
+    result = await adapter.create_response(
+        context=context,
+        caller=_FakeRoom().local_participant,
+        toolkits=[],
+    )
+
+    assert result == "done"
+    assert client.chat.completions.create_kwargs[0]["extra_headers"] == {
+        "Meshagent-Llm-Delegation": "delegation-token"
+    }
+
+
+@pytest.mark.asyncio
 async def test_openai_completions_adapter_publishes_text_events_for_restore() -> None:
     adapter = OpenAICompletionsAdapter(
         model="gpt-4o-mini",

@@ -7273,7 +7273,7 @@ def test_retry_event_uses_python_api_status_error_details() -> None:
 
 
 @pytest.mark.asyncio
-async def test_next_omits_on_behalf_of_header_when_name_is_missing() -> None:
+async def test_next_passes_delegation_when_on_behalf_of_name_is_missing() -> None:
     client = _FakeOpenAIClient(
         outcomes=[
             _FakeResponse(
@@ -7286,6 +7286,7 @@ async def test_next_omits_on_behalf_of_header_when_name_is_missing() -> None:
     adapter = OpenAIResponsesAdapter(client=client, max_retries=3, mode="request")
     context = adapter.create_session()
     context.append_user_message("hello")
+    context.set_llm_authorization_token("delegation-token")
 
     result = await adapter.create_response(
         context=context,
@@ -7296,7 +7297,9 @@ async def test_next_omits_on_behalf_of_header_when_name_is_missing() -> None:
 
     assert result == "done"
     assert len(client.responses.create_kwargs) == 1
-    assert client.responses.create_kwargs[0]["extra_headers"] == {}
+    assert client.responses.create_kwargs[0]["extra_headers"] == {
+        "Meshagent-Llm-Delegation": "delegation-token"
+    }
 
 
 @pytest.mark.asyncio

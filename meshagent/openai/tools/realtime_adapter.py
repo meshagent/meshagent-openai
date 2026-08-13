@@ -1013,6 +1013,7 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
         protocol: Literal["websocket", "webrtc"],
         model: str | None = None,
         options: dict[str, Any] | None = None,
+        llm_authorization_token: str | None = None,
     ) -> LLMRealtimeConnectionInfo:
         if protocol not in self._realtime_protocols:
             raise RoomException(
@@ -1022,6 +1023,8 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
         realtime_model = model or self.default_model()
         openai = self._openai_client()
         extra_headers = llm_annotation_headers(self._annotations)
+        if llm_authorization_token is not None:
+            extra_headers["Meshagent-Llm-Delegation"] = llm_authorization_token
         headers = self._websocket_headers(openai=openai, extra_headers=extra_headers)
         if protocol == "websocket":
             return LLMRealtimeConnectionInfo(
@@ -1295,6 +1298,8 @@ class OpenAIRealtimeAdapter(LLMAdapter[dict[str, Any]]):
         realtime_model = model or self.default_model()
         openai = self._openai_client()
         extra_headers = llm_annotation_headers(self._annotations)
+        if context.llm_authorization_token is not None:
+            extra_headers["Meshagent-Llm-Delegation"] = context.llm_authorization_token
         headers = self._websocket_headers(openai=openai, extra_headers=extra_headers)
         url = self._http_base_url_to_ws_realtime_url(
             base_url=str(openai.base_url),

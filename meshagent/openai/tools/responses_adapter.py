@@ -4025,6 +4025,10 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                             extra_headers.update(
                                 llm_annotation_headers(self._annotations)
                             )
+                            if context.llm_authorization_token is not None:
+                                extra_headers["Meshagent-Llm-Delegation"] = (
+                                    context.llm_authorization_token
+                                )
                             if on_behalf_of is not None:
                                 on_behalf_of_name = on_behalf_of.get_attribute("name")
                                 caller_name = caller.get_attribute("name")
