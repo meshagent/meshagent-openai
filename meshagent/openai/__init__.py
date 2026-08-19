@@ -1,6 +1,10 @@
 from .tools import (
+    DEFAULT_GROK_RESPONSES_COMPACTION_THRESHOLD,
     DEFAULT_OPENAI_REALTIME_TURN_DETECTION,
     DEFAULT_OPENAI_REALTIME_TRANSCRIPTION_MODEL,
+    GROK_RESPONSES_CAPABILITIES,
+    OPENAI_RESPONSES_CAPABILITIES,
+    GrokResponsesAdapter,
     OpenAICompletionsAdapter,
     OpenAIRealtimeAdapter,
     OpenAIRealtimeSessionContext,
@@ -8,15 +12,24 @@ from .tools import (
     OpenAICompletionsToolResponseAdapter,
     OpenAIResponsesToolResponseAdapter,
     OpenAIResponsesMCPToolkit,
+    ResponsesProviderCapabilities,
+    ResponsesCompactionMechanism,
+    ResponsesTransport,
+    ResponsesToolType,
+    responses_provider_capabilities,
     ImageGenerationToolkit,
 )
 from .version import __version__
 
 
 __all__ = [
+    "DEFAULT_GROK_RESPONSES_COMPACTION_THRESHOLD",
     "__version__",
     "DEFAULT_OPENAI_REALTIME_TURN_DETECTION",
     "DEFAULT_OPENAI_REALTIME_TRANSCRIPTION_MODEL",
+    "GROK_RESPONSES_CAPABILITIES",
+    "OPENAI_RESPONSES_CAPABILITIES",
+    "GrokResponsesAdapter",
     "OpenAICompletionsAdapter",
     "OpenAIRealtimeAdapter",
     "OpenAIRealtimeSessionContext",
@@ -24,5 +37,10 @@ __all__ = [
     "OpenAICompletionsToolResponseAdapter",
     "OpenAIResponsesToolResponseAdapter",
     "OpenAIResponsesMCPToolkit",
+    "ResponsesProviderCapabilities",
+    "ResponsesCompactionMechanism",
+    "ResponsesTransport",
+    "ResponsesToolType",
+    "responses_provider_capabilities",
     "ImageGenerationToolkit",
 ]

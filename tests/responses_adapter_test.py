@@ -82,8 +82,12 @@ from meshagent.computers.operator import Operator
 import meshagent.openai.tools.responses_adapter as responses_adapter_module
 from meshagent.openai.tools.responses_adapter import (
     ApplyPatchTool,
+    DEFAULT_GROK_RESPONSES_COMPACTION_THRESHOLD,
     DEFAULT_IMAGE_GENERATION_MODEL,
+    GROK_RESPONSES_CAPABILITIES,
+    OPENAI_RESPONSES_CAPABILITIES,
     CodeInterpreterTool,
+    GrokResponsesAdapter,
     ImageGenerationTool,
     MCPServer,
     MCPTool,
@@ -93,6 +97,7 @@ from meshagent.openai.tools.responses_adapter import (
     OpenAIResponsesToolResponseAdapter,
     OpenAIResponsesSessionContext,
     OpenAIResponsesToolSearchRequest,
+    ResponsesProviderCapabilities,
     ResponsesToolBundle,
     ShellTool,
     WebSearchTool,
@@ -3553,6 +3558,181 @@ async def test_responses_tool_bundle_uses_toolkit_namespaces_for_function_tools(
 
 
 @pytest.mark.asyncio
+async def test_grok_responses_tool_bundle_flattens_and_resolves_namespaces() -> None:
+    alpha_tool = _AnyArgsTool("lookup")
+    beta_tool = _AnyArgsTool("lookup")
+    bundle = ResponsesToolBundle(
+        toolkits=[
+            Toolkit(name="alpha", description="Alpha tools.", tools=[alpha_tool]),
+            Toolkit(name="beta", description="Beta tools.", tools=[beta_tool]),
+            Toolkit(name="", tools=[_AnyArgsTool("alpha__lookup")]),
+        ],
+        capabilities=GROK_RESPONSES_CAPABILITIES,
+    )
+
+    definitions = bundle.to_json()
+    assert definitions is not None
+    assert [definition["type"] for definition in definitions] == [
+        "function",
+        "function",
+        "function",
+    ]
+    assert [definition["name"] for definition in definitions] == [
+        "alpha__lookup",
+        "beta__lookup",
+        "alpha__lookup__2",
+    ]
+    assert bundle.resolve_function_tool_name("alpha__lookup", None) == (
+        "alpha",
+        "lookup",
+    )
+    assert bundle.resolve_function_tool_name("beta__lookup", None) == (
+        "beta",
+        "lookup",
+    )
+    assert bundle.resolve_function_tool_name("alpha__lookup__2", None) == (
+        "",
+        "alpha__lookup",
+    )
+
+    result = await bundle.execute(
+        context=ToolContext(caller=_FakeParticipant()),
+        tool_call=ResponseFunctionToolCall(
+            id="call-beta",
+            name="beta__lookup",
+            call_id="call-beta",
+            arguments='{"value":"beta"}',
+            type="function_call",
+            status="completed",
+        ),
+    )
+
+    assert isinstance(result, JsonContent)
+    assert result.json == {"ok": True, "args": {"value": "beta"}}
+
+
+def test_grok_responses_adapter_declares_provider_capabilities() -> None:
+    adapter = GrokResponsesAdapter(api_key="test-key", reasoning_effort="xhigh")
+
+    assert adapter.provider_name() == "grok"
+    assert adapter.provider_friendly_name() == "Grok"
+    assert adapter.capabilities == GROK_RESPONSES_CAPABILITIES
+    assert adapter.context_management_mode() == "standalone"
+    assert adapter.compaction_threshold("grok-4.6") == (
+        DEFAULT_GROK_RESPONSES_COMPACTION_THRESHOLD
+    )
+    assert adapter._configured_reasoning_options() == {"effort": "xhigh"}
+    assert GROK_RESPONSES_CAPABILITIES.supports_reasoning_effort is True
+    assert GROK_RESPONSES_CAPABILITIES.supports_reasoning_summary_option is False
+    assert all(
+        GROK_RESPONSES_CAPABILITIES.supports_compaction(
+            transport=transport,
+            mechanism="endpoint",
+        )
+        for transport in ("request", "websocket")
+    )
+    assert all(
+        not GROK_RESPONSES_CAPABILITIES.supports_compaction(
+            transport=transport,
+            mechanism="server",
+        )
+        for transport in ("request", "websocket")
+    )
+    assert all(
+        OPENAI_RESPONSES_CAPABILITIES.supports_compaction(
+            transport=transport,
+            mechanism=mechanism,
+        )
+        for transport in ("request", "websocket")
+        for mechanism in ("server", "endpoint")
+    )
+    websocket_adapter = GrokResponsesAdapter(api_key="test-key", mode="websocket")
+    assert websocket_adapter.context_management_mode() == "standalone"
+    assert websocket_adapter.compaction_threshold("grok-4.6") == (
+        DEFAULT_GROK_RESPONSES_COMPACTION_THRESHOLD
+    )
+    assert (
+        GrokResponsesAdapter(
+            api_key="test-key", context_management="auto"
+        ).context_management_mode()
+        == "standalone"
+    )
+    assert (
+        GrokResponsesAdapter(
+            api_key="test-key", context_management="none"
+        ).context_management_mode()
+        == "none"
+    )
+    with pytest.raises(ValueError, match="does not support Responses tool search"):
+        GrokResponsesAdapter(api_key="test-key", tool_search="server")
+
+    no_reasoning = ResponsesProviderCapabilities(
+        supported_tool_types=frozenset({"function"}),
+        supported_reasoning_efforts=frozenset(),
+    )
+    with pytest.raises(
+        ValueError,
+        match="does not support Responses reasoning effort",
+    ):
+        OpenAIResponsesAdapter(
+            provider="custom",
+            mode="request",
+            context_management="none",
+            reasoning_effort="high",
+            capabilities=no_reasoning,
+            api_key="test-key",
+        )
+    with pytest.raises(
+        ValueError,
+        match="does not support Responses reasoning effort 'none'",
+    ):
+        GrokResponsesAdapter(api_key="test-key", reasoning_effort="none")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["request", "websocket"])
+async def test_grok_responses_adapter_compacts_through_endpoint_in_each_transport(
+    mode: str,
+) -> None:
+    compacted_item = _FakeOutputItem(
+        type="compaction",
+        id="cmp_grok",
+        encrypted_content="opaque",
+    )
+    client = _FakeOpenAIClient(
+        outcomes=[],
+        compact_outcomes=[SimpleNamespace(output=[compacted_item])],
+    )
+    adapter = GrokResponsesAdapter(client=client, mode=mode)
+    context = adapter.create_session()
+    context.append_user_message("please compact")
+    if isinstance(context, OpenAIResponsesSessionContext):
+        context._websocket_previous_response_id = "resp_before_compaction"
+        context._websocket_incremental_start_index = 1
+
+    await adapter.compact(context=context)
+
+    assert len(client.responses.compact_kwargs) == 1
+    compact_kwargs = client.responses.compact_kwargs[0]
+    assert compact_kwargs["model"] == "grok-4.6"
+    assert compact_kwargs["input"] == [{"role": "user", "content": "please compact"}]
+    assert isinstance(
+        compact_kwargs["instructions"],
+        type(responses_adapter_module.NOT_GIVEN),
+    )
+    assert context.messages == [
+        {
+            "type": "compaction",
+            "id": "cmp_grok",
+            "encrypted_content": "opaque",
+        }
+    ]
+    if isinstance(context, OpenAIResponsesSessionContext):
+        assert context._websocket_previous_response_id is None
+        assert context._websocket_incremental_start_index is None
+
+
+@pytest.mark.asyncio
 async def test_responses_tool_bundle_invalid_arguments_error_matches_json_loads() -> (
     None
 ):
@@ -3806,10 +3986,17 @@ class _EventStream:
 
 
 class _FakeResponsesClient:
-    def __init__(self, *, outcomes: list[object]):
+    def __init__(
+        self,
+        *,
+        outcomes: list[object],
+        compact_outcomes: list[object] | None = None,
+    ):
         self._outcomes = outcomes.copy()
+        self._compact_outcomes = (compact_outcomes or []).copy()
         self.calls = 0
         self.create_kwargs: list[dict] = []
+        self.compact_kwargs: list[dict] = []
 
     async def create(self, **kwargs):
         self.create_kwargs.append(copy.deepcopy(kwargs))
@@ -3821,10 +4008,27 @@ class _FakeResponsesClient:
             raise outcome
         return outcome
 
+    async def compact(self, **kwargs):
+        self.compact_kwargs.append(copy.deepcopy(kwargs))
+        if len(self._compact_outcomes) == 0:
+            raise AssertionError("no responses.compact outcomes configured")
+        outcome = self._compact_outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
 
 class _FakeOpenAIClient:
-    def __init__(self, *, outcomes: list[object]):
-        self.responses = _FakeResponsesClient(outcomes=outcomes)
+    def __init__(
+        self,
+        *,
+        outcomes: list[object],
+        compact_outcomes: list[object] | None = None,
+    ):
+        self.responses = _FakeResponsesClient(
+            outcomes=outcomes,
+            compact_outcomes=compact_outcomes,
+        )
 
 
 class _FakeInputTokenCounter:

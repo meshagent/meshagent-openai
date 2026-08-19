@@ -121,6 +121,105 @@ _OPENAI_OUT_OF_CREDITS_MESSAGE = (
 _OPENAI_RESPONSES_MAX_INLINE_IMAGE_BYTES = 20 * 1024 * 1024
 _OPENAI_RESPONSES_MAX_INLINE_FILE_BYTES = 32 * 1024 * 1024
 _OPENAI_RESPONSES_ACCEPTED_ATTACHMENT_TYPES: tuple[str, ...]
+DEFAULT_GROK_RESPONSES_COMPACTION_THRESHOLD = 425_000
+
+ResponsesToolType = Literal[
+    "apply_patch",
+    "code_interpreter",
+    "computer",
+    "file_search",
+    "function",
+    "image_generation",
+    "mcp",
+    "namespace",
+    "shell",
+    "tool_search",
+    "web_search",
+]
+ResponsesTransport = Literal["request", "websocket"]
+# "server" is the in-request context_management mechanism; "endpoint" is
+# the explicit POST /responses/compact mechanism.
+ResponsesCompactionMechanism = Literal["server", "endpoint"]
+
+
+@dataclass(frozen=True)
+class ResponsesProviderCapabilities:
+    supported_tool_types: frozenset[ResponsesToolType]
+    supports_websocket: bool = True
+    supported_reasoning_efforts: frozenset[str] = frozenset(
+        {"none", "minimal", "low", "medium", "high", "xhigh"}
+    )
+    supports_reasoning_summary_option: bool = True
+    request_compaction: frozenset[ResponsesCompactionMechanism] = frozenset()
+    websocket_compaction: frozenset[ResponsesCompactionMechanism] = frozenset()
+
+    def supports_tool_type(self, tool_type: str) -> bool:
+        return tool_type in self.supported_tool_types
+
+    @property
+    def supports_reasoning_effort(self) -> bool:
+        return len(self.supported_reasoning_efforts) > 0
+
+    def supports_compaction(
+        self,
+        *,
+        transport: ResponsesTransport,
+        mechanism: ResponsesCompactionMechanism,
+    ) -> bool:
+        mechanisms = (
+            self.request_compaction
+            if transport == "request"
+            else self.websocket_compaction
+        )
+        return mechanism in mechanisms
+
+
+OPENAI_RESPONSES_CAPABILITIES = ResponsesProviderCapabilities(
+    supported_tool_types=frozenset(
+        {
+            "apply_patch",
+            "code_interpreter",
+            "computer",
+            "file_search",
+            "function",
+            "image_generation",
+            "mcp",
+            "namespace",
+            "shell",
+            "tool_search",
+            "web_search",
+        }
+    ),
+    request_compaction=frozenset({"server", "endpoint"}),
+    websocket_compaction=frozenset({"server", "endpoint"}),
+)
+
+GROK_RESPONSES_CAPABILITIES = ResponsesProviderCapabilities(
+    supported_tool_types=frozenset(
+        {
+            "code_interpreter",
+            "file_search",
+            "function",
+            "image_generation",
+            "mcp",
+            "shell",
+            "web_search",
+        }
+    ),
+    supports_websocket=True,
+    supported_reasoning_efforts=frozenset({"low", "medium", "high", "xhigh"}),
+    supports_reasoning_summary_option=False,
+    request_compaction=frozenset({"endpoint"}),
+    websocket_compaction=frozenset({"endpoint"}),
+)
+
+
+def responses_provider_capabilities(provider: str) -> ResponsesProviderCapabilities:
+    if provider == "grok":
+        return GROK_RESPONSES_CAPABILITIES
+    return OPENAI_RESPONSES_CAPABILITIES
+
+
 _OPENAI_RESPONSES_IMAGE_GENERATION_CALL_INPUT_FIELDS = frozenset(
     {
         "background",
@@ -1618,16 +1717,24 @@ class ResponsesToolBundle:
         *,
         tool_call_approval_handler: ToolCallApprovalHandler | None = None,
         tool_search: OpenAIResponsesToolSearchMode | None = None,
+        capabilities: ResponsesProviderCapabilities = OPENAI_RESPONSES_CAPABILITIES,
     ):
         self._toolkits = toolkits
+        self._capabilities = capabilities
         self._executors = dict[tuple[str | None, str], Toolkit]()
         self._safe_names = dict[tuple[str | None, str], str]()
         self._unqualified_safe_names = dict[str, tuple[str | None, str]]()
         self._tools_by_name = dict[tuple[str | None, str], BaseTool]()
         self._function_tool_definitions: list[dict[str, Any]] = []
+        exposed_function_names: dict[str, tuple[str | None, str]] = {}
 
         open_ai_tools = []
         has_deferred_function_tools = False
+
+        if tool_search is not None and not capabilities.supports_tool_type(
+            "tool_search"
+        ):
+            raise RoomException("provider does not support Responses tool search")
 
         for toolkit in toolkits:
             namespace_tools: list[dict[str, Any]] = []
@@ -1659,12 +1766,38 @@ class ResponsesToolBundle:
                 if isinstance(v, OpenAIResponsesTool):
                     fns = v.get_open_ai_tool_definitions()
                     for fn in fns:
+                        tool_type = fn.get("type")
+                        if not isinstance(
+                            tool_type, str
+                        ) or not capabilities.supports_tool_type(tool_type):
+                            raise RoomException(
+                                f"provider does not support Responses tool type {tool_type!r}"
+                            )
                         open_ai_tools.append(fn)
 
                 elif isinstance(v, FunctionTool):
+                    if not capabilities.supports_tool_type("function"):
+                        raise RoomException(
+                            "provider does not support Responses function tools"
+                        )
+                    if not capabilities.supports_tool_type("namespace"):
+                        base_name = (
+                            safe_tool_name(f"{namespace}__{name}")
+                            if namespace is not None
+                            else name
+                        )
+                        exposed_name = self._unique_function_name(
+                            base_name=base_name,
+                            tool_key=tool_key,
+                            exposed_names=exposed_function_names,
+                        )
+                        self._unqualified_safe_names[exposed_name] = tool_key
+                    else:
+                        exposed_name = name
+                        exposed_function_names.setdefault(exposed_name, tool_key)
                     fn = {
                         "type": "function",
-                        "name": name,
+                        "name": exposed_name,
                         "description": v.description,
                         "parameters": {
                             **v.input_schema,
@@ -1683,7 +1816,9 @@ class ResponsesToolBundle:
 
                     if tool_search == "client":
                         continue
-                    if namespace is None:
+                    if namespace is None or not capabilities.supports_tool_type(
+                        "namespace"
+                    ):
                         open_ai_tools.append(fn)
                     else:
                         namespace_tools.append(fn)
@@ -1695,9 +1830,12 @@ class ResponsesToolBundle:
                 open_ai_tools.append(self._namespace_tool(toolkit, namespace_tools))
 
             if function_namespace_tools:
-                self._function_tool_definitions.append(
-                    self._namespace_tool(toolkit, function_namespace_tools)
-                )
+                if capabilities.supports_tool_type("namespace"):
+                    self._function_tool_definitions.append(
+                        self._namespace_tool(toolkit, function_namespace_tools)
+                    )
+                else:
+                    self._function_tool_definitions.extend(function_namespace_tools)
 
         if has_deferred_function_tools or tool_search == "client":
             tool_search_tool: dict[str, Any] = {"type": "tool_search"}
@@ -1720,6 +1858,21 @@ class ResponsesToolBundle:
             open_ai_tools = None
 
         self._open_ai_tools = open_ai_tools
+
+    @staticmethod
+    def _unique_function_name(
+        *,
+        base_name: str,
+        tool_key: tuple[str | None, str],
+        exposed_names: dict[str, tuple[str | None, str]],
+    ) -> str:
+        candidate = base_name
+        collision_index = 2
+        while candidate in exposed_names and exposed_names[candidate] != tool_key:
+            candidate = f"{base_name}__{collision_index}"
+            collision_index += 1
+        exposed_names[candidate] = tool_key
+        return candidate
 
     @staticmethod
     def _namespace_tool(
@@ -1992,6 +2145,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         "gpt-5.3-codex": 400000,
         "gpt-5.2": 400000,
         "gpt-5": 400000,
+        "grok-4.6": 500000,
         "o1": 200000,
         "o3": 200000,
         "o4": 200000,
@@ -2018,6 +2172,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         compaction_threshold: Optional[int | float] = None,
         tool_search: OpenAIResponsesToolSearchConfig = None,
         *,
+        capabilities: ResponsesProviderCapabilities | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
         user_agent: str | None = None,
@@ -2039,9 +2194,58 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             raise ValueError(
                 "context_management must be one of 'auto', 'standalone', or 'none'"
             )
+        resolved_capabilities = capabilities or responses_provider_capabilities(
+            provider
+        )
+        if mode == "websocket" and not resolved_capabilities.supports_websocket:
+            raise ValueError(
+                f"provider {provider!r} does not support Responses websocket mode"
+            )
+        if (
+            reasoning_effort is not None
+            and not resolved_capabilities.supports_reasoning_effort
+        ):
+            raise ValueError(
+                f"provider {provider!r} does not support Responses reasoning effort"
+            )
+        if (
+            reasoning_effort is not None
+            and reasoning_effort
+            not in resolved_capabilities.supported_reasoning_efforts
+        ):
+            supported_efforts = ", ".join(
+                sorted(resolved_capabilities.supported_reasoning_efforts)
+            )
+            raise ValueError(
+                f"provider {provider!r} does not support Responses reasoning effort "
+                f"{reasoning_effort!r}; supported efforts: {supported_efforts}"
+            )
+        compaction_mechanism: ResponsesCompactionMechanism | None = None
+        if context_management == "auto":
+            compaction_mechanism = "server"
+        elif context_management == "standalone":
+            compaction_mechanism = "endpoint"
+        if (
+            compaction_mechanism is not None
+            and not resolved_capabilities.supports_compaction(
+                transport=mode,
+                mechanism=compaction_mechanism,
+            )
+        ):
+            raise ValueError(
+                f"provider {provider!r} does not support Responses "
+                f"{compaction_mechanism} compaction in {mode} mode"
+            )
         if compaction_threshold is not None and isinstance(compaction_threshold, bool):
             raise ValueError("compaction_threshold must be an integer or infinity")
         resolved_tool_search = self._normalize_tool_search_mode(tool_search)
+        if (
+            resolved_tool_search is not None
+            and not resolved_capabilities.supports_tool_type("tool_search")
+        ):
+            raise ValueError(
+                f"provider {provider!r} does not support Responses tool search"
+            )
         resolved_compaction_threshold: Optional[int] = None
         if compaction_threshold is None:
             if self.context_window_size(model) != float("inf"):
@@ -2072,6 +2276,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         self._annotations = normalize_llm_annotations(annotations)
         self._response_options = response_options
         self._provider = provider
+        self._capabilities = resolved_capabilities
         self._reasoning_effort = reasoning_effort
         self._log_requests = log_requests
         self.max_output_tokens = max_output_tokens
@@ -2110,6 +2315,10 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
 
     def provider_name(self) -> str | None:
         return self._provider
+
+    @property
+    def capabilities(self) -> ResponsesProviderCapabilities:
+        return self._capabilities
 
     def provider_friendly_name(self) -> str:
         return self._friendly_name or "OpenAI"
@@ -2196,6 +2405,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             toolkits=found_toolkits,
             tool_call_approval_handler=self._tool_call_approval_handler,
             tool_search="server",
+            capabilities=self._capabilities,
         )
         output: dict[str, Any] = {
             "type": "tool_search_output",
@@ -2241,6 +2451,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                 else float("inf")
             ),
             tool_search=self._tool_search,
+            capabilities=self._capabilities,
             base_url=self._base_url,
             api_key=resolved_api_key,
             user_agent=self._user_agent,
@@ -2684,6 +2895,14 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         effort = reasoning.get("effort")
         return not (isinstance(effort, str) and effort == "none")
 
+    def _configured_reasoning_options(self) -> dict[str, str] | None:
+        if self._reasoning_effort is None:
+            return None
+        reasoning = {"effort": self._reasoning_effort}
+        if self._capabilities.supports_reasoning_summary_option:
+            reasoning["summary"] = "detailed"
+        return reasoning
+
     @staticmethod
     def _ensure_encrypted_reasoning_include(response_options: dict[str, Any]) -> None:
         if not OpenAIResponsesAdapter._reasoning_enabled(response_options):
@@ -2776,6 +2995,11 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
     ) -> None:
         if self._context_management_mode != "auto":
             return
+        if not self._capabilities.supports_compaction(
+            transport=self._mode,
+            mechanism="server",
+        ):
+            return
         threshold = self._effective_compaction_threshold(model=model)
         if threshold is None:
             return
@@ -2867,6 +3091,14 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
             model = self.default_model()
         if not context.messages:
             return
+        if not self._capabilities.supports_compaction(
+            transport=self._mode,
+            mechanism="endpoint",
+        ):
+            raise RoomException(
+                f"provider {self._provider!r} does not support Responses endpoint "
+                f"compaction in {self._mode} mode"
+            )
         instructions = self._compose_instructions(context=context)
         openai = self.get_openai_client()
         response = await openai.responses.compact(
@@ -3038,6 +3270,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                 *(toolkits or []),
             ],
             tool_search=self._tool_search,
+            capabilities=self._capabilities,
         )
         open_ai_tools = tool_bundle.to_json()
 
@@ -3966,6 +4199,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                 ],
                                 tool_call_approval_handler=self._tool_call_approval_handler,
                                 tool_search=self._tool_search,
+                                capabilities=self._capabilities,
                             )
                             self._set_function_tool_name_resolver(
                                 event_handler=event_handler,
@@ -4012,10 +4246,9 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                                 response_options = {}
 
                             if self._reasoning_effort is not None:
-                                response_options["reasoning"] = {
-                                    "effort": self._reasoning_effort,
-                                    "summary": "detailed",
-                                }
+                                response_options["reasoning"] = (
+                                    self._configured_reasoning_options()
+                                )
                             self._ensure_encrypted_reasoning_include(response_options)
                             request_options = copy.deepcopy(options or {})
                             request_options.pop("output_modalities", None)
@@ -5103,6 +5336,49 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
                         event_handler=event_handler,
                         resolver=None,
                     )
+
+
+class GrokResponsesAdapter(OpenAIResponsesAdapter):
+    def __init__(
+        self,
+        model: str = "grok-4.6",
+        *args: Any,
+        provider: str = "grok",
+        mode: Literal["request", "websocket"] = "request",
+        context_management: Literal["auto", "standalone", "none"] = "auto",
+        compaction_threshold: int | float | None = None,
+        capabilities: ResponsesProviderCapabilities = GROK_RESPONSES_CAPABILITIES,
+        friendly_name: str | None = "Grok",
+        description: str | None = "xAI Responses API",
+        **kwargs: Any,
+    ):
+        if provider != "grok":
+            raise ValueError("GrokResponsesAdapter provider must be 'grok'")
+        # xAI documents the explicit /responses/compact endpoint, but not the
+        # in-request context_management mechanism. Implement "auto" locally by
+        # checking usage and calling the endpoint before the next turn.
+        resolved_context_management = (
+            "standalone" if context_management == "auto" else context_management
+        )
+        resolved_compaction_threshold = compaction_threshold
+        if resolved_compaction_threshold is None:
+            resolved_compaction_threshold = (
+                DEFAULT_GROK_RESPONSES_COMPACTION_THRESHOLD
+                if resolved_context_management == "standalone"
+                else float("inf")
+            )
+        super().__init__(
+            model,
+            *args,
+            provider=provider,
+            mode=mode,
+            context_management=resolved_context_management,
+            compaction_threshold=resolved_compaction_threshold,
+            capabilities=capabilities,
+            friendly_name=friendly_name,
+            description=description,
+            **kwargs,
+        )
 
 
 class OpenAIResponsesTool(BaseTool):
