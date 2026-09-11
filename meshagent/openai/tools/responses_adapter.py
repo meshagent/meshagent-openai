@@ -6324,11 +6324,33 @@ class ReasoningTool(OpenAIResponsesTool):
 
 
 class WebSearchTool(OpenAIResponsesTool):
-    def __init__(self, *, name: str = "web_search"):
+    def __init__(
+        self,
+        *,
+        name: str = "web_search",
+        allowed_domains: list[str] | None = None,
+        blocked_domains: list[str] | None = None,
+    ):
         super().__init__(name=name)
+        self.allowed_domains = allowed_domains
+        self.blocked_domains = blocked_domains
 
     def get_open_ai_tool_definitions(self) -> list[dict]:
-        return [{"type": "web_search"}]
+        filters: dict[str, list[str]] = {}
+        for name, domains in (
+            ("allowed_domains", self.allowed_domains),
+            ("blocked_domains", self.blocked_domains),
+        ):
+            if domains is not None:
+                if len(domains) > 100:
+                    raise ValueError(
+                        f"web_search {name} must contain at most 100 domains"
+                    )
+                filters[name] = domains
+        tool: dict = {"type": "web_search"}
+        if filters:
+            tool["filters"] = filters
+        return [tool]
 
     def get_open_ai_stream_callbacks(self):
         return {

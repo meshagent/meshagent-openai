@@ -8922,6 +8922,41 @@ def test_make_agent_event_publisher_emits_web_search_tool_events() -> None:
     assert ended.result.json == {"results": [{"title": "MeshAgent"}]}
 
 
+@pytest.mark.parametrize(
+    "filters",
+    [
+        {},
+        {"allowed_domains": []},
+        {"blocked_domains": []},
+        {"allowed_domains": ["example.com"]},
+        {"blocked_domains": ["blocked.example.com"]},
+        {
+            "allowed_domains": ["example.com"],
+            "blocked_domains": ["blocked.example.com"],
+        },
+    ],
+)
+def test_web_search_domain_filters_reach_tool_bundle(filters) -> None:
+    tool = WebSearchTool(**filters)
+    bundle = ResponsesToolBundle(
+        toolkits=[Toolkit(name="openai", tools=[tool])],
+    )
+    expected = {"type": "web_search"}
+    if filters:
+        expected["filters"] = filters
+    assert bundle.to_json() == [expected]
+
+
+@pytest.mark.parametrize("field", ["allowed_domains", "blocked_domains"])
+def test_web_search_domain_filters_enforce_each_list_limit(field) -> None:
+    domains = [f"site{index}.example.com" for index in range(100)]
+    tool = WebSearchTool(**{field: domains})
+    assert tool.get_open_ai_tool_definitions()[0]["filters"][field] == domains
+    domains.append("overflow.example.com")
+    with pytest.raises(ValueError, match=f"{field} must contain at most 100 domains"):
+        tool.get_open_ai_tool_definitions()
+
+
 def test_web_search_tool_uses_current_responses_tool_definition() -> None:
     tool = WebSearchTool()
 
