@@ -1473,6 +1473,7 @@ def _restore_tool_lifecycle(
     toolkit: str,
     tool: str,
     arguments: dict[str, object],
+    provider_item_type: str | None = None,
 ) -> list[dict[str, object]]:
     context = adapter.create_session()
     restored_messages: list[dict[str, object]] = []
@@ -1511,6 +1512,9 @@ def _restore_tool_lifecycle(
             toolkit=toolkit,
             tool=tool,
             arguments=arguments,
+            metadata={"provider_item_type": provider_item_type}
+            if provider_item_type is not None
+            else {},
             provider="openai",
             model="gpt-5-mini",
         )
@@ -1644,6 +1648,7 @@ def test_make_agent_event_reader_restores_tool_lifecycle_as_responses_items(
         toolkit=toolkit,
         tool=tool,
         arguments=arguments,
+        provider_item_type=expected_type,
     )
 
     restored_call = messages[0]
@@ -1676,6 +1681,121 @@ def test_make_agent_event_reader_restores_tool_lifecycle_as_responses_items(
         assert restored_call["output"] == "tool result"
     else:
         raise AssertionError(f"missing assertion for {expected_type}")
+
+
+@pytest.mark.parametrize(
+    ("toolkit", "tool", "provider_item_type"),
+    [
+        ("tool", "tool", None),
+        ("server", "search", None),
+        ("server", "list_tools", None),
+        ("mcp", "search", None),
+        ("openai", "mcp", None),
+        ("openai", "unknown", None),
+        ("openai", "shell", "unknown_call"),
+    ],
+)
+def test_make_agent_event_reader_does_not_infer_mcp_from_tool_names(
+    toolkit: str, tool: str, provider_item_type: str | None
+) -> None:
+    messages = _restore_tool_lifecycle(
+        OpenAIResponsesAdapter(client=object()),
+        namespace="openai.responses",
+        toolkit=toolkit,
+        tool=tool,
+        arguments={"query": "meshagent"},
+        provider_item_type=provider_item_type,
+    )
+    assert [message.get("type", "message") for message in messages] == [
+        "message",
+        "message",
+    ]
+    assert "Called tool" in messages[0]["content"][0]["text"]
+    assert messages[1]["content"] == "tool result"
+
+
+@pytest.mark.parametrize("item_type", ["mcp_call", "mcp_list_tools"])
+def test_make_agent_event_publisher_preserves_explicit_mcp_type(item_type: str) -> None:
+    adapter = OpenAIResponsesAdapter(client=object())
+    messages = []
+    reader = adapter.make_agent_event_reader(emit_message=messages.append)
+    publisher = adapter.make_agent_event_publisher(
+        thread_id="thread-1", turn_id="turn-1", callback=reader.consume
+    )
+    item = {
+        "id": "mcp_1",
+        "type": item_type,
+        "server_label": "openai",
+        "name": "list_tools",
+        "arguments": "{}",
+        "tools": [],
+        "output": "tool result",
+        "status": "completed",
+    }
+    publisher({"type": "response.output_item.added", "item": item})
+    publisher({"type": "response.output_item.done", "item": item})
+    assert len(messages) == 1
+    assert messages[0]["type"] == item_type
+    assert messages[0]["server_label"] == "openai"
+
+
+def test_make_agent_event_reader_preserves_late_shell_result_without_inventing_mcp() -> (
+    None
+):
+    adapter = OpenAIResponsesAdapter(client=object())
+    messages = []
+    reader = adapter.make_agent_event_reader(emit_message=messages.append)
+    common = {
+        "thread_id": "thread-1",
+        "turn_id": "turn-1",
+        "item_id": "sh_1",
+        "call_id": "call_1",
+        "namespace": "openai.responses",
+        "provider": "openai",
+    }
+    reader.consume(
+        AgentToolCallStarted(
+            type=AGENT_EVENT_TOOL_CALL_STARTED,
+            toolkit="openai",
+            tool="shell",
+            arguments={"action": {"commands": ["pwd"]}},
+            **common,
+        )
+    )
+    reader.consume(
+        AgentToolCallEnded(
+            type=AGENT_EVENT_TOOL_CALL_ENDED,
+            toolkit="openai",
+            tool="shell",
+            error=AgentError(
+                message="Tool call ended without a result", code="incomplete"
+            ),
+            **common,
+        )
+    )
+    reader.consume(
+        AgentToolCallLogDelta(
+            type="meshagent.agent.tool_call.log_delta",
+            lines=[{"source": "stdout", "text": "late output"}],
+            **common,
+        )
+    )
+    reader.consume(
+        AgentToolCallEnded(
+            type=AGENT_EVENT_TOOL_CALL_ENDED,
+            toolkit="openai",
+            tool="shell",
+            result=TextContent(text="successful result"),
+            **common,
+        )
+    )
+    assert [message.get("type", "message") for message in messages] == [
+        "shell_call",
+        "shell_call_output",
+        "message",
+        "message",
+    ]
+    assert messages[-1]["content"] == "successful result"
 
 
 @pytest.mark.parametrize(

@@ -1286,6 +1286,13 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
         error: dict[str, Any] | None,
     ) -> None:
         item_type = self._response_item_type(tool_call=tool_call)
+        if item_type is None:
+            self._append_cross_provider_tool_call(
+                tool_call=tool_call,
+                result=result,
+                error=error,
+            )
+            return
         call_id = tool_call.call_id or tool_call.item_id
         if item_type == "function_call":
             if tool_call.provider != self._provider:
@@ -1434,14 +1441,22 @@ class OpenAIResponsesAgentEventReader(AccumulatingAgentEventReader):
         return None
 
     @staticmethod
-    def _response_item_type(*, tool_call: _BufferedToolCall) -> str:
-        if tool_call.namespace == "openai.responses":
-            if tool_call.toolkit == "openai":
-                return f"{tool_call.tool}_call"
-            if tool_call.tool == "list_tools":
-                return "mcp_list_tools"
-            return "mcp_call"
-        return "function_call"
+    def _response_item_type(*, tool_call: _BufferedToolCall) -> str | None:
+        if tool_call.namespace != "openai.responses":
+            return "function_call"
+        item_type = tool_call.metadata.get("provider_item_type")
+        if item_type is None and tool_call.toolkit == "openai":
+            # Older events identified built-in tools by toolkit and tool name.
+            item_type = f"{tool_call.tool}_call"
+            if item_type in {"mcp_call", "mcp_list_tools"}:
+                return None
+        if isinstance(item_type, str) and (
+            item_type in _OPENAI_RESPONSES_BUILTIN_CALL_FIELDS
+            or item_type == "image_generation_call"
+        ):
+            return item_type
+        # A provider namespace or a server/tool name does not identify MCP.
+        return None
 
     @staticmethod
     def _function_name(*, tool_call: _BufferedToolCall) -> str:
