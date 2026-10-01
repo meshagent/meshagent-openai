@@ -278,7 +278,7 @@ def test_list_models_empty_allowed_models_falls_back_to_known_without_custom_mod
 
     names = [model.name for model in adapter.list_models()]
 
-    assert names[0] == "gpt-5.6-sol"
+    assert names[0] == "gpt-6.1-sol"
     assert "custom-model" not in names
 
 
@@ -288,6 +288,16 @@ def test_gpt_5_6_models_use_documented_context_window() -> None:
     assert adapter.context_window_size("gpt-5.6-sol") == 1_050_000
     assert adapter.context_window_size("gpt-5.6-terra") == 1_050_000
     assert adapter.context_window_size("gpt-5.6-luna") == 1_050_000
+
+
+def test_gpt_6_models_use_documented_context_window_and_default() -> None:
+    adapter = OpenAIResponsesAdapter()
+
+    assert adapter.default_model() == "gpt-6.1-sol"
+    for model in ("gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"):
+        assert adapter.context_window_size(model) == 1_050_000
+        info = next(info for info in adapter.list_models() if info.name == model)
+        assert info.pricing is not None
 
 
 class _FakeDeveloper:
@@ -4639,7 +4649,7 @@ async def test_next_uses_websocket_path_when_mode_is_websocket(monkeypatch):
     assert call_count["count"] == 1
     assert context.turn_count == 1
     assert context.last_usage == SessionUsage(
-        model="gpt-5.2",
+        model="gpt-6.1-sol",
         usage={
             "input_tokens": 9.0,
             "output_tokens": 4.0,
@@ -4647,7 +4657,7 @@ async def test_next_uses_websocket_path_when_mode_is_websocket(monkeypatch):
             "total_tokens": 16.0,
         },
         context_window_used=16,
-        context_window_size=400000,
+        context_window_size=1_050_000,
     )
 
 
@@ -4732,7 +4742,7 @@ async def test_next_tracks_usage_for_non_streaming_request_mode():
     assert result == ""
     assert context.turn_count == 1
     assert context.last_usage == SessionUsage(
-        model="gpt-5.2",
+        model="gpt-6.1-sol",
         usage={
             "input_tokens": 4.0,
             "output_tokens": 2.0,
@@ -4740,7 +4750,7 @@ async def test_next_tracks_usage_for_non_streaming_request_mode():
             "total_tokens": 11.0,
         },
         context_window_used=11,
-        context_window_size=400000,
+        context_window_size=1_050_000,
     )
 
 
@@ -5342,7 +5352,7 @@ async def test_next_tracks_usage_for_streaming_request_mode():
     assert context.turn_count == 1
     assert events[0]["type"] == "response.completed"
     assert context.last_usage == SessionUsage(
-        model="gpt-5.2",
+        model="gpt-6.1-sol",
         usage={
             "input_tokens": 7.0,
             "output_tokens": 7.0,
@@ -5350,7 +5360,7 @@ async def test_next_tracks_usage_for_streaming_request_mode():
             "total_tokens": 18.0,
         },
         context_window_used=18,
-        context_window_size=400000,
+        context_window_size=1_050_000,
     )
 
 
@@ -5402,14 +5412,14 @@ async def test_next_commits_response_state_when_stream_ends_incomplete_after_com
         "status": "completed",
     }
     assert context.last_usage == SessionUsage(
-        model="gpt-5.2",
+        model="gpt-6.1-sol",
         usage={
             "input_tokens": 18.0,
             "output_tokens": 3.0,
             "cached_tokens": 2.0,
         },
         context_window_used=23,
-        context_window_size=400000,
+        context_window_size=1_050_000,
     )
     assert [event["type"] for event in events] == [
         "response.output_item.done",
@@ -5616,10 +5626,10 @@ async def test_next_marks_usage_when_response_contains_auto_compaction() -> None
 
     assert result == ""
     assert context.last_usage == SessionUsage(
-        model="gpt-5.2",
+        model="gpt-6.1-sol",
         usage={"input_tokens": 20000.0, "output_tokens": 10.0},
         context_window_used=10000,
-        context_window_size=400000,
+        context_window_size=1_050_000,
     )
 
 

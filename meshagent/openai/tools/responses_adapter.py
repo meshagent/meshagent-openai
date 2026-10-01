@@ -2133,6 +2133,10 @@ class OpenAIResponsesToolResponseAdapter(ToolResponseAdapter):
 
 class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
     _known_models = (
+        "gpt-6.1-sol",
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
@@ -2152,6 +2156,8 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
         "o1",
     )
     _context_window_sizes = {
+        "gpt-6": 1_050_000,
+        "gpt-6.1-sol": 1_050_000,
         "gpt-5.6": 1_050_000,
         "gpt-5.5": 400000,
         "gpt-4.1": 128000,
@@ -2172,7 +2178,7 @@ class OpenAIResponsesAdapter(LLMAdapter[dict[str, Any]]):
 
     def __init__(
         self,
-        model: str = os.getenv("OPENAI_MODEL", "gpt-5.2"),
+        model: str = os.getenv("OPENAI_MODEL", "gpt-6.1-sol"),
         parallel_tool_calls: Optional[bool] = None,
         client: Optional[AsyncOpenAI] = None,
         response_options: Optional[dict] = None,
