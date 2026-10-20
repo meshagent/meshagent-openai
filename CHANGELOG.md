@@ -1,4 +1,5 @@
 ## [0.55.0]
+- Fixed Rust Responses and Realtime TLS startup when both crypto backends are linked, and stopped retrying invalid WebSocket requests while preserving transient-error retries.
 - Corrected Grok web-search domain exclusions and validation of its domain-filter limits.
 - Added managed-agent Python tool and HTTP connection models, including strict schema, URL, source, entrypoint, and duplicate-name validation.
 - Added local CLI execution for embedded Python tools with JSON input, live HTTP requests, captured logs, request summaries, and optional private-HTTP access for development.
